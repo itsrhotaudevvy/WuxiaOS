@@ -57,6 +57,7 @@ const BOOT_MARKERS: &[&str] = &[
     "WUXIA_FAULT_TEST",
     "HELLO FROM PE",
     "WUXIA_USER_PAGE_FAULT",
+    "WUXIA_USER_FAULT_KILLED",
     "WUXIA_TEST_PASS",
 ];
 
