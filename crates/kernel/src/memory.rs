@@ -25,11 +25,11 @@ impl<const N: usize> MemoryMap<N> {
     }
 
     /// Add a usable region, rejecting overflow and non-page-aligned inputs.
-    pub fn add(&mut self, start: u64, length: u64) -> Result<(), wuxia_core::Error> {
+    pub fn add(&mut self, start: u64, length: u64) -> Result<usize, wuxia_core::Error> {
         if self.len >= N || start & 0xfff != 0 || length == 0 {
-            return Err(Error::InvalidInput);
+            return Err(wuxia_core::Error::InvalidInput);
         }
-        let end = start.checked_add(length).ok_or(Error::OutOfRange)?;
+        let end = start.checked_add(length).ok_or(wuxia_core::Error::OutOfRange)?;
         if self.regions[..self.len].iter().any(|region| {
             region.start < end && start < region.start + region.length
         }) {
