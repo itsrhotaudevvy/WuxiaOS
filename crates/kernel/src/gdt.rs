@@ -19,4 +19,23 @@ impl SegmentDescriptor {
     pub const fn code(privilege: u8) -> Self {
         Self((1u64 << 43) | (1u64 << 44) | (1u64 << 47) | ((privilege as u64) << 45) | (1u64 << 53))
     }
+
+    /// Construct a flat present, writable data descriptor.
+    pub const fn data(privilege: u8) -> Self {
+        Self((1u64 << 43) | (1u64 << 44) | (1u64 << 47) | ((privilege as u64) << 45))
+    }
+}
+
+/// A minimal GDT with null, kernel code and kernel data entries.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(16))]
+pub struct Gdt {
+    entries: [u64; 3],
+}
+
+impl Gdt {
+    /// Construct null, kernel code and kernel data descriptors.
+    pub const fn new() -> Self {
+        Self { entries: [0, SegmentDescriptor::code(0).0, SegmentDescriptor::code(0)] }
+    }
 }
