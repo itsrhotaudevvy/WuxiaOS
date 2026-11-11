@@ -73,10 +73,13 @@ impl ProgramSegment {
     }
 
     /// Address one past the last in-memory byte.
+    ///
+    /// Returns [`Error::InvalidImage`] when the sum wraps past `u64::MAX`,
+    /// which only a malformed program header can produce.
     pub const fn memory_end(self) -> Result<u64> {
         match self.virtual_address.checked_add(self.memory_size) {
             Some(end) => Ok(end),
-            None => Err(Error::OutOfRange),
+            None => Err(Error::InvalidImage),
         }
     }
 }
@@ -511,7 +514,10 @@ mod tests {
         let mut image = minimal_elf();
         image[0x40 + 16..0x40 + 24].copy_from_slice(&0xffff_ffff_ffff_f000u64.to_le_bytes());
         image[0x40 + 40..0x40 + 48].copy_from_slice(&0x2000u64.to_le_bytes());
-        assert!(matches!(Elf64Image::parse(&image), Err(Error::OutOfRange)));
+        assert!(matches!(
+            Elf64Image::parse(&image),
+            Err(Error::InvalidImage)
+        ));
 
         // p_memsz itself is unrepresentable once the address is added.
         let mut image = minimal_elf();
