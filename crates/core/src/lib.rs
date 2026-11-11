@@ -22,6 +22,7 @@ pub mod nt;
 pub mod object_namespace;
 pub mod paging;
 pub mod path;
+pub mod pe_export;
 pub mod pe_import;
 pub mod pe_reloc;
 pub mod personality;
