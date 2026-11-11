@@ -42,13 +42,15 @@ cargo run -p wuxia-xtask -- iso
 
 The ISO is written to `target/wuxia.iso`.
 
-To watch the kernel boot interactively:
+One command builds the ISO, boots it headless, checks the serial log for every required marker and fails on a missing marker, a hang or a non-zero QEMU exit:
 
 ```sh
 cargo run -p wuxia-xtask -- qemu-test
 ```
 
-The bootstrap kernel deliberately halts, so an interactive QEMU session does not exit on its own. Stop it with your terminal's timeout/interrupt command. A passing serial log contains:
+`qemu-run` builds the ISO and keeps serial output on the terminal for interactive inspection. Because the bootstrap ends with `exit(0)`, it terminates on its own; `qemu-run` is mainly useful while debugging. `ci` runs the host tests and then the self-checking boot.
+
+A passing serial log contains:
 
 ```text
 WUXIA_BOOT_OK: Limine entered the high-half kernel

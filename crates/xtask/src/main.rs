@@ -3,7 +3,26 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+/// Markers every successful boot must print, in order-independent presence.
+const BOOT_MARKERS: &[&str] = &[
+    "WUXIA_BOOT_OK",
+    "WUXIA_GDT_OK",
+    "WUXIA_BREAKPOINT_OK",
+    "WUXIA_MEMORY_MAP_READY",
+    "WUXIA_FRAME_ALLOC_OK",
+    "WUXIA_HHDM_OK",
+    "WUXIA_USER_IMAGE_OK",
+    "WUXIA_CR3_OK",
+    "WUXIA_POST_SWITCH_PASS",
+    "WUXIA_ENTER_USER",
+    "WUXIA_SYSCALL_GETPID",
+    "WUXIA_SYSCALL_EXIT",
+    "WUXIA_TEST_PASS",
+];
 
 fn main() -> ExitCode {
     let command = env::args().nth(1).unwrap_or_else(|| "help".into());
@@ -12,12 +31,18 @@ fn main() -> ExitCode {
         "build-kernel" => build_kernel(),
         "iso" => build_iso(),
         "qemu-test" => qemu_test(),
+        "qemu-run" => qemu_run(),
+        "ci" => ci(),
         "help" | "--help" | "-h" => {
-            println!("Usage: cargo run -p wuxia-xtask -- <test|build-kernel|iso|qemu-test>");
+            println!(
+                "Usage: cargo run -p wuxia-xtask -- <test|build-kernel|iso|qemu-test|qemu-run|ci>"
+            );
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("unknown command {command:?}; use test, build-kernel, iso, qemu-test");
+            eprintln!(
+                "unknown command {command:?}; use test, build-kernel, iso, qemu-test, qemu-run, ci"
+            );
             ExitCode::FAILURE
         }
     }
@@ -162,9 +187,80 @@ fn build_iso() -> ExitCode {
     }
 }
 
+/// Build the ISO, boot it headless and require every marker to appear.
 fn qemu_test() -> ExitCode {
+    if build_iso() != ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
+    }
+    let log = PathBuf::from("target/serial.log");
+    let _ = fs::remove_file(&log);
+    let serial = format!("file:{}", log.display());
+    let child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M",
+            "q35",
+            "-m",
+            "128M",
+            "-display",
+            "none",
+            "-serial",
+            &serial,
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            "-cdrom",
+            "target/wuxia.iso",
+            "-boot",
+            "d",
+            "-no-reboot",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("cannot run QEMU: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let status = match wait_with_timeout(&mut child, Duration::from_secs(60)) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{error}");
+            let _ = child.kill();
+            return ExitCode::FAILURE;
+        }
+    };
+    let serial_text = fs::read_to_string(&log).unwrap_or_default();
+    let missing: Vec<&str> = BOOT_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| !serial_text.contains(marker))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("boot log is missing markers: {missing:?}");
+        eprintln!("--- serial log ---\n{serial_text}");
+        return ExitCode::FAILURE;
+    }
+    match status.code() {
+        Some(33) => {
+            println!("QEMU boot verified: {} markers present", BOOT_MARKERS.len());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("QEMU test failed with status {status}");
+            eprintln!("--- serial log ---\n{serial_text}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run QEMU interactively with serial output on the terminal.
+fn qemu_run() -> ExitCode {
+    if build_iso() != ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
+    }
     let mut command = Command::new("qemu-system-x86_64");
-    command.args(["-display", "none"]);
     command.args([
         "-M",
         "q35",
@@ -183,14 +279,35 @@ fn qemu_test() -> ExitCode {
         "-no-reboot",
     ]);
     match command.status() {
-        Ok(status) if status.code() == Some(33) => ExitCode::SUCCESS,
-        Ok(status) => {
-            eprintln!("QEMU test failed with status {status}");
-            ExitCode::FAILURE
-        }
+        Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("cannot run QEMU: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Host tests followed by a self-checking boot.
+fn ci() -> ExitCode {
+    if run_tests() != ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
+    }
+    qemu_test()
+}
+
+fn wait_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                return Err(format!("QEMU did not exit within {timeout:?}"));
+            }
+            Ok(None) => sleep(Duration::from_millis(100)),
+            Err(error) => return Err(format!("cannot wait for QEMU: {error}")),
         }
     }
 }
