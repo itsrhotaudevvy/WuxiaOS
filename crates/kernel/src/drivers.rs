@@ -48,6 +48,16 @@ pub const DRIVER_BASE: u64 = 0xffff_9700_0000_0000;
 /// Highest number of sections a driver image may have.
 pub const MAX_SECTIONS: usize = 8;
 
+/// Address of the page holding the objects a driver is handed at entry.
+///
+/// It sits just above the image's own sections so a driver's data can never be
+/// mistaken for the objects it was given.
+pub const OBJECTS_ADDRESS: u64 = DRIVER_BASE + 0x8000;
+
+/// Name the driver is described by, and the service key its registry path names.
+pub const DRIVER_NAME: &str = "wuxia";
+pub const SERVICE_NAME: &str = "wuxia";
+
 /// A loaded image's entry point.
 #[derive(Clone, Copy)]
 pub struct Loaded {
@@ -59,6 +69,10 @@ pub struct Loaded {
     pub relocations: usize,
     /// Number of import address table slots bound to kernel routines.
     pub imports: usize,
+    /// Address of the `DRIVER_OBJECT` the entry point is handed.
+    pub driver_object: u64,
+    /// Address of the registry path `UNICODE_STRING` the entry point is handed.
+    pub registry_path: u64,
 }
 
 /// Load a kernel-mode image and return where it was mapped and where to enter it.
@@ -76,6 +90,9 @@ pub fn load<const N: usize>(
     let relocations =
         paging::apply_pe_relocations_at(direct_map, paging::read_cr3(), image, DRIVER_BASE)?;
     let imports = bind_imports(&plan, image, DRIVER_BASE)?;
+    // A driver is entered with the objects it expects, so they are written before
+    // the image takes its final permissions and never touched afterwards.
+    let objects = publish_objects(allocator, direct_map, image)?;
     // The contents are final, so the image takes its real permissions: code
     // read-only and executable, data writable and non-executable.
     paging::protect_kernel_image(direct_map, &plan)?;
@@ -84,7 +101,32 @@ pub fn load<const N: usize>(
         entry: plan.entry(),
         relocations,
         imports,
+        driver_object: OBJECTS_ADDRESS + objects.driver_object as u64,
+        registry_path: OBJECTS_ADDRESS + objects.registry_path as u64,
     })
+}
+
+/// Map the objects page and fill it with the driver object and registry path.
+fn publish_objects<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    image: &[u8],
+) -> Result<wuxia_core::driver_object::Objects> {
+    let frame = paging::map_kernel_data_page(allocator, direct_map, OBJECTS_ADDRESS)?;
+    let (_, size) = wuxia_core::pe_common::image_base_and_size(image)?;
+    let size = u64::from(size);
+    let block = direct_map.physical_to_virtual(frame)? as *mut u8;
+    // SAFETY: the frame is a freshly zeroed page mapped writable in the active
+    // address space, so writing the object block into it is exactly what it is for.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(block, PAGE_SIZE as usize) };
+    wuxia_core::driver_object::write(
+        bytes,
+        OBJECTS_ADDRESS,
+        DRIVER_BASE,
+        size,
+        DRIVER_NAME,
+        SERVICE_NAME,
+    )
 }
 
 /// Point every import address table slot at the routine that serves its name.

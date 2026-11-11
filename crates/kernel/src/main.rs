@@ -426,18 +426,27 @@ pub extern "C" fn _start() -> ! {
     log::write_hex(driver.base);
     log::write_hex(driver.entry);
     log::write_hex(driver.relocations as u64);
+    // A driver's entry point takes the driver object and the registry path in the
+    // Windows argument registers, so the call uses that convention as well.
     // SAFETY: the entry point is the start of a mapped, executable code page of a
-    // native image, which is the convention a driver entry point uses.
+    // native image, and both addresses name objects this loader wrote.
     let status = unsafe {
-        let entry: extern "sysv64" fn() -> u64 = core::mem::transmute(driver.entry);
-        entry()
+        let entry: extern "win64" fn(u64, u64) -> u32 = core::mem::transmute(driver.entry);
+        entry(driver.driver_object, driver.registry_path)
     };
     log::write_str("WUXIA_DRIVER_ENTRY\n");
-    log::write_hex(status);
+    log::write_hex(u64::from(status));
+    assert_eq!(status, 0, "the driver entry point did not report success");
+    // The driver stored the object it was handed; the boot checks it received the
+    // one the loader published, which proves both arguments arrived.
+    // SAFETY: the slot is inside the driver's writable data section.
+    let received = unsafe { core::ptr::read_volatile((driver.base + 0x2070) as *const u64) };
     assert_eq!(
-        status, 0x1234,
-        "the driver entry point did not return the constant it reaches through its relocated pointer"
+        received, driver.driver_object,
+        "the driver was handed a different driver object"
     );
+    log::write_str("WUXIA_DRIVER_OBJECT_OK\n");
+    log::write_hex(received);
     log::write_str("WUXIA_DRIVER_IMPORTS\n");
     log::write_hex(driver.imports as u64);
     assert_eq!(driver.imports, 4, "not every import was bound");

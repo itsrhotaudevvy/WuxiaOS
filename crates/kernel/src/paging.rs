@@ -469,6 +469,24 @@ pub fn map_kernel_image<const N: usize>(
     Ok(())
 }
 
+/// Map one writable, non-executable page of kernel data and return its frame.
+pub fn map_kernel_data_page<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    address: u64,
+) -> Result<u64, Error> {
+    let frame = allocator.allocate().ok_or(Error::TableFull)?;
+    zero_frame(direct_map, frame)?;
+    map_kernel_page(
+        allocator,
+        direct_map,
+        address,
+        frame,
+        PagePermissions::KERNEL_READ_WRITE,
+    )?;
+    Ok(frame)
+}
+
 /// Apply the plan's permissions to an image that was mapped for loading.
 ///
 /// Every written page becomes what the plan asked for: code read-only and

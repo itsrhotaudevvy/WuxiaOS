@@ -17,6 +17,7 @@ pub mod descriptor;
 pub mod dirtree;
 pub mod dispatcher;
 pub mod dospath;
+pub mod driver_object;
 pub mod elf;
 pub mod elf_reloc;
 pub mod errno;
