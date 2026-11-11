@@ -37,6 +37,7 @@ pub mod pe_export;
 pub mod pe_import;
 pub mod pe_pdata;
 pub mod pe_reloc;
+pub mod pe_resource;
 pub mod pe_tls;
 pub mod personality;
 pub mod pipe;
