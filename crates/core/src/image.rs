@@ -84,7 +84,11 @@ impl<'a> PeImage<'a> {
             0x10b | 0x20b => return Err(Error::Unsupported),
             _ => return Err(Error::InvalidImage),
         };
-        if optional_size < 112 {
+        let minimum_optional_size = match kind {
+            PeKind::Pe32 => 96,
+            PeKind::Pe32Plus => 112,
+        };
+        if optional_size < minimum_optional_size {
             return Err(Error::InvalidImage);
         }
         let table_size = (section_count as usize).checked_mul(40).ok_or(Error::InvalidImage)?;
@@ -121,6 +125,17 @@ impl<'a> PeImage<'a> {
     pub fn info(&self) -> Result<PeInfo> {
         let entry_rva = read_u32(self.bytes, self.optional_offset + 16)?;
         let size_of_image = read_u32(self.bytes, self.optional_offset + 56)?;
+        if size_of_image == 0 || (entry_rva != 0 && entry_rva >= size_of_image) {
+            return Err(Error::InvalidImage);
+        }
+        for index in 0..self.section_count as usize {
+            let section = self.section(index)?;
+            let end = section.virtual_address.checked_add(section.virtual_size.max(section.raw_size))
+                .ok_or(Error::InvalidImage)?;
+            if end > size_of_image {
+                return Err(Error::InvalidImage);
+            }
+        }
         let image_base = match self.kind {
             PeKind::Pe32 => read_u32(self.bytes, self.optional_offset + 28)? as u64,
             PeKind::Pe32Plus => read_u64(self.bytes, self.optional_offset + 24)?,
@@ -143,6 +158,12 @@ impl<'a> PeImage<'a> {
         let raw_size = read_u32(header, 16)?;
         let raw_offset = read_u32(header, 20)? as usize;
         let end = raw_offset.checked_add(raw_size as usize).ok_or(Error::InvalidImage)?;
+        if raw_size != 0 && raw_offset < self.sections_offset + self.section_count as usize * 40 {
+            return Err(Error::InvalidImage);
+        }
+        if raw_size == 0 && raw_offset > self.bytes.len() {
+            return Err(Error::InvalidImage);
+        }
         if self.bytes.get(raw_offset..end).is_none() {
             return Err(Error::InvalidImage);
         }
