@@ -1,4 +1,4 @@
-//! Minimal read-only in-memory file system shared by every personality.
+//! Minimal in-memory file system shared by every personality.
 //!
 //! The store has a fixed capacity and never allocates, so both userspace
 //! personalities can resolve the same files without a heap. Names and contents
@@ -22,7 +22,8 @@ struct File {
     length: usize,
 }
 
-/// A fixed-capacity read-only file store.
+/// A fixed-capacity in-memory file store. Writes update a file in place; only
+/// the file that ends the store can grow, up to the store's byte capacity.
 #[derive(Clone, Copy, Debug)]
 pub struct MemFs<const FILES: usize, const BYTES: usize> {
     files: [Option<File>; FILES],
