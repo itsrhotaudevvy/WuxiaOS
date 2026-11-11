@@ -13,6 +13,7 @@ use limine::request::{MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, 
 
 mod gdt;
 mod idt;
+mod memory;
 
 #[used]
 #[unsafe(link_section = ".requests")]
