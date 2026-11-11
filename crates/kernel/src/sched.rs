@@ -161,6 +161,46 @@ pub fn map_current(length: u64) -> Option<u64> {
     }
 }
 
+/// Unmap a previously mapped anonymous range from the running process.
+pub fn unmap_current(address: u64, length: u64) -> bool {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        let Some(thread) = threads[current].as_mut() else {
+            return false;
+        };
+        let Some(region) = thread.process.space().region_at(address) else {
+            return false;
+        };
+        if region.start != address || region.length != length {
+            return false;
+        }
+        let direct_map = match crate::paging::current_direct_map() {
+            Some(direct_map) => direct_map,
+            None => return false,
+        };
+        let root = thread.root;
+        let mut released = 0u64;
+        let result = crate::paging::unmap_user_range(
+            direct_map,
+            root,
+            &mut thread.frames,
+            address,
+            length,
+            |frame| {
+                if crate::memory::free_frame(frame).is_ok() {
+                    released += 1;
+                }
+            },
+        );
+        if result.is_err() || released != length / wuxia_core::paging::PAGE_SIZE {
+            return false;
+        }
+        thread.process.space_mut().unmap(address, length).is_ok()
+    }
+}
+
 /// Mark the running process exited, rejecting a second exit.
 pub fn exit_process(code: u64) -> bool {
     // SAFETY: traps are non-nesting and the current index is stable here.

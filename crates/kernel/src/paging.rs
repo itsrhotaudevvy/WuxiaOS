@@ -49,6 +49,16 @@ impl FrameTracker {
         Ok(frame)
     }
 
+    /// Drop a frame that has already been returned to the pool.
+    pub fn forget(&mut self, frame: u64) -> bool {
+        let Some(index) = self.frames[..self.len].iter().position(|&f| f == frame) else {
+            return false;
+        };
+        self.frames[index] = self.frames[self.len - 1];
+        self.len -= 1;
+        true
+    }
+
     /// The recorded frames.
     pub fn frames(&self) -> &[u64] {
         &self.frames[..self.len]
@@ -237,6 +247,68 @@ static mut DIRECT_MAP_OFFSET: u64 = 0;
 pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error> {
     let reader = DirectMapReader { direct_map };
     walk(&reader, read_cr3(), virtual_address)
+}
+
+/// Whether an entry maps a large page rather than a subtable.
+fn is_huge(entry: u64) -> bool {
+    entry & (1 << 7) != 0
+}
+
+/// Invalidate one page-table entry in the translation lookaside buffer.
+fn invalidate(address: u64) {
+    // SAFETY: invlpg only affects the current address space's cached mapping.
+    unsafe {
+        core::arch::asm!("invlpg [{0}]", in(reg) address, options(nostack, preserves_flags));
+    }
+}
+
+/// Resolve the leaf slot for `address` without changing anything.
+fn leaf_slot(direct_map: DirectMap, root: u64, address: u64) -> Result<(*mut u64, usize), Error> {
+    let mut table = root;
+    for level in 0..3usize {
+        let entry = read_entry(
+            frame_pointer(direct_map, table)?,
+            table_index(address, level)?,
+        );
+        if !is_present(entry) || is_huge(entry) {
+            return Err(Error::NotFound);
+        }
+        table = physical_address(entry);
+    }
+    Ok((frame_pointer(direct_map, table)?, table_index(address, 3)?))
+}
+
+/// Clear `length` mapped pages, releasing each frame through `release`.
+///
+/// The caller must have validated that the range is one contiguous region of
+/// the running process.
+pub fn unmap_user_range(
+    direct_map: DirectMap,
+    root: u64,
+    tracker: &mut FrameTracker,
+    address: u64,
+    length: u64,
+    mut release: impl FnMut(u64),
+) -> Result<(), Error> {
+    if !address.is_multiple_of(PAGE_SIZE) || length == 0 || !length.is_multiple_of(PAGE_SIZE) {
+        return Err(Error::InvalidInput);
+    }
+    for page in 0..length / PAGE_SIZE {
+        let page_address = address
+            .checked_add(page * PAGE_SIZE)
+            .ok_or(Error::OutOfRange)?;
+        let (table, index) = leaf_slot(direct_map, root, page_address)?;
+        let entry = read_entry(table, index);
+        if !is_present(entry) || is_huge(entry) {
+            return Err(Error::NotFound);
+        }
+        write_entry(table, index, 0);
+        invalidate(page_address);
+        let frame = physical_address(entry);
+        tracker.forget(frame);
+        release(frame);
+    }
+    Ok(())
 }
 
 /// Map a fresh writable range into an existing user root at runtime.

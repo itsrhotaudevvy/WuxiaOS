@@ -31,6 +31,8 @@ pub enum PosixCall {
     Close = 3,
     /// Map anonymous writable memory.
     Map = 9,
+    /// Unmap a previously mapped anonymous range.
+    Unmap = 11,
     /// Yield the processor to another runnable thread.
     Yield = 24,
     /// Return the process identifier.
@@ -46,6 +48,7 @@ impl PosixCall {
             1 => Some(Self::Write),
             3 => Some(Self::Close),
             9 => Some(Self::Map),
+            11 => Some(Self::Unmap),
             24 => Some(Self::Yield),
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
@@ -81,6 +84,13 @@ pub enum PosixRequest {
         /// Requested byte length, bounded by [`MAX_MAP_LENGTH`].
         length: u64,
     },
+    /// Unmap a page-aligned anonymous range.
+    Unmap {
+        /// First page-aligned address.
+        address: u64,
+        /// Length in bytes, a page multiple.
+        length: u64,
+    },
     /// Close a process-local descriptor.
     Close {
         /// Descriptor to close.
@@ -108,6 +118,10 @@ impl PosixRequest {
             PosixCall::Map => Ok(Self::Map {
                 length: decode_map_length(registers.args[0])?,
             }),
+            PosixCall::Unmap => Ok(Self::Unmap {
+                address: decode_unmap_address(registers.args[0])?,
+                length: decode_map_length(registers.args[1])?,
+            }),
             PosixCall::Close => Ok(Self::Close {
                 descriptor: decode_descriptor(registers.args[0])?,
             }),
@@ -120,8 +134,18 @@ impl PosixRequest {
     }
 }
 
+fn decode_unmap_address(raw: u64) -> Result<u64> {
+    if raw == 0
+        || !raw.is_multiple_of(crate::paging::PAGE_SIZE)
+        || raw >= crate::paging::USER_ADDRESS_LIMIT
+    {
+        return Err(Error::BadAddress);
+    }
+    Ok(raw)
+}
+
 fn decode_map_length(raw: u64) -> Result<u64> {
-    if raw == 0 || raw > MAX_MAP_LENGTH {
+    if raw == 0 || raw > MAX_MAP_LENGTH || !raw.is_multiple_of(crate::paging::PAGE_SIZE) {
         return Err(Error::InvalidInput);
     }
     Ok(raw)
@@ -184,6 +208,28 @@ mod tests {
         registers.args[0] = MAX_MAP_LENGTH + 1;
         assert_eq!(
             PosixRequest::decode(9, &registers),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn unmap_requests_require_aligned_ranges() {
+        let mut registers = Registers {
+            args: [0x8000_1000, 4096, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(11, &registers),
+            Ok(PosixRequest::Unmap {
+                address: 0x8000_1000,
+                length: 4096
+            })
+        );
+        registers.args[0] = 0x8000_1001;
+        assert_eq!(PosixRequest::decode(11, &registers), Err(Error::BadAddress));
+        registers.args[0] = 0x8000_1000;
+        registers.args[1] = 0x1001;
+        assert_eq!(
+            PosixRequest::decode(11, &registers),
             Err(Error::InvalidInput)
         );
     }

@@ -374,6 +374,15 @@ fn service_syscall(frame: &mut InterruptFrame) {
                 }
             }
         }
+        Ok(wuxia_core::syscall::PosixRequest::Unmap { address, length }) => {
+            if crate::sched::unmap_current(address, length) {
+                serial::write_str("WUXIA_SYSCALL_UNMAP\n");
+                frame.rax = 0;
+            } else {
+                serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                frame.rax = u64::MAX;
+            }
+        }
         Ok(wuxia_core::syscall::PosixRequest::Close { descriptor }) => {
             if crate::sched::close_descriptor(descriptor) {
                 serial::write_str("WUXIA_SYSCALL_CLOSE\n");
