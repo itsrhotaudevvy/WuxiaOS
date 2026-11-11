@@ -1,4 +1,16 @@
-//! x86_64 interrupt descriptor table encoding and loading.
+//! x86_64 interrupt descriptor table: gates, stubs and dispatch.
+//!
+//! Every gate funnels into one naked stub that saves general-purpose
+//! registers, calls a Rust dispatcher with a stable frame layout, restores the
+//! registers and returns with `iretq`. The same path serves CPL0 and CPL3
+//! traps because the CPU-supplied frame differs only by the extra `RSP`/`SS`.
+
+use core::arch::asm;
+use core::mem::size_of;
+use core::ptr::addr_of_mut;
+
+use crate::gdt::KERNEL_CODE_SELECTOR;
+use crate::serial;
 
 /// A 64-bit interrupt gate descriptor in the hardware-required layout.
 #[derive(Clone, Copy, Debug, Default)]
@@ -14,7 +26,7 @@ pub struct IdtEntry {
 }
 
 impl IdtEntry {
-    /// Construct a present interrupt gate without installing it in the CPU.
+    /// Construct a not-present gate.
     pub const fn missing() -> Self {
         Self {
             offset_low: 0,
@@ -27,28 +39,26 @@ impl IdtEntry {
         }
     }
 
-    /// Construct a present interrupt gate without installing it in the CPU.
+    /// Construct a present 64-bit interrupt gate.
     pub const fn interrupt(handler: usize, selector: u16, privilege: u8) -> Self {
         Self {
             offset_low: handler as u16,
             offset_middle: (handler >> 16) as u16,
             offset_high: (handler >> 32) as u32,
-            selector: 0x08,
+            selector,
             ist: 0,
-            attributes: 0x8e | (privilege << 5),
+            attributes: 0x8e | ((privilege & 0x3) << 5),
             reserved: 0,
         }
     }
 }
 
-/// The IDT pointer consumed by `lidt`.
-#[derive(Clone, Copy, Debug, Default)]
+/// The 10-byte pointer consumed by `lidt`.
+#[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
-pub struct IdtPointer {
-    /// One less than the size of the IDT in bytes.
-    pub limit: u16,
-    /// Linear address of the table.
-    pub base: u64,
+struct IdtPointer {
+    limit: u16,
+    base: u64,
 }
 
 /// A 256-entry table of interrupt and exception gates.
@@ -62,29 +72,212 @@ impl Idt {
     /// Construct an empty IDT with all descriptors marked not-present.
     pub const fn new() -> Self {
         Self {
-            entries: [IdtEntry {
-                offset_low: 0,
-                selector: 0,
-                ist: 0,
-                attributes: 0,
-                offset_middle: 0,
-                offset_high: 0,
-                reserved: 0,
-            }; 256],
+            entries: [IdtEntry::missing(); 256],
         }
     }
 
-    /// Set one exception vector's descriptor.
+    /// Set one vector's descriptor.
     pub fn set_handler(&mut self, vector: u8, handler: usize, privilege: u8) {
-        self.entries[vector as usize] = IdtEntry::interrupt(handler, 0x08, privilege);
+        self.entries[vector as usize] = IdtEntry::interrupt(handler, KERNEL_CODE_SELECTOR, privilege);
     }
 
-    /// Install the table after all required exception stubs are present.
+    /// Load the table with `lidt`.
     pub fn load(&self) {
-        // SAFETY: This routine is called only after the caller has populated a
-        // complete static IDT and validated its handler addresses.
-        unsafe {
-            core::arch::asm!("lidt [{0}]", in(reg) &self, options(readonly, nostack, preserves_flags))
+        let pointer = IdtPointer {
+            limit: (size_of::<Self>() - 1) as u16,
+            base: self as *const Self as u64,
         };
+        // SAFETY: `pointer` describes this static table, which outlives the CPU
+        // configuration and was fully populated before the call.
+        unsafe {
+            asm!("lidt [{0}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
+        }
     }
+}
+
+/// Registers and trap frame as laid out by [`common_stub`].
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct InterruptFrame {
+    /// Saved general-purpose registers, lowest address first.
+    pub r15: u64,
+    /// See `r15`.
+    pub r14: u64,
+    /// See `r15`.
+    pub r13: u64,
+    /// See `r15`.
+    pub r12: u64,
+    /// See `r15`.
+    pub r11: u64,
+    /// See `r15`.
+    pub r10: u64,
+    /// See `r15`.
+    pub r9: u64,
+    /// See `r15`.
+    pub r8: u64,
+    /// See `r15`.
+    pub rdi: u64,
+    /// See `r15`.
+    pub rsi: u64,
+    /// See `r15`.
+    pub rbp: u64,
+    /// See `r15`.
+    pub rbx: u64,
+    /// See `r15`.
+    pub rdx: u64,
+    /// See `r15`.
+    pub rcx: u64,
+    /// See `r15`.
+    pub rax: u64,
+    /// Interrupt vector number.
+    pub vector: u64,
+    /// Hardware error code, or zero for vectors that do not push one.
+    pub error: u64,
+    /// Faulting instruction pointer.
+    pub rip: u64,
+    /// Code selector at the time of the trap.
+    pub cs: u64,
+    /// Saved flags.
+    pub rflags: u64,
+}
+
+/// Install handlers for the vectors the bootstrap can currently service.
+pub fn init() {
+    // SAFETY: bootstrap is single-threaded; the static IDT is written once.
+    unsafe {
+        let idt = &mut *addr_of_mut!(IDT);
+        idt.set_handler(3, breakpoint as usize, 3);
+        idt.set_handler(6, invalid_opcode as usize, 0);
+        idt.set_handler(13, general_protection as usize, 0);
+        idt.set_handler(14, page_fault as usize, 0);
+        idt.set_handler(0x80, syscall_gate as usize, 3);
+        idt.load();
+    }
+}
+
+static mut IDT: Idt = Idt::new();
+
+macro_rules! isr {
+    ($name:ident, $vector:expr) => {
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() {
+            core::arch::naked_asm!(
+                "push 0",
+                "push {vector}",
+                "jmp {common}",
+                vector = const $vector,
+                common = sym common_stub,
+            )
+        }
+    };
+}
+
+macro_rules! isr_error {
+    ($name:ident, $vector:expr) => {
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() {
+            core::arch::naked_asm!(
+                "push {vector}",
+                "jmp {common}",
+                vector = const $vector,
+                common = sym common_stub,
+            )
+        }
+    };
+}
+
+isr!(breakpoint, 3);
+isr!(invalid_opcode, 6);
+isr_error!(general_protection, 13);
+isr_error!(page_fault, 14);
+isr!(syscall_gate, 0x80);
+
+#[unsafe(naked)]
+unsafe extern "C" fn common_stub() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "call {dispatcher}",
+        "mov rsp, rbp",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "add rsp, 16",
+        "iretq",
+        dispatcher = sym dispatch,
+    );
+}
+
+extern "C" fn dispatch(frame: *mut InterruptFrame) {
+    // SAFETY: the stub builds a complete frame and passes its address; no other
+    // reference to the frame exists during the call.
+    let frame = unsafe { &*frame };
+    match frame.vector {
+        3 => serial::write_str("WUXIA_BREAKPOINT_OK\n"),
+        6 => {
+            serial::write_str("WUXIA_UD_FAULT\n");
+            serial::write_hex(frame.rip);
+        }
+        13 => {
+            serial::write_str("WUXIA_GP_FAULT\n");
+            serial::write_hex(frame.error);
+            serial::write_hex(frame.rip);
+        }
+        14 => {
+            let address = read_cr2();
+            serial::write_str("WUXIA_PAGE_FAULT\n");
+            serial::write_hex(frame.error);
+            serial::write_hex(address);
+            serial::write_hex(frame.rip);
+        }
+        0x80 => serial::write_str("WUXIA_SYSCALL_OK\n"),
+        _ => {
+            serial::write_str("WUXIA_UNEXPECTED_VECTOR\n");
+            serial::write_hex(frame.vector);
+        }
+    }
+}
+
+fn read_cr2() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR2 has no side effects.
+    unsafe {
+        asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Load the IDT and immediately trigger a breakpoint to prove the path works.
+pub fn self_test() {
+    init();
+    // SAFETY: the breakpoint gate is installed and its handler returns cleanly.
+    unsafe { asm!("int3", options(nomem, nostack)) };
 }
