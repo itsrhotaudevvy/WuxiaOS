@@ -74,7 +74,14 @@ pub const CTRL_ASDE: u32 = 1 << 5;
 /// `STATUS.LU`: link is up.
 pub const STATUS_LU: u32 = 1 << 1;
 
-/// `TCTL.EN`: enable the transmit path.
+/// `RCTL.EN`: enable the receive path.
+pub const RCTL_EN: u32 = 1 << 1;
+/// `RCTL.BAM`: accept broadcast frames.
+pub const RCTL_BAM: u32 = 1 << 15;
+/// `RCTL.SECRC`: the device strips the Ethernet FCS.
+pub const RCTL_SECRC: u32 = 1 << 26;
+
+/// Transmit descriptor command: end of packet.
 pub const TCTL_EN: u32 = 1 << 1;
 /// `TCTL.PSP`: pad short packets.
 pub const TCTL_PSP: u32 = 1 << 3;
@@ -93,6 +100,11 @@ pub const TX_CMD_RS: u8 = 1 << 3;
 
 /// Transmit descriptor status: descriptor done.
 pub const TX_STATUS_DD: u8 = 1 << 0;
+
+/// Receive descriptor status: descriptor done.
+pub const RX_STATUS_DD: u8 = 1 << 0;
+/// Receive descriptor status: end of packet.
+pub const RX_STATUS_EOP: u8 = 1 << 1;
 
 /// Smallest Ethernet frame the controller must be willing to send.
 pub const MIN_FRAME: usize = 60;
@@ -239,6 +251,84 @@ pub const fn transmit_control() -> u32 {
     distance | threshold | TCTL_PSP | TCTL_EN
 }
 
+/// One legacy receive descriptor, as the controller writes it back.
+///
+/// The receive layout differs from the transmit layout: after the 64-bit buffer
+/// address come a 16-bit length and checksum, then the status and error bytes at
+/// offsets 12 and 13.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RxDescriptor {
+    /// Number of bytes the controller wrote into the buffer.
+    pub length: u16,
+    /// Status bits, including [`RX_STATUS_DD`] and [`RX_STATUS_EOP`].
+    pub status: u8,
+    /// Error bits reported by the controller.
+    pub errors: u8,
+}
+
+impl RxDescriptor {
+    /// Decode a descriptor the controller has written.
+    ///
+    /// Errors: [`Error::InvalidImage`] when the sixteen bytes are not a
+    /// completed frame (no done bit) and [`Error::InvalidInput`] when the
+    /// reported length cannot be an Ethernet frame.
+    pub fn parse(bytes: &[u8; DESCRIPTOR_SIZE]) -> Result<Self> {
+        let length = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let status = bytes[12];
+        let errors = bytes[13];
+        if status & RX_STATUS_DD == 0 {
+            return Err(Error::InvalidImage);
+        }
+        if usize::from(length) < MIN_FRAME || usize::from(length) > MAX_FRAME {
+            return Err(Error::InvalidInput);
+        }
+        Ok(Self {
+            length,
+            status,
+            errors,
+        })
+    }
+
+    /// Whether the descriptor reports a complete, error-free frame.
+    pub const fn is_usable(&self) -> bool {
+        self.status & RX_STATUS_EOP != 0 && self.errors == 0
+    }
+}
+
+/// Build the value written to [`RCTL`] to accept frames.
+///
+/// Broadcast frames are accepted so an address resolution reply can arrive;
+/// the controller strips the FCS so the buffer holds only the frame as sent.
+pub const fn receive_control() -> u32 {
+    RCTL_EN | RCTL_BAM | RCTL_SECRC
+}
+
+/// Build an address-resolution request for `target_ip`.
+///
+/// The result is a complete Ethernet frame without the FCS, which the caller
+/// pads to [`MIN_FRAME`] before sending. An ARP request is the smallest frame
+/// that makes a conforming peer answer, so it is the cheapest end-to-end test of
+/// a transmit and receive pair.
+pub fn arp_request(source: [u8; 6], sender_ip: [u8; 4], target_ip: [u8; 4]) -> [u8; 42] {
+    let mut frame = [0u8; 42];
+    frame[..6].fill(0xff);
+    frame[6..12].copy_from_slice(&source);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&1u16.to_be_bytes());
+    frame[22..28].copy_from_slice(&source);
+    frame[28..32].copy_from_slice(&sender_ip);
+    frame[32..38].fill(0);
+    frame[38..42].copy_from_slice(&target_ip);
+    frame
+}
+
+/// Ethertype of an address-resolution frame.
+pub const ETHERTYPE_ARP: u16 = 0x0806;
+
 /// Build the value written to [`CTRL`] to bring the link up with autonegotiation.
 pub const fn link_up_control() -> u32 {
     CTRL_SLU | CTRL_ASDE
@@ -323,6 +413,47 @@ mod tests {
         assert_eq!(mac_words([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]), words);
         assert_eq!(eeprom_read_command(2), EERD_START | 0x200);
         assert_eq!(eeprom_read_data(0x1234_abcd), 0x1234);
+    }
+
+    #[test]
+    fn receive_descriptors_report_completed_frames() {
+        let mut bytes = [0u8; DESCRIPTOR_SIZE];
+        bytes[..8].copy_from_slice(&0x2_0000u64.to_le_bytes());
+        bytes[8..10].copy_from_slice(&64u16.to_le_bytes());
+        bytes[12] = RX_STATUS_DD | RX_STATUS_EOP;
+        let descriptor = RxDescriptor::parse(&bytes).unwrap();
+        assert_eq!(descriptor.length, 64);
+        assert!(descriptor.is_usable());
+
+        // Without the done bit the descriptor is not complete.
+        bytes[12] = 0;
+        assert_eq!(RxDescriptor::parse(&bytes), Err(Error::InvalidImage));
+
+        // A zero-length completion is not an Ethernet frame.
+        bytes[12] = RX_STATUS_DD;
+        bytes[8..10].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(RxDescriptor::parse(&bytes), Err(Error::InvalidInput));
+
+        assert_ne!(receive_control() & RCTL_EN, 0);
+    }
+
+    #[test]
+    fn address_resolution_requests_have_the_expected_layout() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let frame = arp_request(mac, [10, 0, 2, 15], [10, 0, 2, 2]);
+        assert_eq!(frame.len(), 42);
+        assert_eq!(&frame[..6], &[0xff; 6]);
+        assert_eq!(&frame[6..12], &mac);
+        assert_eq!(&frame[12..14], &ETHERTYPE_ARP.to_be_bytes());
+        assert_eq!(&frame[14..16], &1u16.to_be_bytes());
+        assert_eq!(&frame[16..18], &0x0800u16.to_be_bytes());
+        assert_eq!(frame[18], 6);
+        assert_eq!(frame[19], 4);
+        assert_eq!(&frame[20..22], &1u16.to_be_bytes());
+        assert_eq!(&frame[22..28], &mac);
+        assert_eq!(&frame[28..32], &[10, 0, 2, 15]);
+        assert_eq!(&frame[32..38], &[0; 6]);
+        assert_eq!(&frame[38..42], &[10, 0, 2, 2]);
     }
 
     #[test]

@@ -19,14 +19,21 @@ use wuxia_core::Result;
 use wuxia_core::frames::FramePool;
 use wuxia_core::hhdm::DirectMap;
 use wuxia_core::net::{
-    CTRL, CTRL_RST, DESCRIPTOR_SIZE, EERD, EERD_DONE, MAX_FRAME, MIN_FRAME, RAH, RAL, RING_BYTES,
-    STATUS, STATUS_LU, TCTL, TDBAH, TDBAL, TDH, TDLEN, TDT, TX_CMD_EOP, TX_CMD_IFCS, TX_CMD_RS,
-    TxDescriptor, eeprom_read_command, eeprom_read_data, link_up_control, mac_from_eeprom,
-    mac_from_registers, register, transmit_control,
+    CTRL, CTRL_RST, DESCRIPTOR_SIZE, EERD, EERD_DONE, MAX_FRAME, MIN_FRAME, RAH, RAL, RCTL, RDBAH,
+    RDBAL, RDH, RDLEN, RDT, RING_BYTES, RING_DESCRIPTORS, RxDescriptor, STATUS, STATUS_LU, TCTL,
+    TDBAH, TDBAL, TDH, TDLEN, TDT, TX_CMD_EOP, TX_CMD_IFCS, TX_CMD_RS, TxDescriptor,
+    eeprom_read_command, eeprom_read_data, link_up_control, mac_from_eeprom, mac_from_registers,
+    receive_control, register, transmit_control,
 };
 
 /// Highest number of polls spent waiting for the controller.
 const POLL_LIMIT: usize = 1 << 20;
+
+/// Highest number of polls spent waiting for one received frame.
+///
+/// An address-resolution reply from the emulated network stack arrives in
+/// microseconds, so this budget only expires when nothing answers at all.
+const RECEIVE_POLL_LIMIT: usize = 1 << 26;
 
 /// A mapped controller register window.
 #[derive(Clone, Copy)]
@@ -129,6 +136,85 @@ impl Device {
             self.eeprom_word(2)?,
         ];
         Ok(mac_from_eeprom(words))
+    }
+
+    /// Set up a receive ring and wait for one frame.
+    ///
+    /// The ring and every buffer it points at are freshly allocated frames that
+    /// stay owned by the driver for the rest of the boot: a descriptor that the
+    /// controller has not yet written must keep pointing at readable memory, so
+    /// nothing here is freed. The received frame is copied into `out` and its
+    /// length returned; the buffer's own copy stays in place for the same reason.
+    ///
+    /// Errors: `InvalidInput` for an `out` buffer smaller than one frame,
+    /// `TableFull` when the frame pool is exhausted, `InvalidImage` for a
+    /// descriptor the controller never completed and `WouldBlock` when no frame
+    /// arrives inside the polling budget.
+    pub fn receive<const N: usize>(
+        &self,
+        allocator: &mut FramePool<N>,
+        direct_map: DirectMap,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        if out.len() < MAX_FRAME {
+            return Err(Error::InvalidInput);
+        }
+        let ring = allocator.allocate().ok_or(Error::TableFull)?;
+        let ring_bytes = direct_map.physical_to_virtual(ring)? as *mut u8;
+        // SAFETY: the frame is owned by the driver for the rest of the boot.
+        unsafe {
+            core::ptr::write_bytes(ring_bytes, 0, RING_BYTES as usize);
+        }
+        let mut buffers = [0u64; RING_DESCRIPTORS as usize];
+        for index in 0..buffers.len() {
+            let buffer = allocator.allocate().ok_or(Error::TableFull)?;
+            buffers[index] = buffer;
+            let buffer_bytes = direct_map.physical_to_virtual(buffer)? as *mut u8;
+            // The controller writes the buffer address into the descriptor, so
+            // each descriptor needs its physical address in the first word.
+            let descriptor = [buffer.to_le_bytes(), [0u8; 8]];
+            // SAFETY: the ring holds `RING_DESCRIPTORS` sixteen-byte entries and
+            // the buffer frame outlives the descriptor.
+            unsafe {
+                core::ptr::write_bytes(buffer_bytes, 0, MAX_FRAME);
+                core::ptr::copy_nonoverlapping(
+                    descriptor.as_ptr() as *const u8,
+                    ring_bytes.add(index * DESCRIPTOR_SIZE),
+                    DESCRIPTOR_SIZE,
+                );
+            }
+        }
+
+        self.write(RDBAL, (ring & 0xffff_ffff) as u32)?;
+        self.write(RDBAH, (ring >> 32) as u32)?;
+        self.write(RDLEN, RING_BYTES)?;
+        self.write(RDH, 0)?;
+        self.write(RDT, RING_DESCRIPTORS - 1)?;
+        self.write(RCTL, receive_control())?;
+
+        for _ in 0..RECEIVE_POLL_LIMIT {
+            // SAFETY: the ring is one page and the first descriptor is within it.
+            let mut raw = [0u8; DESCRIPTOR_SIZE];
+            unsafe {
+                core::ptr::copy_nonoverlapping(ring_bytes, raw.as_mut_ptr(), DESCRIPTOR_SIZE);
+            }
+            if raw[12] & wuxia_core::net::RX_STATUS_DD != 0 {
+                let descriptor = RxDescriptor::parse(&raw)?;
+                if !descriptor.is_usable() {
+                    return Err(Error::InvalidImage);
+                }
+                let length = usize::from(descriptor.length);
+                let source = direct_map.physical_to_virtual(buffers[0])? as *const u8;
+                // SAFETY: the controller wrote `length` bytes into this frame and
+                // `out` is at least one maximum frame long.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(source, out.as_mut_ptr(), length);
+                }
+                return Ok(length);
+            }
+            core::hint::spin_loop();
+        }
+        Err(Error::WouldBlock)
     }
 
     /// Send one frame through the transmit descriptor ring.

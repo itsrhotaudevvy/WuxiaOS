@@ -210,6 +210,44 @@ pub extern "C" fn _start() -> ! {
                 log::write_hex(error as u64);
             }
         }
+
+        // Ask the emulated network stack for the gateway's hardware address. A
+        // reply proves the receive ring, the descriptor handshake and the frame
+        // buffers, not just the transmit engine.
+        let request = wuxia_core::net::arp_request(mac, [10, 0, 2, 15], [10, 0, 2, 2]);
+        let mut padded = [0u8; wuxia_core::net::MIN_FRAME];
+        padded[..request.len()].copy_from_slice(&request);
+        device
+            .transmit(&mut allocator, direct_map, &padded)
+            .expect("the address-resolution request cannot be sent");
+        let mut received = [0u8; wuxia_core::net::MAX_FRAME];
+        match device.receive(&mut allocator, direct_map, &mut received) {
+            Ok(length) => {
+                log::write_str("WUXIA_NET_RX_OK\n");
+                log::write_hex(length as u64);
+                let ethertype = u16::from_be_bytes([received[12], received[13]]);
+                log::write_hex(u64::from(ethertype));
+                let operation = u16::from_be_bytes([received[20], received[21]]);
+                log::write_hex(u64::from(operation));
+                // The reply must be addressed to this controller, which is the
+                // only claim about its contents worth making here.
+                let reply_is_addressed_to_us = received[..6] == mac;
+                log::write_str("WUXIA_NET_RX_ADDRESSED\n");
+                log::write_hex(u64::from(reply_is_addressed_to_us));
+                // The sender protocol address names the peer that answered.
+                log::write_str("WUXIA_NET_RX_SENDER\n");
+                log::write_hex(u64::from(u32::from_be_bytes([
+                    received[28],
+                    received[29],
+                    received[30],
+                    received[31],
+                ])));
+            }
+            Err(error) => {
+                log::write_str("WUXIA_NET_RX_FAILED\n");
+                log::write_hex(error as u64);
+            }
+        }
     }
 
     let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)

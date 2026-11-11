@@ -41,6 +41,9 @@ const BOOT_MARKERS: &[&str] = &[
     "WUXIA_NET_RESET",
     "WUXIA_NET_MAC",
     "WUXIA_NET_TX_OK",
+    "WUXIA_NET_RX_OK",
+    "WUXIA_NET_RX_ADDRESSED",
+    "WUXIA_NET_RX_SENDER",
     "WUXIA_PE_IMAGE_OK",
     "WUXIA_PE_RELOCATED",
     "WUXIA_IMPORTS_OK",
@@ -617,6 +620,14 @@ fn qemu_test() -> ExitCode {
             &serial,
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            // A user-mode network backend, so a frame the guest sends reaches a
+            // peer that answers it. Without an explicit backend the machine's
+            // default NIC is present but connected to nothing, and the boot
+            // cannot prove the receive path works.
+            "-netdev",
+            "user,id=net0",
+            "-device",
+            "e1000,netdev=net0",
             "-cdrom",
             "target/wuxia.iso",
             "-boot",
@@ -681,6 +692,10 @@ fn qemu_run() -> ExitCode {
         "stdio",
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-netdev",
+        "user,id=net0",
+        "-device",
+        "e1000,netdev=net0",
         "-cdrom",
         "target/wuxia.iso",
         "-boot",
