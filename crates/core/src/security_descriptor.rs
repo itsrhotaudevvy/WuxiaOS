@@ -245,7 +245,7 @@ impl<'a> SecurityDescriptor<'a> {
             control_lo,
             control_hi,
         ]);
-        for (slot, offset) in header[4..].chunks_exact_mut(4).zip([
+        for (slot, offset) in header[4..].as_chunks_mut::<4>().0.iter_mut().zip([
             owner_offset,
             group_offset,
             sacl_offset,
@@ -466,7 +466,13 @@ mod tests {
         buf[20..36].copy_from_slice(&ADMINS);
         buf[36..48].copy_from_slice(&SYSTEM);
         assert_eq!(
-            one_ace_acl(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &WORLD, &mut buf[48..76]),
+            one_ace_acl(
+                ACCESS_ALLOWED_ACE_TYPE,
+                0,
+                FILE_READ,
+                &WORLD,
+                &mut buf[48..76]
+            ),
             28
         );
         buf
@@ -480,7 +486,13 @@ mod tests {
         header(&mut buf, control, 56, 72, 20, 28);
         buf[20..28].copy_from_slice(&EMPTY_ACL);
         assert_eq!(
-            one_ace_acl(ACCESS_DENIED_ACE_TYPE, 0, FILE_WRITE, &WORLD, &mut buf[28..56]),
+            one_ace_acl(
+                ACCESS_DENIED_ACE_TYPE,
+                0,
+                FILE_WRITE,
+                &WORLD,
+                &mut buf[28..56]
+            ),
             28
         );
         buf[56..72].copy_from_slice(&ADMINS);
@@ -812,10 +824,7 @@ mod tests {
         // Audit ACEs are not modeled by the ACL parser yet.
         let mut buf = [0u8; 48];
         header(&mut buf, SE_SELF_RELATIVE | SE_SACL_PRESENT, 0, 0, 20, 0);
-        assert_eq!(
-            one_ace_acl(2, 0, FILE_READ, &WORLD, &mut buf[20..48]),
-            28
-        );
+        assert_eq!(one_ace_acl(2, 0, FILE_READ, &WORLD, &mut buf[20..48]), 28);
         assert_eq!(SecurityDescriptor::parse(&buf), Err(Error::Unsupported));
     }
 

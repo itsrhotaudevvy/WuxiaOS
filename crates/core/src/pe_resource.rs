@@ -108,12 +108,16 @@ impl<'a> ResourceName<'a> {
     /// The name's UTF-16 code units.
     pub fn units(&self) -> impl Iterator<Item = u16> + 'a {
         self.raw
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
     }
 
     /// Decode the name, yielding an error for each unpaired surrogate.
-    pub fn chars(&self) -> impl Iterator<Item = core::result::Result<char, core::char::DecodeUtf16Error>> + 'a {
+    pub fn chars(
+        &self,
+    ) -> impl Iterator<Item = core::result::Result<char, core::char::DecodeUtf16Error>> + 'a {
         char::decode_utf16(self.units())
     }
 
@@ -620,10 +624,5 @@ impl FixedFileInfo {
 
 /// Split a version's two doublewords into four words.
 fn version(ms: u32, ls: u32) -> [u16; 4] {
-    [
-        (ms >> 16) as u16,
-        ms as u16,
-        (ls >> 16) as u16,
-        ls as u16,
-    ]
+    [(ms >> 16) as u16, ms as u16, (ls >> 16) as u16, ls as u16]
 }

@@ -780,7 +780,10 @@ mod tests {
         let at = PE_OFFSET + FILE_CHARACTERISTICS_OFFSET;
         image[at..at + 2].copy_from_slice(&0x0023u16.to_le_bytes());
         assert_eq!(relocations_stripped(&image), Ok(true));
-        assert_eq!(relocations_stripped(&image[..0x30]), Err(Error::InvalidImage));
+        assert_eq!(
+            relocations_stripped(&image[..0x30]),
+            Err(Error::InvalidImage)
+        );
     }
 
     #[test]

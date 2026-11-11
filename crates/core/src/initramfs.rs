@@ -109,6 +109,11 @@ pub enum EntryKind {
 }
 
 /// Where an entry's normalized path is stored.
+///
+/// `Joined` inlines a whole path buffer, so it is much larger than
+/// `Borrowed`. The core has no allocator and an `Entry` lives on the caller's
+/// stack for one archive walk, so the asymmetry is deliberate.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
 enum StoredPath<'a> {
     /// A slice of the archive itself.
@@ -216,7 +221,10 @@ impl<'a> Archive<'a> {
         let header_end = start
             .checked_add(CPIO_HEADER_LENGTH)
             .ok_or(Error::InvalidImage)?;
-        let header = self.data.get(start..header_end).ok_or(Error::InvalidImage)?;
+        let header = self
+            .data
+            .get(start..header_end)
+            .ok_or(Error::InvalidImage)?;
         let crc = match header.get(..6) {
             Some(magic) if magic == NEWC_MAGIC && self.format == Format::CpioNewc => false,
             Some(magic) if magic == CRC_MAGIC && self.format == Format::CpioCrc => true,
@@ -310,7 +318,10 @@ impl<'a> Archive<'a> {
         let header = block_at(self.data, start)?;
         if is_zero(header) {
             // The end marker is two consecutive zero blocks.
-            let second = block_at(self.data, start.checked_add(BLOCK).ok_or(Error::InvalidImage)?)?;
+            let second = block_at(
+                self.data,
+                start.checked_add(BLOCK).ok_or(Error::InvalidImage)?,
+            )?;
             return if is_zero(second) {
                 Ok(None)
             } else {
@@ -603,7 +614,10 @@ fn normalized_range(path: &str, kind: EntryKind) -> Result<(usize, usize)> {
     }
     let mut start = 0;
     let mut end = path.len();
-    while path.get(start..end).is_some_and(|rest| rest.starts_with("./")) {
+    while path
+        .get(start..end)
+        .is_some_and(|rest| rest.starts_with("./"))
+    {
         start += 2;
     }
     if path.get(start..end) == Some(".") {

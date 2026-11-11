@@ -349,7 +349,11 @@ pub fn access_check(
 /// to the caller, which lets a token match some SIDs only against deny
 /// ACEs. `None` is a null DACL and allows every bit. The ordering rules are
 /// those of [`access_check`]; generic bits in ACE masks are mapped.
-pub fn granted_rights_by<F>(acl: Option<&Acl<'_>>, mapping: &GenericMapping, mut matches: F) -> Result<u32>
+pub fn granted_rights_by<F>(
+    acl: Option<&Acl<'_>>,
+    mapping: &GenericMapping,
+    mut matches: F,
+) -> Result<u32>
 where
     F: FnMut(&[u8], AceKind) -> bool,
 {

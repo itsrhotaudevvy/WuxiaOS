@@ -325,7 +325,9 @@ impl<const FRAMES: usize, const ARENAS: usize, const ORDERS: usize>
                     let buddy = address ^ size;
                     if order + 1 < orders
                         && buddy >= arena.base
-                        && buddy.checked_add(size).is_some_and(|end| end <= arena.end())
+                        && buddy
+                            .checked_add(size)
+                            .is_some_and(|end| end <= arena.end())
                         && self.state[arena.index_of(buddy) as usize] == state
                     {
                         return Err(Error::InvalidState);
@@ -338,7 +340,7 @@ impl<const FRAMES: usize, const ARENAS: usize, const ORDERS: usize>
         if expected_first != self.used || free_frames != self.free_frames {
             return Err(Error::InvalidState);
         }
-        for order in 0..orders {
+        for (order, &block_count) in blocks.iter().enumerate().take(orders) {
             let mut length = 0usize;
             let mut previous = NIL;
             let mut current = self.heads[order];
@@ -354,7 +356,7 @@ impl<const FRAMES: usize, const ARENAS: usize, const ORDERS: usize>
                 previous = current;
                 current = self.next[current as usize];
             }
-            if length != self.free_blocks[order] || length != blocks[order] {
+            if length != self.free_blocks[order] || length != block_count {
                 return Err(Error::InvalidState);
             }
         }
@@ -494,7 +496,7 @@ mod tests {
         assert_eq!(buddy.free(block + 1, 2), Err(Error::InvalidInput));
         assert_eq!(buddy.free(0x9000, 0), Err(Error::NotFound));
         assert_eq!(buddy.free(0x40000, 0), Err(Error::NotFound));
-        assert_eq!(buddy.free(u64::MAX & !0xfff, 0), Err(Error::NotFound));
+        assert_eq!(buddy.free(!0xfff, 0), Err(Error::NotFound));
         assert_eq!(buddy.free(block, 1), Err(Error::InvalidInput));
         assert_eq!(buddy.free(block, 99), Err(Error::InvalidInput));
         assert_eq!(buddy.free(block + PAGE_SIZE, 0), Err(Error::InvalidInput));
@@ -542,7 +544,10 @@ mod tests {
     fn high_regions_do_not_overflow() {
         let mut buddy = BuddyAllocator::<8, 2, 64>::new();
         assert_eq!(buddy.orders(), MAX_SUPPORTED_ORDERS);
-        assert_eq!(buddy.add_region(u64::MAX - 0x7fff, 0x8000), Err(Error::OutOfRange));
+        assert_eq!(
+            buddy.add_region(u64::MAX - 0x7fff, 0x8000),
+            Err(Error::OutOfRange)
+        );
         // Frames 0x..8000 through 0x..e000; the last page is never whole.
         assert_eq!(buddy.add_region(u64::MAX - 0x7fff, 0x7fff), Ok(7));
         buddy.check_invariants().unwrap();
