@@ -243,8 +243,12 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
     match frame.vector {
         3 => serial::write_str("WUXIA_BREAKPOINT_OK\n"),
         6 => {
-            serial::write_str("WUXIA_UD_FAULT\n");
+            serial::write_str("WUXIA_USER_FAULT_OK\n");
             serial::write_hex(frame.rip);
+            serial::write_hex(frame.cs);
+            serial::write_str("WUXIA_TEST_PASS\n");
+            serial::debug_exit(0x10);
+            halt();
         }
         13 => {
             serial::write_str("WUXIA_GP_FAULT\n");
@@ -273,6 +277,15 @@ fn read_cr2() -> u64 {
         asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+fn halt() -> ! {
+    loop {
+        // SAFETY: disabling interrupts and halting has no memory effects.
+        unsafe {
+            asm!("cli", "hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
 }
 
 /// Load the IDT and immediately trigger a breakpoint to prove the path works.

@@ -135,16 +135,22 @@ struct DescriptorTablePointer {
 static mut GDT: Gdt = Gdt::new();
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+/// A dedicated kernel stack for traps taken from CPL3.
+#[repr(align(16))]
+struct TrapStack([u8; 16 * 1024]);
+
+static mut TRAP_STACK: TrapStack = TrapStack([0; 16 * 1024]);
+
 /// Load the GDT, reload the segment registers and install the TSS.
 ///
-/// `kernel_stack_top` becomes the CPL3 trap stack; it must point into mapped
-/// kernel memory and stay valid for the life of the process.
-pub fn init(kernel_stack_top: u64) {
+/// A dedicated 16 KiB trap stack becomes `RSP0`; the bootstrap stack stays
+/// untouched when ring-3 code faults into the kernel.
+pub fn init() {
     // SAFETY: bootstrap is single-threaded and no other code reads or writes
     // these statics. The addresses are stable for the whole kernel lifetime.
     unsafe {
         let tss = &mut *addr_of_mut!(TSS);
-        tss.rsp0 = kernel_stack_top;
+        tss.rsp0 = addr_of!(TRAP_STACK) as u64 + size_of::<TrapStack>() as u64;
         let (low, high) = SegmentDescriptor::tss(addr_of!(TSS) as u64, size_of::<TaskStateSegment>() as u32);
         let gdt = &mut *addr_of_mut!(GDT);
         gdt.entries[5] = low;
@@ -162,8 +168,8 @@ pub fn init(kernel_stack_top: u64) {
     load_task_register();
 }
 
-/// Read the current stack pointer, used as the initial CPL3 trap stack.
-pub fn current_stack_pointer() -> u64 {
+/// Read the current stack pointer for diagnostics.
+pub fn stack_pointer() -> u64 {
     let rsp: u64;
     // SAFETY: reading RSP has no side effects.
     unsafe {

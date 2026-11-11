@@ -17,6 +17,7 @@ mod gdt;
 mod idt;
 mod memory;
 mod paging;
+mod user;
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -50,7 +51,7 @@ pub extern "C" fn _start() -> ! {
     }
     serial::init();
     serial::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
-    gdt::init(gdt::current_stack_pointer());
+    gdt::init();
     serial::write_str("WUXIA_GDT_OK\n");
     idt::self_test();
     let response = MEMORY_MAP_REQUEST
@@ -80,29 +81,41 @@ pub extern "C" fn _start() -> ! {
     serial::write_str("WUXIA_HHDM_OK\n");
     serial::write_hex(direct_map.offset());
 
-    let mapping = paging::install_user_mapping(&mut allocator, direct_map, first)
-        .expect("cannot install the isolated user mapping");
-    serial::write_str("WUXIA_MAPPING_INSTALLED\n");
-    serial::write_hex(mapping.old_pml4);
-    serial::write_hex(mapping.new_pml4);
-    serial::write_hex(mapping.virtual_address);
+    // int 0x80 returns to CPL3; ud2 then traps back into the kernel.
+    const USER_CODE: [u8; 4] = [0xcd, 0x80, 0x0f, 0x0b];
+    paging::write_frame(direct_map, first, &USER_CODE)
+        .expect("cannot write the user code page");
+    let stack = allocator
+        .allocate_frame()
+        .expect("a user stack frame is required");
 
-    paging::activate(mapping.new_pml4);
+    let image = paging::install_user_image(&mut allocator, direct_map, first, stack)
+        .expect("cannot install the isolated user image");
+    serial::write_str("WUXIA_USER_IMAGE_OK\n");
+    serial::write_hex(image.old_pml4);
+    serial::write_hex(image.new_pml4);
+    serial::write_hex(image.code_address);
+    serial::write_hex(image.stack_address);
+
+    paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");
     serial::write_hex(paging::read_cr3());
 
-    let resolved = paging::resolve(direct_map, mapping.virtual_address)
-        .expect("the new root does not resolve the installed user page");
+    let code = paging::resolve(direct_map, image.code_address)
+        .expect("the new root does not resolve the user code page");
+    assert_eq!(code, image.code_entry, "the code leaf changed after activation");
+    let stack_leaf = paging::resolve(direct_map, image.stack_address)
+        .expect("the new root does not resolve the user stack page");
     assert_eq!(
-        resolved, mapping.leaf_entry,
-        "the activated root resolved a different leaf"
+        stack_leaf, image.stack_entry,
+        "the stack leaf changed after activation"
     );
     serial::write_str("WUXIA_POST_SWITCH_PASS\n");
-    serial::write_hex(resolved);
+    serial::write_hex(code);
+    serial::write_hex(stack_leaf);
 
-    serial::write_str("WUXIA_TEST_PASS\n");
-    serial::debug_exit(0x10);
-    halt_forever()
+    serial::write_str("WUXIA_ENTER_USER\n");
+    user::enter(image.code_address, image.stack_address + 0x1000 - 16);
 }
 
 /// Panic handler for early bootstrap failures.

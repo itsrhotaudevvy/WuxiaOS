@@ -10,8 +10,8 @@ use core::arch::asm;
 use wuxia_core::Error;
 use wuxia_core::hhdm::DirectMap;
 use wuxia_core::paging::{
-    ENTRIES_PER_TABLE, PagePermissions, PageTableReader, is_present, leaf, table_entry, table_index,
-    walk,
+    ENTRIES_PER_TABLE, PAGE_SIZE, PagePermissions, PageTableReader, is_present, leaf, table_entry,
+    table_index, walk,
 };
 use wuxia_core::region::BumpAllocator;
 
@@ -23,34 +23,46 @@ const FIRST_USER_SLOT: usize = 1;
 /// Slot 255 still maps below the 128 TiB user address limit.
 const LAST_USER_SLOT: usize = 255;
 
-/// Details of the installed and activated user mapping.
+/// Details of the installed and activated user image.
 #[derive(Clone, Copy, Debug)]
-pub struct InstalledMapping {
+pub struct UserImage {
     /// Physical root that was active before the switch.
     pub old_pml4: u64,
     /// Physical root loaded into CR3.
     pub new_pml4: u64,
-    /// Virtual address the user leaf now maps.
-    pub virtual_address: u64,
-    /// Encoded leaf entry written for the user page.
-    pub leaf_entry: u64,
+    /// Virtual address of the executable code page.
+    pub code_address: u64,
+    /// Virtual address of the writable stack page.
+    pub stack_address: u64,
+    /// Encoded leaf entry for the code page.
+    pub code_entry: u64,
+    /// Encoded leaf entry for the stack page.
+    pub stack_entry: u64,
 }
 
-/// Build a user subtree, clone the active root and load the clone into CR3.
-pub fn install_user_mapping<const N: usize>(
+/// Build a two-page user subtree, clone the active root and load it into CR3.
+pub fn install_user_image<const N: usize>(
     allocator: &mut BumpAllocator<N>,
     direct_map: DirectMap,
-    physical_address: u64,
-) -> Result<InstalledMapping, Error> {
+    code_physical: u64,
+    stack_physical: u64,
+) -> Result<UserImage, Error> {
     let old_pml4 = read_cr3();
     let old_root = frame_pointer(direct_map, old_pml4)?;
     let slot = (FIRST_USER_SLOT..=LAST_USER_SLOT)
         .find(|index| !is_present(read_entry(old_root, *index)))
         .ok_or(Error::TableFull)?;
-    let virtual_address = (slot as u64) << 39;
+    let code_address = (slot as u64) << 39;
+    let stack_address = code_address + PAGE_SIZE;
 
-    let (pdpt, leaf_entry) =
-        link_chain(allocator, direct_map, virtual_address, physical_address)?;
+    let (pdpt, code_entry, stack_entry) = link_pages(
+        allocator,
+        direct_map,
+        code_address,
+        code_physical,
+        stack_address,
+        stack_physical,
+    )?;
 
     let new_pml4 = allocator.allocate_frame().ok_or(Error::TableFull)?;
     zero_frame(direct_map, new_pml4)?;
@@ -60,15 +72,17 @@ pub fn install_user_mapping<const N: usize>(
     }
     write_entry(
         new_root,
-        table_index(virtual_address, 0)?,
+        table_index(code_address, 0)?,
         table_entry(pdpt, true)?,
     );
 
-    Ok(InstalledMapping {
+    Ok(UserImage {
         old_pml4,
         new_pml4,
-        virtual_address,
-        leaf_entry,
+        code_address,
+        stack_address,
+        code_entry,
+        stack_entry,
     })
 }
 
@@ -98,12 +112,34 @@ pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error
     walk(&reader, read_cr3(), virtual_address)
 }
 
-fn link_chain<const N: usize>(
+/// Copy a byte slice into a physical frame through the direct map.
+pub fn write_frame(
+    direct_map: DirectMap,
+    frame: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    if bytes.len() > PAGE_SIZE as usize {
+        return Err(Error::InvalidInput);
+    }
+    let destination = direct_map.physical_to_virtual(frame)? as *mut u8;
+    for (offset, byte) in bytes.iter().enumerate() {
+        // SAFETY: the frame is a 4 KiB direct-mapped page and the slice length
+        // was bounded above, so every write stays inside the frame.
+        unsafe {
+            destination.add(offset).write_volatile(*byte);
+        }
+    }
+    Ok(())
+}
+
+fn link_pages<const N: usize>(
     allocator: &mut BumpAllocator<N>,
     direct_map: DirectMap,
-    virtual_address: u64,
-    physical_address: u64,
-) -> Result<(u64, u64), Error> {
+    code_address: u64,
+    code_physical: u64,
+    stack_address: u64,
+    stack_physical: u64,
+) -> Result<(u64, u64, u64), Error> {
     let pdpt = allocator.allocate_frame().ok_or(Error::TableFull)?;
     let pd = allocator.allocate_frame().ok_or(Error::TableFull)?;
     let pt = allocator.allocate_frame().ok_or(Error::TableFull)?;
@@ -112,25 +148,28 @@ fn link_chain<const N: usize>(
     }
     write_entry(
         frame_pointer(direct_map, pdpt)?,
-        table_index(virtual_address, 1)?,
+        table_index(code_address, 1)?,
         table_entry(pd, true)?,
     );
     write_entry(
         frame_pointer(direct_map, pd)?,
-        table_index(virtual_address, 2)?,
+        table_index(code_address, 2)?,
         table_entry(pt, true)?,
     );
-    let leaf_entry = leaf(
-        virtual_address,
-        physical_address,
-        PagePermissions::USER_READ_ONLY,
+    let code_entry = leaf(
+        code_address,
+        code_physical,
+        PagePermissions::USER_CODE,
     )?;
-    write_entry(
-        frame_pointer(direct_map, pt)?,
-        table_index(virtual_address, 3)?,
-        leaf_entry,
-    );
-    Ok((pdpt, leaf_entry))
+    let stack_entry = leaf(
+        stack_address,
+        stack_physical,
+        PagePermissions::USER_READ_WRITE,
+    )?;
+    let pointer = frame_pointer(direct_map, pt)?;
+    write_entry(pointer, table_index(code_address, 3)?, code_entry);
+    write_entry(pointer, table_index(stack_address, 3)?, stack_entry);
+    Ok((pdpt, code_entry, stack_entry))
 }
 
 fn zero_frame(direct_map: DirectMap, frame: u64) -> Result<(), Error> {
