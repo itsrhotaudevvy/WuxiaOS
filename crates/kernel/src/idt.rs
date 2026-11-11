@@ -1,4 +1,4 @@
-//! x86_64 interrupt descriptor table encoding.
+//! x86_64 interrupt descriptor table encoding and loading.
 
 /// A 64-bit interrupt gate descriptor in the hardware-required layout.
 #[derive(Clone, Copy, Debug, Default)]
@@ -38,7 +38,7 @@ pub struct IdtPointer {
     pub base: u64,
 }
 
-/// A small IDT that can be initialized once the handler path exists.
+/// A 256-entry table of interrupt and exception gates.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, align(16))]
 pub struct Idt {
@@ -51,7 +51,12 @@ impl Idt {
         Self { entries: [IdtEntry::default(); 256] }
     }
 
-    /// Install the IDT pointer after all required exception stubs are present.
+    /// Set one exception vector's descriptor.
+    pub fn set_handler(&mut self, vector: u8, handler: usize, privilege: u8) {
+        self.entries[vector] = IdtEntry::interrupt(handler, 0x08, privilege);
+    }
+
+    /// Install the table after all required exception stubs are present.
     pub fn load(&self) {
         // SAFETY: This routine is called only after the caller has populated a
         // complete static IDT and validated its handler addresses.
