@@ -501,9 +501,38 @@ pub extern "C" fn _start() -> ! {
     );
     log::write_str("WUXIA_DEVICE_OBJECT_OK\n");
     log::write_hex(head);
+    // The driver allocated a tagged block, wrote one byte of its own into it, saw a
+    // zero-length request refused, freed the block and was refused a second free.
+    // SAFETY: every slot quoted is inside the driver's writable data section.
+    let (block, refused, first_free, second_free) = unsafe {
+        (
+            core::ptr::read_volatile((driver.base + 0x2090) as *const u64),
+            core::ptr::read_volatile((driver.base + 0x2098) as *const u64),
+            core::ptr::read_volatile((driver.base + 0x20a0) as *const u32),
+            core::ptr::read_volatile((driver.base + 0x20a8) as *const u32),
+        )
+    };
+    assert!(
+        block >= crate::ddi::DRIVER_POOL_BASE,
+        "the allocation is outside the pool"
+    );
+    assert_eq!(refused, 0, "a zero-length allocation was served");
+    assert_eq!(first_free, 0, "the first free was refused");
+    assert_eq!(
+        second_free, 0xC000_0001,
+        "a second free of the same block was accepted"
+    );
+    // SAFETY: `block` is the payload of an allocation in the pool's mapped region.
+    let written = unsafe { core::ptr::read_volatile(block as *const u8) };
+    assert_eq!(
+        written, 0x5a,
+        "the block the driver wrote to belongs to someone else"
+    );
+    log::write_str("WUXIA_POOL_OK\n");
+    log::write_hex(block);
     log::write_str("WUXIA_DRIVER_IMPORTS\n");
     log::write_hex(driver.imports as u64);
-    assert_eq!(driver.imports, 5, "not every import was bound");
+    assert_eq!(driver.imports, 7, "not every import was bound");
     // The driver asked RtlZeroMemory to clear sixteen bytes of its own data; the
     // boot checks the result, which proves the routine ran with both arguments.
     let mut cleared = 0;

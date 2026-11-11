@@ -24,12 +24,14 @@ use crate::log;
 const MAX_MESSAGE: usize = 128;
 
 /// Names a driver may import, in the order they are offered.
-pub const EXPORT_NAMES: [&str; 5] = [
+pub const EXPORT_NAMES: [&str; 7] = [
     "DbgPrint",
     "RtlZeroMemory",
     "KeGetCurrentIrql",
     "MmMapIoSpace",
     "IoCreateDevice",
+    "ExAllocatePoolWithTag",
+    "ExFreePoolWithTag",
 ];
 
 /// Where driver device mappings start.
@@ -50,6 +52,25 @@ pub const DRIVER_DEVICE_BASE: u64 = 0xffff_9900_0000_0000;
 /// Next free byte in the device object window.
 static DEVICE_NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// Where the nonpaged pool lives.
+///
+/// Its own page-map slot, mapped on the first allocation and never unmapped: a
+/// driver keeps a pointer it was handed, so the region behind it has to stay
+/// addressable for the life of the boot.
+pub const DRIVER_POOL_BASE: u64 = 0xffff_9a00_0000_0000;
+
+/// Number of pages the pool maps.
+const POOL_PAGES: u64 = 64;
+
+/// Nonpaged pool type, the only one this kernel serves.
+const NON_PAGED_POOL: u32 = 0;
+
+/// Set once the pool's pages are mapped.
+static POOL_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Next free byte in the pool.
+static POOL_NEXT: AtomicU64 = AtomicU64::new(0);
+
 /// Lowest supervisor address. Anything below it is a user address.
 const SUPERVISOR_BASE: u64 = 0xffff_8000_0000_0000;
 
@@ -64,6 +85,8 @@ unsafe extern "C" {
     fn wuxia_ddi_rtl_zero_memory(destination: *mut u8, length: usize) -> u64;
     fn wuxia_ddi_ke_get_current_irql() -> u64;
     fn wuxia_ddi_mm_map_io_space(physical: u64, length: u64, cache: u32) -> u64;
+    fn wuxia_ddi_ex_allocate_pool_with_tag(size: u64, tag: u32, pool_type: u32) -> u64;
+    fn wuxia_ddi_ex_free_pool_with_tag(address: u64, tag: u32) -> u32;
     fn wuxia_ddi_io_create_device(
         driver_object: u64,
         extension_size: u32,
@@ -132,11 +155,32 @@ core::arch::global_asm!(
     "call {create_device}",
     "add rsp, 8",
     "ret",
+    ".globl wuxia_ddi_ex_allocate_pool_with_tag",
+    ".p2align 4",
+    "wuxia_ddi_ex_allocate_pool_with_tag:",
+    "sub rsp, 0x28",
+    "mov rdi, rcx",
+    "mov esi, edx",
+    "mov edx, r8d",
+    "call {allocate_pool}",
+    "add rsp, 0x28",
+    "ret",
+    ".globl wuxia_ddi_ex_free_pool_with_tag",
+    ".p2align 4",
+    "wuxia_ddi_ex_free_pool_with_tag:",
+    "sub rsp, 0x28",
+    "mov rdi, rcx",
+    "mov esi, edx",
+    "call {free_pool}",
+    "add rsp, 0x28",
+    "ret",
     dbg_print = sym dbg_print,
     zero_memory = sym rtl_zero_memory,
     irql = sym ke_get_current_irql,
     map_io_space = sym mm_map_io_space,
     create_device = sym io_create_device,
+    allocate_pool = sym ex_allocate_pool_with_tag,
+    free_pool = sym ex_free_pool_with_tag,
 );
 
 /// Append NUL-terminated `message` to the kernel log and report success.
@@ -293,6 +337,85 @@ extern "sysv64" fn io_create_device(
     0
 }
 
+/// Map the pool's pages once and report the region's length.
+fn map_pool() -> Option<u64> {
+    if !POOL_MAPPED.load(Ordering::Acquire) {
+        let direct_map = crate::paging::current_direct_map()?;
+        for page in 0..POOL_PAGES {
+            let address = DRIVER_POOL_BASE.checked_add(page * wuxia_core::paging::PAGE_SIZE)?;
+            crate::paging::map_kernel_data_page(crate::memory::pool(), direct_map, address).ok()?;
+        }
+        POOL_MAPPED.store(true, Ordering::Release);
+    }
+    POOL_PAGES.checked_mul(wuxia_core::paging::PAGE_SIZE)
+}
+
+/// `ExAllocatePoolWithTag`: hand out a tagged block of nonpaged pool.
+///
+/// Returns zero when the request is refused - a zero length, a block larger than
+/// one allocation may be, a pool type this kernel does not have, or a full pool -
+/// because that is the failure a driver already checks for.
+///
+/// The pool is not yet protected against concurrent callers; the boot runs drivers
+/// with interrupts enabled but only one processor executes, and no driver is called
+/// from interrupt context yet.
+extern "sysv64" fn ex_allocate_pool_with_tag(size: u64, tag: u32, pool_type: u32) -> u64 {
+    if pool_type != NON_PAGED_POOL {
+        return 0;
+    }
+    let Ok(size) = usize::try_from(size) else {
+        return 0;
+    };
+    let Some(limit) = map_pool().and_then(|bytes| usize::try_from(bytes).ok()) else {
+        return 0;
+    };
+    let Some(offset) = usize::try_from(POOL_NEXT.load(Ordering::Acquire)).ok() else {
+        return 0;
+    };
+    let Ok(payload) = wuxia_core::pool::allocate(offset, size, limit) else {
+        return 0;
+    };
+    let consumed = wuxia_core::pool::footprint(size);
+    POOL_NEXT.store((offset + consumed) as u64, Ordering::Release);
+    // SAFETY: the pool's pages are mapped writable in the active address space and
+    // this allocation's header has not been handed out yet.
+    let block = unsafe { core::slice::from_raw_parts_mut(DRIVER_POOL_BASE as *mut u8, limit) };
+    let tag_bytes = tag.to_le_bytes();
+    if wuxia_core::pool::write_header(block, payload, size, tag_bytes).is_err() {
+        return 0;
+    }
+    DRIVER_POOL_BASE + payload as u64
+}
+
+/// `ExFreePoolWithTag`: take a block back.
+///
+/// Returns zero on success and `STATUS_UNSUCCESSFUL` when the address is not a live
+/// allocation of the pool - which is how a second free, or a free of a pointer the
+/// driver never received, is refused rather than acted on. The pages themselves are
+/// never unmapped; the block is marked free so a later free is refused.
+extern "sysv64" fn ex_free_pool_with_tag(address: u64, tag: u32) -> u32 {
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    let _ = tag;
+    let Some(limit) = map_pool().and_then(|bytes| usize::try_from(bytes).ok()) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Some(offset) = address.checked_sub(DRIVER_POOL_BASE) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Ok(payload) = usize::try_from(offset) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if payload >= limit {
+        return STATUS_UNSUCCESSFUL;
+    }
+    // SAFETY: the address is inside the pool's mapped pages.
+    let block = unsafe { core::slice::from_raw_parts_mut(DRIVER_POOL_BASE as *mut u8, limit) };
+    match wuxia_core::pool::release(block, payload) {
+        Ok(()) => 0,
+        Err(_) => STATUS_UNSUCCESSFUL,
+    }
+}
+
 /// Resolve `module!name` to the address a driver should call.
 ///
 /// Errors: `NotFound` for a module this kernel does not serve or a name it does
@@ -311,6 +434,8 @@ pub fn resolve(module: &str, name: &str) -> Result<u64, wuxia_core::Error> {
         "KeGetCurrentIrql" => Ok(wuxia_ddi_ke_get_current_irql as usize as u64),
         "MmMapIoSpace" => Ok(wuxia_ddi_mm_map_io_space as usize as u64),
         "IoCreateDevice" => Ok(wuxia_ddi_io_create_device as usize as u64),
+        "ExAllocatePoolWithTag" => Ok(wuxia_ddi_ex_allocate_pool_with_tag as usize as u64),
+        "ExFreePoolWithTag" => Ok(wuxia_ddi_ex_free_pool_with_tag as usize as u64),
         _ => Err(wuxia_core::Error::NotFound),
     }
 }

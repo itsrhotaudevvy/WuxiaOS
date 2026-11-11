@@ -52,6 +52,7 @@ pub mod pe_tls;
 pub mod personality;
 pub mod pipe;
 pub mod pledge;
+pub mod pool;
 pub mod priority;
 pub mod process;
 pub mod proctree;
