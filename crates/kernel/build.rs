@@ -82,20 +82,21 @@ fn embed(out: &std::path::Path, name: &str, variable: &str, default: &std::path:
 /// address, which is not mapped, and fault instead of returning.
 fn write_driver_image(out: &std::path::Path) -> PathBuf {
     let target = out.join("driver_image.bin");
-    let mut image = vec![0u8; 0x800];
+    let mut image = vec![0u8; 0xa00];
 
     image[0..2].copy_from_slice(b"MZ");
     image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
     image[0x40..0x44].copy_from_slice(b"PE\0\0");
     image[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
-    image[0x46..0x48].copy_from_slice(&3u16.to_le_bytes());
+    // Four sections: .text, .data, .reloc and .idata.
+    image[0x46..0x48].copy_from_slice(&4u16.to_le_bytes());
     image[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
     image[0x56..0x58].copy_from_slice(&0x22u16.to_le_bytes());
 
     let optional = 0x58;
     image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
     image[optional + 4..optional + 8].copy_from_slice(&0x200u32.to_le_bytes());
-    image[optional + 8..optional + 12].copy_from_slice(&0x400u32.to_le_bytes());
+    image[optional + 8..optional + 12].copy_from_slice(&0x600u32.to_le_bytes());
     image[optional + 16..optional + 20].copy_from_slice(&0x1000u32.to_le_bytes());
     image[optional + 20..optional + 24].copy_from_slice(&0x1000u32.to_le_bytes());
     // A preferred base the loader will not use, so the relocation is exercised.
@@ -111,10 +112,14 @@ fn write_driver_image(out: &std::path::Path) -> PathBuf {
     image[optional + 96..optional + 104].copy_from_slice(&0x1000u64.to_le_bytes());
     image[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
     // SizeOfImage, then the base-relocation directory at index 5.
-    image[optional + 56..optional + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+    image[optional + 56..optional + 60].copy_from_slice(&0x5000u32.to_le_bytes());
     let reloc_directory = optional + 112 + 5 * 8;
     image[reloc_directory..reloc_directory + 4].copy_from_slice(&0x3000u32.to_le_bytes());
     image[reloc_directory + 4..reloc_directory + 8].copy_from_slice(&12u32.to_le_bytes());
+    // The import directory sits at index 1: one descriptor plus its terminator.
+    let import_directory = optional + 112 + 8;
+    image[import_directory..import_directory + 4].copy_from_slice(&0x4000u32.to_le_bytes());
+    image[import_directory + 4..import_directory + 8].copy_from_slice(&40u32.to_le_bytes());
 
     let section = optional + 240;
     image[section..section + 5].copy_from_slice(b".text");
@@ -140,22 +145,92 @@ fn write_driver_image(out: &std::path::Path) -> PathBuf {
     image[reloc + 20..reloc + 24].copy_from_slice(&0x600u32.to_le_bytes());
     image[reloc + 36..reloc + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
 
-    // The pointer sits at RVA 0x2010 and this instruction ends at RVA 0x1007, so
-    // the displacement is 0x1009.
-    // mov rax, [rip + 0x1009] ; mov rax, [rax] ; ret
-    let code: [u8; 10] = [0x48, 0x8b, 0x05, 0x09, 0x10, 0x00, 0x00, 0x48, 0x8b, 0x00];
-    image[0x200..0x200 + code.len()].copy_from_slice(&code);
-    image[0x200 + code.len()] = 0xc3;
+    let idata = reloc + 40;
+    image[idata..idata + 6].copy_from_slice(b".idata");
+    image[idata + 8..idata + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[idata + 12..idata + 16].copy_from_slice(&0x4000u32.to_le_bytes());
+    image[idata + 16..idata + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    image[idata + 20..idata + 24].copy_from_slice(&0x800u32.to_le_bytes());
+    image[idata + 36..idata + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
 
-    // The pointer at RVA 0x2010 names the constant at RVA 0x2020; the relocation
-    // block below patches it to the address the image was actually mapped at.
+    // The entry point calls three imported routines with the Windows argument
+    // registers, then returns the constant it reached through a relocated
+    // pointer. One call therefore proves the import table was bound, the
+    // argument registers were translated, and the relocation was applied:
+    //   sub rsp, 0x28             ; shadow space and 16-byte alignment
+    //   lea rcx, [rip + 0x1025]   ; the message at RVA 0x2030
+    //   mov rax, [rip + 0x304e]   ; the DbgPrint slot at RVA 0x4060
+    //   call rax
+    //   lea rcx, [rip + 0x1035]   ; the buffer at RVA 0x2050
+    //   mov edx, 0x10
+    //   mov rax, [rip + 0x3041]   ; the RtlZeroMemory slot at RVA 0x4068
+    //   call rax
+    //   mov rax, [rip + 0x3040]   ; the KeGetCurrentIrql slot at RVA 0x4070
+    //   call rax
+    //   mov rax, [rip + 0xfd7]    ; the pointer at RVA 0x2010
+    //   mov rax, [rax]
+    //   add rsp, 0x28
+    //   ret
+    let code: [u8; 65] = [
+        0x48, 0x83, 0xec, 0x28, //
+        0x48, 0x8d, 0x0d, 0x25, 0x10, 0x00, 0x00, //
+        0x48, 0x8b, 0x05, 0x4e, 0x30, 0x00, 0x00, //
+        0xff, 0xd0, //
+        0x48, 0x8d, 0x0d, 0x35, 0x10, 0x00, 0x00, //
+        0xba, 0x10, 0x00, 0x00, 0x00, //
+        0x48, 0x8b, 0x05, 0x41, 0x30, 0x00, 0x00, //
+        0xff, 0xd0, //
+        0x48, 0x8b, 0x05, 0x40, 0x30, 0x00, 0x00, //
+        0xff, 0xd0, //
+        0x48, 0x8b, 0x05, 0xd7, 0x0f, 0x00, 0x00, //
+        0x48, 0x8b, 0x00, //
+        0x48, 0x83, 0xc4, 0x28, //
+        0xc3,
+    ];
+    image[0x200..0x200 + code.len()].copy_from_slice(&code);
+
+    // The pointer at RVA 0x2010 names the constant at RVA 0x2020, and the
+    // message the driver prints sits at RVA 0x2030.
     image[0x410..0x418].copy_from_slice(&0x1_4002_2020u64.to_le_bytes());
     image[0x420..0x428].copy_from_slice(&0x1234u64.to_le_bytes());
+    let message = b"WUXIA_DRIVER_PRINT\n\0";
+    image[0x430..0x430 + message.len()].copy_from_slice(message);
+    // A buffer the driver hands to RtlZeroMemory, filled with a pattern the boot
+    // can check was cleared.
+    image[0x450..0x460].copy_from_slice(&[0xff; 16]);
 
     // One IMAGE_REL_BASED_DIR64 entry for the pointer at page offset 0x10.
     image[0x600..0x604].copy_from_slice(&0x2000u32.to_le_bytes());
     image[0x604..0x608].copy_from_slice(&12u32.to_le_bytes());
     image[0x608..0x60a].copy_from_slice(&0xa010u16.to_le_bytes());
+
+    // The import directory: one descriptor for ntoskrnl.exe importing three
+    // routines, followed by the all-zero descriptor that terminates the list.
+    // RVA 0x4000: descriptor (original thunk 0x4030, name 0x4050, IAT 0x4060).
+    image[0x800..0x804].copy_from_slice(&0x4030u32.to_le_bytes());
+    image[0x80c..0x810].copy_from_slice(&0x4050u32.to_le_bytes());
+    image[0x810..0x814].copy_from_slice(&0x4060u32.to_le_bytes());
+    // RVA 0x4030: the import name table, three entries plus its terminator.
+    for (index, name) in [0x4090u32, 0x40a0, 0x40b0].iter().enumerate() {
+        let at = 0x830 + index * 8;
+        image[at..at + 4].copy_from_slice(&name.to_le_bytes());
+    }
+    // RVA 0x4050: the module name.
+    let module = b"ntoskrnl.exe\0";
+    image[0x850..0x850 + module.len()].copy_from_slice(module);
+    // RVA 0x4060: the import address table the loader rewrites.
+    for (index, name) in [0x4090u32, 0x40a0, 0x40b0].iter().enumerate() {
+        let at = 0x860 + index * 8;
+        image[at..at + 4].copy_from_slice(&name.to_le_bytes());
+    }
+    // RVA 0x4090, 0x40a0 and 0x40b0: the hint/name entries.
+    for (at, imported) in [
+        (0x892, b"DbgPrint\0".as_slice()),
+        (0x8a2, b"RtlZeroMemory\0".as_slice()),
+        (0x8b2, b"KeGetCurrentIrql\0".as_slice()),
+    ] {
+        image[at..at + imported.len()].copy_from_slice(imported);
+    }
 
     fs::write(&target, image).expect("cannot write the driver test image");
     target

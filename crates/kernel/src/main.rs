@@ -15,6 +15,7 @@ use limine::request::{
 
 mod apic;
 mod cpu;
+mod ddi;
 mod drivers;
 mod gdt;
 mod idt;
@@ -431,8 +432,34 @@ pub extern "C" fn _start() -> ! {
         let entry: extern "sysv64" fn() -> u64 = core::mem::transmute(driver.entry);
         entry()
     };
+    log::write_str("WUXIA_DRIVER_IMPORTS\n");
+    log::write_hex(driver.imports as u64);
+    assert_eq!(driver.imports, 3, "not every import was bound");
+    // The driver asked RtlZeroMemory to clear sixteen bytes of its own data; the
+    // boot checks the result, which proves the routine ran with both arguments.
+    let mut cleared = 0;
+    for offset in 0..16u64 {
+        // SAFETY: the buffer is inside the driver's writable data section.
+        let byte =
+            unsafe { core::ptr::read_volatile((driver.base + 0x2050 + offset) as *const u8) };
+        assert_eq!(byte, 0, "the driver's buffer was not cleared");
+        cleared += 1;
+    }
+    log::write_str("WUXIA_DDI_ZERO_OK\n");
+    log::write_hex(cleared);
     log::write_str("WUXIA_DRIVER_ENTRY\n");
     log::write_hex(status);
+    // The refused cases matter as much as the served ones: an unserved module or
+    // name must not bind to anything at all.
+    assert_eq!(
+        ddi::resolve("hal.dll", "DbgPrint"),
+        Err(wuxia_core::Error::NotFound)
+    );
+    assert_eq!(
+        ddi::resolve("ntoskrnl.exe", "ObReferenceObjectByHandle"),
+        Err(wuxia_core::Error::NotFound)
+    );
+    log::write_str("WUXIA_DDI_REJECTED\n");
 
     let image = paging::load_user_image(allocator, direct_map, USER_ELF)
         .expect("cannot load the user ELF image");

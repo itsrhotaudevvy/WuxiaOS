@@ -65,6 +65,17 @@ pub fn write_str(text: &str) {
     record(Level::Info, bytes.strip_suffix(b"\n").unwrap_or(bytes));
 }
 
+/// Write raw bytes to the console and record them as one informational line.
+///
+/// This is how a loaded driver's `DbgPrint` reaches the log: the bytes are not
+/// trusted to be UTF-8, so they are copied verbatim.
+pub fn write_bytes(bytes: &[u8]) {
+    for byte in bytes {
+        serial::write_byte(*byte);
+    }
+    record(Level::Info, bytes.strip_suffix(b"\n").unwrap_or(bytes));
+}
+
 /// Write `value` as `0x` and 16 hex digits, and record the same line.
 pub fn write_hex(value: u64) {
     const HEX: &[u8; 16] = b"0123456789abcdef";

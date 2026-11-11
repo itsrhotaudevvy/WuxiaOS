@@ -411,6 +411,18 @@ fn map_kernel_page<const N: usize>(
 /// Errors: `AlreadyExists` when part of the range is mapped, `TableFull` when the
 /// frame pool is exhausted, `InvalidImage` when a segment's file range does not
 /// match its declared size and `OutOfRange` for an unallocatable table.
+/// Permissions every kernel image page gets while it is being written.
+///
+/// Relocations and import binding both patch the image, so the pages are mapped
+/// writable first and [`protect_kernel_image`] downgrades them once the contents
+/// are final. Code is never mapped executable while it is writable.
+const KERNEL_IMAGE_LOADING: PagePermissions = PagePermissions {
+    writable: true,
+    user: false,
+    executable: false,
+    cache_disable: false,
+};
+
 pub fn map_kernel_image<const N: usize>(
     allocator: &mut FramePool<N>,
     direct_map: DirectMap,
@@ -426,7 +438,33 @@ pub fn map_kernel_image<const N: usize>(
             let frame = allocator.allocate().ok_or(Error::TableFull)?;
             zero_frame(direct_map, frame)?;
             copy_segment_bytes(direct_map, frame, address, segment, bytes)?;
-            map_kernel_page(allocator, direct_map, address, frame, segment.permissions)?;
+            map_kernel_page(allocator, direct_map, address, frame, KERNEL_IMAGE_LOADING)?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply the plan's permissions to an image that was mapped for loading.
+///
+/// Every written page becomes what the plan asked for: code read-only and
+/// executable, data writable and non-executable. The TLB is flushed per page, so
+/// a stale writable entry cannot outlive the downgrade.
+pub fn protect_kernel_image(
+    direct_map: DirectMap,
+    plan: &LoaderPlan<MAX_USER_SEGMENTS>,
+) -> Result<(), Error> {
+    let root = read_cr3();
+    for segment in plan.segments() {
+        for page in 0..segment.page_count() {
+            let address = segment
+                .address
+                .checked_add(page * PAGE_SIZE)
+                .ok_or(Error::OutOfRange)?;
+            let (pointer, slot) = leaf_slot(direct_map, root, address)?;
+            let frame = physical_address(read_entry(pointer, slot));
+            let entry = wuxia_core::paging::kernel_leaf(address, frame, segment.permissions)?;
+            write_entry(pointer, slot, entry);
+            invalidate(address);
         }
     }
     Ok(())
