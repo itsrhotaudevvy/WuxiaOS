@@ -34,10 +34,11 @@ fn main() -> ExitCode {
         "iso" => build_iso(),
         "qemu-test" => qemu_test(),
         "qemu-run" => qemu_run(),
+        "elf-info" => elf_info(),
         "ci" => ci(),
         "help" | "--help" | "-h" => {
             println!(
-                "Usage: cargo run -p wuxia-xtask -- <test|build-kernel|iso|qemu-test|qemu-run|ci>"
+                "Usage: cargo run -p wuxia-xtask -- <test|build-kernel|iso|qemu-test|qemu-run|elf-info|ci>"
             );
             ExitCode::SUCCESS
         }
@@ -72,6 +73,64 @@ fn run_tests() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Parse a real ELF64 binary with the in-tree loader and print its segments.
+fn elf_info() -> ExitCode {
+    let path = env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/kernel/x86_64-unknown-none/debug/wuxia-kernel"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("read {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let elf = match wuxia_core::elf::Elf64Image::parse(&bytes) {
+        Ok(elf) => elf,
+        Err(error) => {
+            eprintln!("parse {}: {error:?}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let info = elf.info();
+    println!(
+        "{}: {:?}, entry {:#x}, {} program headers",
+        path.display(),
+        info.kind,
+        info.entry,
+        info.program_headers
+    );
+    let mut writable_and_executable = false;
+    for index in 0..elf.program_header_count() {
+        match elf.segment(index) {
+            Ok(segment) => {
+                let mode = format!(
+                    "{}{}{}",
+                    if segment.flags & 4 != 0 { 'r' } else { '-' },
+                    if segment.is_writable() { 'w' } else { '-' },
+                    if segment.is_executable() { 'x' } else { '-' },
+                );
+                println!(
+                    "  PT_LOAD vaddr {:#x} filesz {:#x} memsz {:#x} {mode} align {:#x}",
+                    segment.virtual_address, segment.file_size, segment.memory_size, segment.align
+                );
+                writable_and_executable |= segment.is_writable_and_executable();
+            }
+            Err(wuxia_core::error::Error::NotFound) => {}
+            Err(error) => {
+                eprintln!("  segment {index}: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if writable_and_executable {
+        eprintln!("writable and executable segment present: W^X violated");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 fn build_kernel() -> ExitCode {

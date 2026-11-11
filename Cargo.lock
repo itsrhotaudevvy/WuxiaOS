@@ -32,3 +32,6 @@ dependencies = [
 [[package]]
 name = "wuxia-xtask"
 version = "0.1.0"
+dependencies = [
+ "wuxia-core",
+]

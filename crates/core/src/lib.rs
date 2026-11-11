@@ -9,6 +9,7 @@
 pub mod address_space;
 pub mod capability;
 pub mod descriptor;
+pub mod elf;
 pub mod error;
 pub mod hhdm;
 pub mod image;
@@ -23,6 +24,7 @@ pub mod syscall;
 pub use address_space::AddressSpace;
 pub use capability::{Handle, HandleTable, Rights};
 pub use descriptor::DescriptorTable;
+pub use elf::{Elf64Image, ElfInfo, ElfKind};
 pub use error::{Error, Result};
 pub use hhdm::DirectMap;
 pub use nt::ObjectType;

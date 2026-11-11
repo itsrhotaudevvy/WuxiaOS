@@ -22,6 +22,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Lint the core contracts
+        run: cargo clippy -p wuxia-core --all-targets -- -D warnings
+
       - name: Host tests
         run: cargo test -p wuxia-core
 
@@ -29,3 +32,6 @@ jobs:
         run: cargo run -p wuxia-xtask -- build-kernel
         env:
           WUXIA_LLD: ld.lld
+
+      - name: Audit the kernel image for W^X
+        run: cargo run -p wuxia-xtask -- elf-info
