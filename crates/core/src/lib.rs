@@ -15,6 +15,7 @@ pub mod memory;
 pub mod nt;
 pub mod paging;
 pub mod personality;
+pub mod process;
 pub mod region;
 pub mod syscall;
 
@@ -25,3 +26,4 @@ pub use hhdm::DirectMap;
 pub use nt::ObjectType;
 pub use paging::PagePermissions;
 pub use personality::{ImageFormat, Personality};
+pub use process::{Process, ProcessState};

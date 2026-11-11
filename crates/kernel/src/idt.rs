@@ -282,9 +282,15 @@ fn service_syscall(frame: &mut InterruptFrame) {
     match wuxia_core::syscall::PosixRequest::decode(frame.rax, &registers) {
         Ok(wuxia_core::syscall::PosixRequest::GetPid) => {
             serial::write_str("WUXIA_SYSCALL_GETPID\n");
-            frame.rax = 1;
+            frame.rax = crate::user::process_id();
+            serial::write_hex(frame.rax);
         }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
+            if !crate::user::exit_process(code) {
+                serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                frame.rax = u64::MAX;
+                return;
+            }
             serial::write_str("WUXIA_SYSCALL_EXIT\n");
             serial::write_hex(code);
             serial::write_str("WUXIA_TEST_PASS\n");

@@ -127,10 +127,12 @@ pub extern "C" fn _start() -> ! {
     serial::write_hex(stack_leaf);
     serial::write_hex(data_leaf);
 
-    // write(1, 0x1000, 8) is rejected because the address is outside the
-    // mapped image, then write(1, MESSAGE, len) succeeds, then exit(0).
-    let mut program = [0u8; 73];
+    // getpid; write(1, 0x1000, 8) is rejected; write(1, MESSAGE, len)
+    // succeeds; exit(0).
+    let mut program = [0u8; 82];
     program.copy_from_slice(&[
+        0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, // mov rax, 39 (getpid)
+        0xcd, 0x80, // int 0x80
         0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
         0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
         0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 0x1000 (outside the image)
@@ -145,11 +147,16 @@ pub extern "C" fn _start() -> ! {
         0x48, 0x31, 0xff, // xor rdi, rdi
         0xcd, 0x80, // int 0x80
     ]);
-    program[44..52].copy_from_slice(&image.data_address.to_le_bytes());
-    program[55..59].copy_from_slice(&(MESSAGE.len() as u32).to_le_bytes());
+    program[53..61].copy_from_slice(&image.data_address.to_le_bytes());
+    program[64..68].copy_from_slice(&(MESSAGE.len() as u32).to_le_bytes());
     paging::write_frame(direct_map, first, &program).expect("cannot write the user code page");
 
-    let mut space = wuxia_core::AddressSpace::<4>::new();
+    let mut process = wuxia_core::Process::<4>::new(
+        wuxia_core::process::FIRST_PROCESS_ID,
+        wuxia_core::Personality::Posix,
+    )
+    .expect("the bootstrap process cannot be created");
+    let space = process.space_mut();
     space
         .map(
             image.code_address,
@@ -171,7 +178,7 @@ pub extern "C" fn _start() -> ! {
             wuxia_core::PagePermissions::USER_READ_ONLY,
         )
         .expect("the data region cannot be modeled");
-    user::set_space(space);
+    user::set_process(process);
     serial::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.code_address, image.stack_address + 0x1000 - 16);
 }

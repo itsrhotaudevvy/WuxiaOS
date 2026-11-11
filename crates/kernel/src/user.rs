@@ -1,35 +1,55 @@
-//! Ring-3 entry.
+//! Ring-3 entry and the bootstrap process record.
 //!
-//! Returning to CPL3 uses `iretq`, which pops `SS`, `RSP`, `RFLAGS`, `CS` and
-//! `RIP` from the current kernel stack. The segment selectors carry RPL 3 and
-//! refer to the user descriptors installed by [`crate::gdt`].
+//! The process owns the address-space model, so syscalls validate pointers
+//! against the same regions the page tables were built from.
 
 use core::arch::asm;
 use core::ptr::{addr_of, addr_of_mut, read_volatile};
 
-use wuxia_core::address_space::AddressSpace;
+use wuxia_core::process::Process;
 
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 const INTERRUPTS_ENABLED: u64 = 1 << 1;
 
-/// Per-process region model kept in sync with the installed page tables.
-static mut SPACE: Option<AddressSpace<4>> = None;
+/// The single bootstrap process.
+static mut PROCESS: Option<Process<4>> = None;
 
-/// Record the mapped user regions so syscalls can reject foreign pointers.
-pub fn set_space(space: AddressSpace<4>) {
+/// Install the bootstrap process after its address space is populated.
+pub fn set_process(process: Process<4>) {
     // SAFETY: written once before ring 3 starts and read only afterwards.
     unsafe {
-        *addr_of_mut!(SPACE) = Some(space);
+        *addr_of_mut!(PROCESS) = Some(process);
+    }
+}
+
+/// Return the current process identifier, or zero before installation.
+pub fn process_id() -> u64 {
+    // SAFETY: the process is written once before ring 3 starts.
+    match unsafe { read_volatile(addr_of!(PROCESS)) } {
+        Some(process) => process.id(),
+        None => 0,
     }
 }
 
 /// Whether `[address, address + length)` lies inside one mapped user region.
 pub fn region_contains(address: u64, length: u64) -> bool {
-    // SAFETY: the model is written once before ring 3 starts.
-    match unsafe { read_volatile(addr_of!(SPACE)) } {
-        Some(space) => space.contains(address, length),
+    // SAFETY: the process is written once before ring 3 starts.
+    match unsafe { read_volatile(addr_of!(PROCESS)) } {
+        Some(process) => process.space().contains(address, length),
         None => false,
+    }
+}
+
+/// Mark the current process exited. Returns false if it is absent or already
+/// terminated, so a second `exit` is rejected rather than silently ignored.
+pub fn exit_process(code: u64) -> bool {
+    // SAFETY: bootstrap is single-threaded and the slot is written once.
+    unsafe {
+        match &mut *addr_of_mut!(PROCESS) {
+            Some(process) => process.exit(code).is_ok(),
+            None => false,
+        }
     }
 }
 
