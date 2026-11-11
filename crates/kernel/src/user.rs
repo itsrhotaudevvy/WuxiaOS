@@ -41,6 +41,26 @@ pub fn region_contains(address: u64, length: u64) -> bool {
     }
 }
 
+/// Whether the process has `descriptor` open.
+pub fn descriptor_open(descriptor: u32) -> bool {
+    // SAFETY: the process is written once before ring 3 starts.
+    match unsafe { read_volatile(addr_of!(PROCESS)) } {
+        Some(process) => process.descriptors().is_open(descriptor),
+        None => false,
+    }
+}
+
+/// Close a process descriptor, rejecting unknown or already closed slots.
+pub fn close_descriptor(descriptor: u32) -> bool {
+    // SAFETY: bootstrap is single-threaded and the slot is written once.
+    unsafe {
+        match &mut *addr_of_mut!(PROCESS) {
+            Some(process) => process.descriptors_mut().close(descriptor).is_ok(),
+            None => false,
+        }
+    }
+}
+
 /// Mark the current process exited. Returns false if it is absent or already
 /// terminated, so a second `exit` is rejected rather than silently ignored.
 pub fn exit_process(code: u64) -> bool {

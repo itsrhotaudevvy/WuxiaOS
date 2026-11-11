@@ -298,7 +298,10 @@ fn service_syscall(frame: &mut InterruptFrame) {
             halt();
         }
         Ok(wuxia_core::syscall::PosixRequest::Write { descriptor, buffer }) => {
-            if descriptor != 1 || !crate::user::region_contains(buffer.address, buffer.length) {
+            if descriptor != 1
+                || !crate::user::descriptor_open(descriptor)
+                || !crate::user::region_contains(buffer.address, buffer.length)
+            {
                 serial::write_str("WUXIA_SYSCALL_REJECTED\n");
                 frame.rax = u64::MAX;
                 return;
@@ -314,11 +317,14 @@ fn service_syscall(frame: &mut InterruptFrame) {
                 }
             }
         }
-        Ok(_) => {
-            serial::write_str("WUXIA_SYSCALL_OK\n");
-            serial::write_hex(frame.rax);
-            // Unimplemented requests report a successful no-op result.
-            frame.rax = 0;
+        Ok(wuxia_core::syscall::PosixRequest::Close { descriptor }) => {
+            if crate::user::close_descriptor(descriptor) {
+                serial::write_str("WUXIA_SYSCALL_CLOSE\n");
+                frame.rax = 0;
+            } else {
+                serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                frame.rax = u64::MAX;
+            }
         }
         Err(_) => {
             serial::write_str("WUXIA_SYSCALL_INVALID\n");

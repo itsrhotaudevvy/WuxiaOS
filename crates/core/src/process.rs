@@ -1,11 +1,15 @@
 //! Per-process state: identity, personality, address space and exit status.
 
 use crate::address_space::AddressSpace;
+use crate::descriptor::DescriptorTable;
 use crate::personality::Personality;
 use crate::{Error, Result};
 
 /// Identifier assigned to the first bootstrap process.
 pub const FIRST_PROCESS_ID: u64 = 1;
+
+/// Descriptor capacity reserved for each process.
+pub const DESCRIPTOR_CAPACITY: usize = 16;
 
 /// Lifecycle state of a process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +29,7 @@ pub struct Process<const N: usize> {
     id: u64,
     personality: Personality,
     space: AddressSpace<N>,
+    descriptors: DescriptorTable<DESCRIPTOR_CAPACITY>,
     state: ProcessState,
 }
 
@@ -38,6 +43,7 @@ impl<const N: usize> Process<N> {
             id,
             personality,
             space: AddressSpace::new(),
+            descriptors: DescriptorTable::with_standard_streams(),
             state: ProcessState::Runnable,
         })
     }
@@ -60,6 +66,16 @@ impl<const N: usize> Process<N> {
     /// Mutably borrow the process address space.
     pub fn space_mut(&mut self) -> &mut AddressSpace<N> {
         &mut self.space
+    }
+
+    /// Borrow the process descriptor table.
+    pub fn descriptors(&self) -> &DescriptorTable<DESCRIPTOR_CAPACITY> {
+        &self.descriptors
+    }
+
+    /// Mutably borrow the process descriptor table.
+    pub fn descriptors_mut(&mut self) -> &mut DescriptorTable<DESCRIPTOR_CAPACITY> {
+        &mut self.descriptors
     }
 
     /// Return the current lifecycle state.
@@ -102,6 +118,15 @@ mod tests {
         assert!(!process.is_runnable());
         assert_eq!(process.exit(8), Err(Error::InvalidState));
         assert_eq!(process.state(), ProcessState::Exited { code: 7 });
+    }
+
+    #[test]
+    fn standard_streams_are_open_for_a_new_process() {
+        let process = Process::<1>::new(FIRST_PROCESS_ID, Personality::Posix).unwrap();
+        assert!(process.descriptors().is_open(0));
+        assert!(process.descriptors().is_open(1));
+        assert!(process.descriptors().is_open(2));
+        assert!(!process.descriptors().is_open(3));
     }
 
     #[test]
