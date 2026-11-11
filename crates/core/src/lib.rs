@@ -40,6 +40,7 @@ pub mod pledge;
 pub mod priority;
 pub mod process;
 pub mod proctree;
+pub mod random;
 pub mod region;
 pub mod rlimit;
 pub mod schedule;
