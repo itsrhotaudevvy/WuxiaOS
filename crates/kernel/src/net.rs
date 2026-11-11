@@ -41,6 +41,12 @@ pub fn publish(device: Device) {
     }
 }
 
+/// The register window of the controller the handler services.
+pub fn serviced_window() -> Option<u64> {
+    // SAFETY: written once before interrupts were unmasked.
+    unsafe { SERVICED }
+}
+
 /// Acknowledge the controller's pending interrupt causes.
 ///
 /// Returns zero when no controller has been published, which is also what a

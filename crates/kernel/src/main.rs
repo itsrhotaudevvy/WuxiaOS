@@ -432,9 +432,15 @@ pub extern "C" fn _start() -> ! {
         let entry: extern "sysv64" fn() -> u64 = core::mem::transmute(driver.entry);
         entry()
     };
+    log::write_str("WUXIA_DRIVER_ENTRY\n");
+    log::write_hex(status);
+    assert_eq!(
+        status, 0x1234,
+        "the driver entry point did not return the constant it reaches through its relocated pointer"
+    );
     log::write_str("WUXIA_DRIVER_IMPORTS\n");
     log::write_hex(driver.imports as u64);
-    assert_eq!(driver.imports, 3, "not every import was bound");
+    assert_eq!(driver.imports, 4, "not every import was bound");
     // The driver asked RtlZeroMemory to clear sixteen bytes of its own data; the
     // boot checks the result, which proves the routine ran with both arguments.
     let mut cleared = 0;
@@ -447,8 +453,47 @@ pub extern "C" fn _start() -> ! {
     }
     log::write_str("WUXIA_DDI_ZERO_OK\n");
     log::write_hex(cleared);
-    log::write_str("WUXIA_DRIVER_ENTRY\n");
-    log::write_hex(status);
+    // The driver asked for a null physical address on purpose: a driver mapping
+    // request that cannot be honoured returns zero rather than a window.
+    // SAFETY: the slot is inside the driver's writable data section.
+    let refused = unsafe { core::ptr::read_volatile((driver.base + 0x2060) as *const u64) };
+    assert_eq!(refused, 0, "a null device mapping was not refused");
+    log::write_str("WUXIA_DDI_MMIO_REJECTED\n");
+
+    // The same routine, called for the network controller's register file, must
+    // return a window onto that file. Comparing it with the window the kernel
+    // mapped for itself proves the driver-requested mapping names the same device,
+    // without depending on the controller's current register values.
+    if let (Some(physical), Some(kernel_window)) = (network, net::serviced_window()) {
+        let map_io = ddi::resolve("ntoskrnl.exe", "MmMapIoSpace")
+            .expect("the device mapping routine is not exported");
+        // SAFETY: the routine is served by `ddi` and takes the three arguments the
+        // Windows x64 convention defines.
+        let map: extern "win64" fn(u64, u64, u32) -> u64 = unsafe { core::mem::transmute(map_io) };
+        let window = map(physical, u64::from(wuxia_core::net::BAR_SIZE), 0);
+        assert_ne!(window, 0, "the device mapping routine returned no window");
+        assert_eq!(
+            paging::physical_frame(direct_map, window),
+            Ok(physical),
+            "the driver window does not name the device's registers"
+        );
+        for offset in [0u64, 8] {
+            // SAFETY: both windows map the controller's register file uncached.
+            let requested = unsafe { core::ptr::read_volatile((window + offset) as *const u32) };
+            let known = unsafe { core::ptr::read_volatile((kernel_window + offset) as *const u32) };
+            assert_eq!(
+                requested, known,
+                "the driver window reads a different register than the kernel window"
+            );
+        }
+        log::write_str("WUXIA_DDI_MMIO_OK\n");
+        log::write_hex(window);
+        log::write_hex(u64::from(
+            // SAFETY: the window maps the control register.
+            unsafe { core::ptr::read_volatile(window as *const u32) },
+        ));
+    }
+
     // The refused cases matter as much as the served ones: an unserved module or
     // name must not bind to anything at all.
     assert_eq!(

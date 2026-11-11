@@ -323,6 +323,31 @@ pub fn map_mmio<const N: usize>(
     if base >= KERNEL_VIRTUAL_START {
         return Err(Error::OutOfRange);
     }
+    map_mmio_at(allocator, direct_map, base, physical, pages)
+}
+
+/// Map `pages` device pages at exactly `base`, bypassing the caches.
+///
+/// This is the form a driver request uses: the caller chooses the window, so the
+/// kernel decides which driver gets which part of the device address space
+/// instead of handing out a window by index.
+pub fn map_mmio_at<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    base: u64,
+    physical: u64,
+    pages: u64,
+) -> Result<u64, Error> {
+    let window_pages = MMIO_WINDOW_SIZE / PAGE_SIZE;
+    if pages == 0 || pages > window_pages {
+        return Err(Error::InvalidInput);
+    }
+    if !physical.is_multiple_of(PAGE_SIZE) || !base.is_multiple_of(PAGE_SIZE) {
+        return Err(Error::BadAddress);
+    }
+    if base < MMIO_BASE || base >= KERNEL_VIRTUAL_START {
+        return Err(Error::OutOfRange);
+    }
     let mut table = read_cr3();
     for level in 0..3usize {
         let slot = wuxia_core::paging::kernel_table_index(base, level)?;

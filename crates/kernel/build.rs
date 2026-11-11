@@ -167,11 +167,17 @@ fn write_driver_image(out: &std::path::Path) -> PathBuf {
     //   call rax
     //   mov rax, [rip + 0x3040]   ; the KeGetCurrentIrql slot at RVA 0x4070
     //   call rax
-    //   mov rax, [rip + 0xfd7]    ; the pointer at RVA 0x2010
+    //   xor ecx, ecx              ; a null physical address, which must be refused
+    //   mov edx, 0x1000
+    //   xor r8d, r8d
+    //   mov rax, [rip + 0x3035]   ; the MmMapIoSpace slot at RVA 0x4078
+    //   call rax
+    //   mov [rip + 0x1014], rax   ; store the refusal at RVA 0x2060
+    //   mov rax, [rip + 0xfbd]    ; the pointer at RVA 0x2010
     //   mov rax, [rax]
     //   add rsp, 0x28
     //   ret
-    let code: [u8; 65] = [
+    let code: [u8; 91] = [
         0x48, 0x83, 0xec, 0x28, //
         0x48, 0x8d, 0x0d, 0x25, 0x10, 0x00, 0x00, //
         0x48, 0x8b, 0x05, 0x4e, 0x30, 0x00, 0x00, //
@@ -182,7 +188,13 @@ fn write_driver_image(out: &std::path::Path) -> PathBuf {
         0xff, 0xd0, //
         0x48, 0x8b, 0x05, 0x40, 0x30, 0x00, 0x00, //
         0xff, 0xd0, //
-        0x48, 0x8b, 0x05, 0xd7, 0x0f, 0x00, 0x00, //
+        0x31, 0xc9, //
+        0xba, 0x00, 0x10, 0x00, 0x00, //
+        0x45, 0x31, 0xc0, //
+        0x48, 0x8b, 0x05, 0x35, 0x30, 0x00, 0x00, //
+        0xff, 0xd0, //
+        0x48, 0x89, 0x05, 0x14, 0x10, 0x00, 0x00, //
+        0x48, 0x8b, 0x05, 0xbd, 0x0f, 0x00, 0x00, //
         0x48, 0x8b, 0x00, //
         0x48, 0x83, 0xc4, 0x28, //
         0xc3,
@@ -204,30 +216,29 @@ fn write_driver_image(out: &std::path::Path) -> PathBuf {
     image[0x604..0x608].copy_from_slice(&12u32.to_le_bytes());
     image[0x608..0x60a].copy_from_slice(&0xa010u16.to_le_bytes());
 
-    // The import directory: one descriptor for ntoskrnl.exe importing three
+    // The import directory: one descriptor for ntoskrnl.exe importing four
     // routines, followed by the all-zero descriptor that terminates the list.
-    // RVA 0x4000: descriptor (original thunk 0x4030, name 0x4050, IAT 0x4060).
+    // RVA 0x4000 is the descriptor, 0x4030 the import name table, 0x4060 the
+    // import address table the loader rewrites, 0x4090 the module name and 0x40a0
+    // onward the hint/name entries.
+    let import_names = [0x40a0u32, 0x40b0, 0x40c0, 0x40e0];
     image[0x800..0x804].copy_from_slice(&0x4030u32.to_le_bytes());
-    image[0x80c..0x810].copy_from_slice(&0x4050u32.to_le_bytes());
+    image[0x80c..0x810].copy_from_slice(&0x4090u32.to_le_bytes());
     image[0x810..0x814].copy_from_slice(&0x4060u32.to_le_bytes());
-    // RVA 0x4030: the import name table, three entries plus its terminator.
-    for (index, name) in [0x4090u32, 0x40a0, 0x40b0].iter().enumerate() {
-        let at = 0x830 + index * 8;
-        image[at..at + 4].copy_from_slice(&name.to_le_bytes());
+    for (index, rva) in import_names.iter().enumerate() {
+        // One eight-byte thunk per name in both tables, then their terminators.
+        let name_table = 0x830 + index * 8;
+        image[name_table..name_table + 4].copy_from_slice(&rva.to_le_bytes());
+        let address_table = 0x860 + index * 8;
+        image[address_table..address_table + 4].copy_from_slice(&rva.to_le_bytes());
     }
-    // RVA 0x4050: the module name.
     let module = b"ntoskrnl.exe\0";
-    image[0x850..0x850 + module.len()].copy_from_slice(module);
-    // RVA 0x4060: the import address table the loader rewrites.
-    for (index, name) in [0x4090u32, 0x40a0, 0x40b0].iter().enumerate() {
-        let at = 0x860 + index * 8;
-        image[at..at + 4].copy_from_slice(&name.to_le_bytes());
-    }
-    // RVA 0x4090, 0x40a0 and 0x40b0: the hint/name entries.
+    image[0x890..0x890 + module.len()].copy_from_slice(module);
     for (at, imported) in [
-        (0x892, b"DbgPrint\0".as_slice()),
-        (0x8a2, b"RtlZeroMemory\0".as_slice()),
-        (0x8b2, b"KeGetCurrentIrql\0".as_slice()),
+        (0x8a2, b"DbgPrint\0".as_slice()),
+        (0x8b2, b"RtlZeroMemory\0".as_slice()),
+        (0x8c2, b"KeGetCurrentIrql\0".as_slice()),
+        (0x8e2, b"MmMapIoSpace\0".as_slice()),
     ] {
         image[at..at + imported.len()].copy_from_slice(imported);
     }

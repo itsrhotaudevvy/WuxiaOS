@@ -30,6 +30,7 @@ pub mod initstack;
 pub mod klog;
 pub mod load;
 pub mod memory;
+pub mod mmio;
 pub mod msi;
 pub mod net;
 pub mod nt;

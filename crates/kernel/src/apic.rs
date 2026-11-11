@@ -225,6 +225,3 @@ impl Io {
 pub const LOCAL_APIC_PHYSICAL: u64 = apic::LOCAL_APIC_BASE;
 /// Physical window of the I/O APIC.
 pub const IO_APIC_PHYSICAL: u64 = apic::IO_APIC_BASE;
-
-/// The span of one APIC page.
-pub const WINDOW_BYTES: u64 = 0x1000;
