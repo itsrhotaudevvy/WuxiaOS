@@ -285,6 +285,47 @@ core::arch::global_asm!(
     "14:",
     "ud2",
     "15:",
+    // clock_gettime(CLOCK_MONOTONIC) fills a 16-byte timespec, and two
+    // reads must never go backwards
+    "sub rsp, 32",
+    "mov rax, 228",
+    "mov edi, 1",
+    "mov rsi, rsp",
+    "int 0x80",
+    "test rax, rax",
+    "jne 16f",
+    "mov r12, qword ptr [rsp]",
+    "mov rax, 228",
+    "mov edi, 1",
+    "mov rsi, rsp",
+    "int 0x80",
+    "test rax, rax",
+    "jne 16f",
+    "cmp qword ptr [rsp], r12",
+    "jb 16f",
+    "mov rax, 1",
+    "mov rdi, 1",
+    "lea rsi, [rip + {clocked}]",
+    "mov rdx, 8",
+    "int 0x80",
+    "add rsp, 32",
+    "jmp 17f",
+    "16:",
+    "ud2",
+    "17:",
+    // an unknown clock selector must be refused, not substituted
+    "sub rsp, 32",
+    "mov rax, 228",
+    "mov rdi, 7",
+    "mov rsi, rsp",
+    "int 0x80",
+    "add rsp, 32",
+    "cmp rax, -1",
+    "jne 18f",
+    "jmp 19f",
+    "18:",
+    "ud2",
+    "19:",
     // pledge("stdio rpath"): the VM promise is dropped from here on
     "mov rax, 108",
     "mov rdi, 3",
@@ -317,6 +358,7 @@ core::arch::global_asm!(
     message = sym MESSAGE,
     second = sym SECOND,
     pledged = sym PLEDGED,
+    clocked = sym CLOCKED,
     veiled = sym VEILED,
 
 );
@@ -332,6 +374,10 @@ static SECOND: [u8; 15] = *b"A SECOND PHASE\n";
 /// Written after `pledge` drops every promise except stdio and rpath.
 #[used]
 static PLEDGED: [u8; 8] = *b"PLEDGED\n";
+
+/// Written after two monotonic `clock_gettime` reads do not go backwards.
+#[used]
+static CLOCKED: [u8; 8] = *b"CLOCKED\n";
 
 /// Written after `unveil` hides every path except `/hello`.
 #[used]

@@ -57,6 +57,7 @@ pub mod security_descriptor;
 pub mod sid;
 pub mod signal;
 pub mod syscall;
+pub mod time;
 pub mod timer;
 pub mod unveil;
 pub mod vfs;

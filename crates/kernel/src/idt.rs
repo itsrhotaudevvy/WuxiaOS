@@ -340,6 +340,24 @@ fn service_syscall(frame: &mut InterruptFrame) {
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
             terminate(frame, code, "WUXIA_SYSCALL_EXIT\n");
         }
+        Ok(wuxia_core::syscall::PosixRequest::ClockGettime { clock, buffer }) => {
+            let instant = match clock {
+                wuxia_core::syscall::ClockId::Realtime => crate::time::realtime(),
+                wuxia_core::syscall::ClockId::Monotonic => crate::time::monotonic(),
+            };
+            let written =
+                instant.and_then(|instant| copy_user_from(buffer.address, &instant.encode()).ok());
+            match written {
+                Some(()) => {
+                    serial::write_str("WUXIA_CLOCK_OK\n");
+                    frame.rax = 0;
+                }
+                None => {
+                    serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
         Ok(wuxia_core::syscall::PosixRequest::Unveil { path, perms }) => {
             let mut path_scratch = [0u8; wuxia_core::unveil::MAX_PATH_LENGTH];
             let mut perms_scratch = [0u8; 4];
@@ -647,6 +665,17 @@ fn service_nt_syscall(frame: &mut InterruptFrame) {
                     frame.rax = count as u64;
                 }
                 None => frame.rax = u64::from(NtStatus::INVALID_HANDLE.0),
+            }
+        }
+        Ok(NtRequest::QueryPerformanceCounter { counter }) => {
+            let written = crate::time::counter()
+                .and_then(|ticks| copy_user_from(counter.address, &ticks.to_le_bytes()).ok());
+            match written {
+                Some(()) => {
+                    serial::write_str("WUXIA_NT_QPC_OK\n");
+                    frame.rax = 0;
+                }
+                None => frame.rax = u64::from(NtStatus::INVALID_PARAMETER.0),
             }
         }
         Ok(NtRequest::CreateFile { name }) => {

@@ -21,6 +21,7 @@ mod log;
 mod memory;
 mod paging;
 mod sched;
+mod time;
 mod user;
 mod vfs;
 
@@ -93,6 +94,9 @@ pub extern "C" fn _start() -> ! {
     log::write_str("WUXIA_TIMER_STARTED\n");
     interrupts::wait_for_ticks(5);
     log::write_str("WUXIA_TIMER_OK\n");
+    let frequency = time::calibrate().expect("the timestamp counter cannot be calibrated");
+    log::write_str("WUXIA_TSC_OK\n");
+    log::write_hex(frequency.hertz());
     let response = MEMORY_MAP_REQUEST
         .get_response()
         .expect("Limine did not provide a memory map");

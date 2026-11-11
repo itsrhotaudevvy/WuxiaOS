@@ -99,6 +99,8 @@ pub enum NtCall {
     ReadFile = 0x06,
     /// Open or create a file and return a handle.
     CreateFile = 0x34,
+    /// Read the performance counter.
+    QueryPerformanceCounter = 0x31,
     /// Write to a file handle.
     WriteFile = 0x08,
 }
@@ -113,6 +115,7 @@ impl NtCall {
             0x06 => Some(Self::ReadFile),
             0x08 => Some(Self::WriteFile),
             0x34 => Some(Self::CreateFile),
+            0x31 => Some(Self::QueryPerformanceCounter),
             _ => None,
         }
     }
@@ -126,6 +129,7 @@ impl NtCall {
             Self::ReadFile => NtService::ReadFile,
             Self::WriteFile => NtService::WriteFile,
             Self::CreateFile => NtService::CreateFile,
+            Self::QueryPerformanceCounter => NtService::QueryPerformanceCounter,
         }
     }
 }
@@ -166,6 +170,11 @@ pub enum NtRequest {
     CreateFile {
         /// The 16-byte `UNICODE_STRING` naming the object.
         name: UserBuffer,
+    },
+    /// Read the performance counter into a `LARGE_INTEGER`.
+    QueryPerformanceCounter {
+        /// Validated 8-byte destination range.
+        counter: UserBuffer,
     },
 }
 
@@ -218,6 +227,9 @@ impl NtRequest {
             NtService::CreateFile => Ok(Self::CreateFile {
                 name: decode_struct(registers.args[0], crate::nt_string::UNICODE_STRING_SIZE)?,
             }),
+            NtService::QueryPerformanceCounter => Ok(Self::QueryPerformanceCounter {
+                counter: decode_fixed_buffer(registers.args[0], 8)?,
+            }),
             _ => Err(Error::Unsupported),
         }
     }
@@ -229,6 +241,18 @@ fn decode_handle(raw: u64) -> Result<u32> {
         return Err(Error::InvalidHandle);
     }
     Ok(handle)
+}
+
+/// Decode an output buffer of exactly `size` bytes.
+fn decode_fixed_buffer(address: u64, size: u64) -> Result<UserBuffer> {
+    if address == 0 || size == 0 {
+        return Err(Error::BadAddress);
+    }
+    address.checked_add(size).ok_or(Error::OutOfRange)?;
+    Ok(UserBuffer {
+        address,
+        length: size,
+    })
 }
 
 /// Decode a pointer to a fixed-size structure the caller must copy in.
@@ -330,6 +354,26 @@ mod tests {
     }
 
     #[test]
+    fn performance_counter_takes_an_eight_byte_destination() {
+        let registers = Registers {
+            args: [0x8000_2000, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            NtRequest::decode(0x31, &registers),
+            Ok(NtRequest::QueryPerformanceCounter {
+                counter: UserBuffer {
+                    address: 0x8000_2000,
+                    length: 8,
+                },
+            })
+        );
+        let null = Registers {
+            args: [0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(NtRequest::decode(0x31, &null), Err(Error::BadAddress));
+    }
+
+    #[test]
     fn nt_requests_decode_through_per_build_tables() {
         use crate::nt_service::WindowsBuild;
         let registers = Registers {
@@ -382,7 +426,7 @@ mod tests {
 
     #[test]
     fn bootstrap_calls_map_to_abstract_services() {
-        for raw in [0x06, 0x08, 0x0f, 0x18, 0x29] {
+        for raw in [0x06, 0x08, 0x0f, 0x18, 0x29, 0x31, 0x34] {
             let call = NtCall::from_raw(raw).unwrap();
             let registers = Registers {
                 args: [3, 0x8000_1000, 64, 0, 0, 0],

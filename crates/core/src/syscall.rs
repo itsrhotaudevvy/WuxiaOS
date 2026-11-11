@@ -53,6 +53,8 @@ pub enum PosixCall {
     Pledge = 108,
     /// Restrict which paths the process can resolve; matches OpenBSD `unveil`.
     Unveil = 114,
+    /// Read a clock into a `struct timespec`.
+    ClockGettime = 228,
 }
 
 impl PosixCall {
@@ -73,6 +75,7 @@ impl PosixCall {
             61 => Some(Self::FileSize),
             108 => Some(Self::Pledge),
             114 => Some(Self::Unveil),
+            228 => Some(Self::ClockGettime),
             _ => None,
         }
     }
@@ -180,6 +183,37 @@ pub enum PosixRequest {
     },
     /// Freeze the visibility table, the `unveil(NULL, NULL)` form.
     UnveilLock,
+    /// Write a `struct timespec` describing `clock` into a user buffer.
+    ClockGettime {
+        /// Requested clock.
+        clock: ClockId,
+        /// Validated 16-byte destination range.
+        buffer: UserBuffer,
+    },
+}
+
+/// POSIX clock selectors this kernel answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ClockId {
+    /// Time since the epoch.
+    Realtime = 0,
+    /// Time since the kernel started; never jumps.
+    Monotonic = 1,
+}
+
+impl ClockId {
+    /// Decode an untrusted clock selector.
+    ///
+    /// Only the two clocks this kernel can answer are accepted; anything else
+    /// is `InvalidInput` rather than being answered with a substitute clock.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Realtime),
+            1 => Some(Self::Monotonic),
+            _ => None,
+        }
+    }
 }
 
 impl PosixRequest {
@@ -227,6 +261,10 @@ impl PosixRequest {
             PosixCall::Exit => Ok(Self::Exit {
                 code: registers.args[0],
             }),
+            PosixCall::ClockGettime => Ok(Self::ClockGettime {
+                clock: ClockId::from_raw(registers.args[0]).ok_or(Error::InvalidInput)?,
+                buffer: decode_exact_buffer(registers.args[1], crate::time::TIMESPEC_SIZE as u64)?,
+            }),
             PosixCall::Pledge => Ok(Self::Pledge {
                 promises: decode_promises(registers.args[0])?,
             }),
@@ -267,6 +305,7 @@ impl PosixRequest {
             Self::Exit { .. } => PosixCall::Exit,
             Self::Pledge { .. } => PosixCall::Pledge,
             Self::Unveil { .. } | Self::UnveilLock => PosixCall::Unveil,
+            Self::ClockGettime { .. } => PosixCall::ClockGettime,
         }
     }
 }
@@ -314,6 +353,14 @@ fn decode_descriptor(raw: u64) -> Result<u32> {
 
 fn decode_buffer(address: u64, length: u64) -> Result<UserBuffer> {
     decode_bounded_buffer(address, length, MAX_WRITE_LENGTH)
+}
+
+fn decode_exact_buffer(address: u64, length: u64) -> Result<UserBuffer> {
+    if address == 0 || length == 0 {
+        return Err(Error::BadAddress);
+    }
+    address.checked_add(length).ok_or(Error::OutOfRange)?;
+    Ok(UserBuffer { address, length })
 }
 
 fn decode_bounded_buffer(address: u64, length: u64, bound: u64) -> Result<UserBuffer> {
@@ -625,6 +672,34 @@ mod tests {
             ),
             Err(Error::BadAddress)
         );
+    }
+
+    #[test]
+    fn clock_gettime_needs_a_known_clock_and_a_timespec() {
+        let registers = Registers {
+            args: [1, 0x8000_3000, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(228, &registers),
+            Ok(PosixRequest::ClockGettime {
+                clock: ClockId::Monotonic,
+                buffer: UserBuffer {
+                    address: 0x8000_3000,
+                    length: crate::time::TIMESPEC_SIZE as u64,
+                },
+            })
+        );
+        let unknown = Registers {
+            args: [7, 0x8000_3000, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(228, &unknown),
+            Err(Error::InvalidInput)
+        );
+        let null = Registers {
+            args: [0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(PosixRequest::decode(228, &null), Err(Error::BadAddress));
     }
 
     #[test]

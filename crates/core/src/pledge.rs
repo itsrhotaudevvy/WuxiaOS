@@ -104,7 +104,10 @@ pub const fn required(call: PosixCall) -> Promises {
         | PosixCall::FileSize
         | PosixCall::Yield
         | PosixCall::Sleep
-        | PosixCall::GetPid => Promises::STDIO,
+        | PosixCall::GetPid
+        // Reading a clock reveals nothing and cannot block, so it stays inside
+        // the baseline every process keeps.
+        | PosixCall::ClockGettime => Promises::STDIO,
         // Opening for write would need WPATH once the ABI carries an open mode.
         PosixCall::Open => Promises::RPATH,
         PosixCall::Map | PosixCall::Unmap => Promises::VM,
@@ -164,7 +167,7 @@ impl Pledge {
 mod tests {
     use super::*;
 
-    const CALLS: [PosixCall; 14] = [
+    const CALLS: [PosixCall; 15] = [
         PosixCall::Read,
         PosixCall::Write,
         PosixCall::Open,
@@ -179,6 +182,7 @@ mod tests {
         PosixCall::Exit,
         PosixCall::Pledge,
         PosixCall::Unveil,
+        PosixCall::ClockGettime,
     ];
 
     #[test]
