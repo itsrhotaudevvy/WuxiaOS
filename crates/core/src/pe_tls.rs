@@ -13,7 +13,9 @@
 //! each entry is range-checked before it is yielded.
 
 use crate::error::{Error, Result};
-use crate::pe_import::SectionRange;
+use crate::pe_common::{
+    SectionRange, image_base_and_size, read_array, read_u32, read_u64, rva_add,
+};
 use crate::pe_reloc::data_directory;
 
 /// Data directory index of the TLS table (`IMAGE_DIRECTORY_ENTRY_TLS`).
@@ -22,8 +24,11 @@ pub const TLS_DIRECTORY: usize = 9;
 /// Size in bytes of `IMAGE_TLS_DIRECTORY64`.
 pub const TLS_DIRECTORY64_SIZE: usize = 40;
 
-/// Largest accepted raw template, `EndAddressOfRawData - StartAddressOfRawData`.
-pub const MAX_TLS_RAW_SIZE: u64 = 1 << 20;
+/// Largest accepted template: the raw data plus its zero fill, in bytes.
+///
+/// The loader gives every thread a block of this size. The zero fill is a
+/// 32-bit field, so without a cap an image could request almost 4 GiB.
+pub const MAX_TLS_TEMPLATE_SIZE: u64 = 1 << 20;
 
 /// Maximum number of callbacks accepted before the NULL terminator.
 pub const MAX_TLS_CALLBACKS: usize = 64;
@@ -34,13 +39,6 @@ const ALIGN_SHIFT: u32 = 20;
 /// Largest defined alignment code (`IMAGE_SCN_ALIGN_8192BYTES`); 0 means default.
 const ALIGN_CODE_MAX: u32 = 14;
 
-const LFANEW_OFFSET: usize = 0x3c;
-const PE_OPTIONAL_OFFSET: usize = 24;
-const SIZE_OF_OPTIONAL_OFFSET: usize = 20;
-/// `ImageBase` within a PE32+ optional header.
-const IMAGE_BASE_OFFSET: usize = 24;
-/// `SizeOfImage` within either optional header format.
-const SIZE_OF_IMAGE_OFFSET: usize = 56;
 const CALLBACK_SIZE: usize = 8;
 
 /// A parsed and validated `IMAGE_TLS_DIRECTORY64`.
@@ -94,9 +92,9 @@ impl<'a> TlsDirectory<'a> {
     ///
     /// Errors: `Unsupported` for a PE32 image; `InvalidImage` when the directory
     /// is shorter than 40 bytes or lies outside section raw data, when
-    /// `StartAddressOfRawData` exceeds `EndAddressOfRawData`, when the template
-    /// is larger than `MAX_TLS_RAW_SIZE`, when an address lies outside the image,
-    /// or when the alignment code is undefined.
+    /// `StartAddressOfRawData` exceeds `EndAddressOfRawData`, when an address lies
+    /// outside the image, or when the alignment code is undefined; `OutOfRange`
+    /// when the raw template plus its zero fill exceeds `MAX_TLS_TEMPLATE_SIZE`.
     pub fn parse(image: &'a [u8], sections: &'a [SectionRange]) -> Result<Option<Self>> {
         let slot = match data_directory(image, TLS_DIRECTORY) {
             Ok(slot) => slot,
@@ -109,7 +107,7 @@ impl<'a> TlsDirectory<'a> {
         if slot.size < TLS_DIRECTORY64_SIZE as u32 {
             return Err(Error::InvalidImage);
         }
-        let (image_base, size_of_image) = image_layout(image)?;
+        let (image_base, size_of_image) = image_base_and_size(image)?;
         let raw: [u8; TLS_DIRECTORY64_SIZE] = read_array(image, sections, slot.rva)?;
 
         let start = read_u64(&raw, 0)?;
@@ -123,8 +121,14 @@ impl<'a> TlsDirectory<'a> {
             return Err(Error::InvalidImage);
         }
         let raw_size = end - start;
-        if raw_size > MAX_TLS_RAW_SIZE {
-            return Err(Error::InvalidImage);
+        // The loader allocates the raw data and the zero fill together, so the
+        // cap applies to their sum. The add is checked, so an overflowing sum is
+        // refused rather than wrapped.
+        let template_size = raw_size
+            .checked_add(u64::from(size_of_zero_fill))
+            .ok_or(Error::OutOfRange)?;
+        if template_size > MAX_TLS_TEMPLATE_SIZE {
+            return Err(Error::OutOfRange);
         }
         // The raw range is half-open, so its end may name the image end. Every
         // other address names a byte the loader reads or writes.
@@ -239,37 +243,6 @@ impl Iterator for TlsCallbacks<'_> {
     }
 }
 
-/// Read `ImageBase` and `SizeOfImage` from a PE32+ image's optional header.
-fn image_layout(image: &[u8]) -> Result<(u64, u32)> {
-    let optional = optional_header(image)?;
-    let image_base = read_u64(optional, IMAGE_BASE_OFFSET)?;
-    let size_of_image = read_u32(optional, SIZE_OF_IMAGE_OFFSET)?;
-    Ok((image_base, size_of_image))
-}
-
-/// Locate the optional header bytes, validating `MZ` and `PE\0\0` on the way.
-fn optional_header(image: &[u8]) -> Result<&[u8]> {
-    if image.len() < 0x40 || image.get(..2) != Some(b"MZ") {
-        return Err(Error::InvalidImage);
-    }
-    let pe = read_u32(image, LFANEW_OFFSET)? as usize;
-    let signature_end = pe.checked_add(4).ok_or(Error::InvalidImage)?;
-    if image.get(pe..signature_end) != Some(b"PE\0\0") {
-        return Err(Error::InvalidImage);
-    }
-    let size_offset = pe
-        .checked_add(SIZE_OF_OPTIONAL_OFFSET)
-        .ok_or(Error::InvalidImage)?;
-    let optional_size = read_u16(image, size_offset)? as usize;
-    let start = pe
-        .checked_add(PE_OPTIONAL_OFFSET)
-        .ok_or(Error::InvalidImage)?;
-    let end = start
-        .checked_add(optional_size)
-        .ok_or(Error::InvalidImage)?;
-    image.get(start..end).ok_or(Error::InvalidImage)
-}
-
 /// Convert a VA to an RVA inside `[image_base, image_base + size_of_image)`.
 ///
 /// With `one_past_end`, the image end itself is also accepted, for exclusive
@@ -288,79 +261,10 @@ fn image_rva(va: u64, image_base: u64, size_of_image: u32, one_past_end: bool) -
     u32::try_from(rva).map_err(|_| Error::InvalidImage)
 }
 
-/// Translate an RVA to its file offset and the bytes readable from there.
-///
-/// Returns `(offset, available)` where `available` counts bytes up to the end
-/// of the containing section's raw data, clipped to the image length.
-fn resolve(bytes: &[u8], sections: &[SectionRange], rva: u32) -> Result<(usize, usize)> {
-    for section in sections {
-        let delta = match rva.checked_sub(section.virtual_address) {
-            Some(delta) => delta,
-            None => continue,
-        };
-        if delta >= section.raw_size {
-            continue;
-        }
-        let offset = section
-            .raw_offset
-            .checked_add(delta as usize)
-            .ok_or(Error::InvalidImage)?;
-        let raw_end = section
-            .raw_offset
-            .checked_add(section.raw_size as usize)
-            .ok_or(Error::InvalidImage)?;
-        let limit = raw_end.min(bytes.len());
-        if offset >= limit {
-            return Err(Error::InvalidImage);
-        }
-        return Ok((offset, limit - offset));
-    }
-    Err(Error::InvalidImage)
-}
-
-/// Read a fixed-size value at an RVA, confined to one section's raw data.
-fn read_array<const N: usize>(
-    bytes: &[u8],
-    sections: &[SectionRange],
-    rva: u32,
-) -> Result<[u8; N]> {
-    let (offset, available) = resolve(bytes, sections, rva)?;
-    if available < N {
-        return Err(Error::InvalidImage);
-    }
-    let end = offset.checked_add(N).ok_or(Error::InvalidImage)?;
-    let source = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    <[u8; N]>::try_from(source).map_err(|_| Error::InvalidImage)
-}
-
-fn rva_add(base: u32, delta: usize) -> Result<u32> {
-    let delta = u32::try_from(delta).map_err(|_| Error::InvalidImage)?;
-    base.checked_add(delta).ok_or(Error::InvalidImage)
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    let end = offset.checked_add(2).ok_or(Error::InvalidImage)?;
-    let bytes = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let end = offset.checked_add(4).ok_or(Error::InvalidImage)?;
-    let bytes = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    let end = offset.checked_add(8).ok_or(Error::InvalidImage)?;
-    let bytes = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(bytes);
-    Ok(u64::from_le_bytes(word))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pe_common::{IMAGE_BASE_OFFSET, LFANEW_OFFSET, SIZE_OF_IMAGE_OFFSET};
 
     const BASE: u64 = 0x1_4000_0000;
     const IMAGE_SIZE: u32 = 0x3000;
@@ -462,16 +366,19 @@ mod tests {
     }
 
     #[test]
-    fn template_size_is_raw_plus_checked_zero_fill() {
+    fn zero_fill_counts_against_the_template_cap() {
         let sections = [SECTION];
+        // Nearly 4 GiB of zero fill is refused before any block could be sized.
         let big_fill = tls_image(
             IMAGE_SIZE,
             [BASE + 0x1300, BASE + 0x1320, BASE + 0x1200, 0],
             u32::MAX,
             0,
         );
-        let tls = TlsDirectory::parse(&big_fill, &sections).unwrap().unwrap();
-        assert_eq!(tls.template_size(), Ok(0x20 + u64::from(u32::MAX)));
+        assert_eq!(
+            TlsDirectory::parse(&big_fill, &sections),
+            Err(Error::OutOfRange)
+        );
     }
 
     #[test]
@@ -497,7 +404,7 @@ mod tests {
             0x20_0000,
             [
                 BASE + 0x1000,
-                BASE + 0x1000 + MAX_TLS_RAW_SIZE,
+                BASE + 0x1000 + MAX_TLS_TEMPLATE_SIZE,
                 BASE + 0x1200,
                 0,
             ],
@@ -505,13 +412,13 @@ mod tests {
             0,
         );
         let tls = TlsDirectory::parse(&at_cap, &sections).unwrap().unwrap();
-        assert_eq!(tls.raw_size(), MAX_TLS_RAW_SIZE);
+        assert_eq!(tls.raw_size(), MAX_TLS_TEMPLATE_SIZE);
 
         let over_cap = tls_image(
             0x20_0000,
             [
                 BASE + 0x1000,
-                BASE + 0x1000 + MAX_TLS_RAW_SIZE + 1,
+                BASE + 0x1000 + MAX_TLS_TEMPLATE_SIZE + 1,
                 BASE + 0x1200,
                 0,
             ],
@@ -520,7 +427,50 @@ mod tests {
         );
         assert_eq!(
             TlsDirectory::parse(&over_cap, &sections),
-            Err(Error::InvalidImage)
+            Err(Error::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn template_cap_includes_zero_fill() {
+        let sections = [SECTION];
+        // A 0x20-byte template, so the zero fill alone decides the total.
+        let with_fill = |fill: u32| {
+            tls_image(
+                IMAGE_SIZE,
+                [BASE + 0x1300, BASE + 0x1320, BASE + 0x1200, 0],
+                fill,
+                0,
+            )
+        };
+
+        // Exactly at the cap is accepted.
+        let at_cap = with_fill((MAX_TLS_TEMPLATE_SIZE - 0x20) as u32);
+        let tls = TlsDirectory::parse(&at_cap, &sections).unwrap().unwrap();
+        assert_eq!(tls.template_size(), Ok(MAX_TLS_TEMPLATE_SIZE));
+
+        // One byte over the cap is rejected.
+        let one_over = with_fill((MAX_TLS_TEMPLATE_SIZE - 0x20 + 1) as u32);
+        assert_eq!(
+            TlsDirectory::parse(&one_over, &sections),
+            Err(Error::OutOfRange)
+        );
+
+        // A raw template exactly at the cap leaves no room for any zero fill.
+        let raw_at_cap = tls_image(
+            0x20_0000,
+            [
+                BASE + 0x1000,
+                BASE + 0x1000 + MAX_TLS_TEMPLATE_SIZE,
+                BASE + 0x1200,
+                0,
+            ],
+            1,
+            0,
+        );
+        assert_eq!(
+            TlsDirectory::parse(&raw_at_cap, &sections),
+            Err(Error::OutOfRange)
         );
     }
 

@@ -12,7 +12,7 @@
 //! trailer, belongs to the unwinder.
 
 use crate::error::{Error, Result};
-use crate::pe_import::SectionRange;
+use crate::pe_common::{SectionRange, read_u32, table_bytes};
 
 /// Index of the exception directory (`IMAGE_DIRECTORY_ENTRY_EXCEPTION`).
 pub const EXCEPTION_DIRECTORY: usize = 3;
@@ -91,7 +91,7 @@ impl<'a> RuntimeFunctions<'a> {
             return Err(Error::InvalidImage);
         }
         let table = Self {
-            bytes: table_bytes(image, sections, rva, size)?,
+            bytes: table_bytes(image, sections, rva, size as usize)?,
         };
         let mut previous: Option<RuntimeFunction> = None;
         for index in 0..table.len() {
@@ -129,9 +129,9 @@ impl<'a> RuntimeFunctions<'a> {
         }
         let base = index.checked_mul(RUNTIME_FUNCTION_SIZE)?;
         Some(RuntimeFunction {
-            begin: u32_at(self.bytes, base)?,
-            end: u32_at(self.bytes, base + 4)?,
-            unwind_info: u32_at(self.bytes, base + 8)?,
+            begin: read_u32(self.bytes, base).ok()?,
+            end: read_u32(self.bytes, base + 4).ok()?,
+            unwind_info: read_u32(self.bytes, base + 8).ok()?,
         })
     }
 
@@ -205,45 +205,6 @@ impl<'a> UnwindInfo<'a> {
     pub const fn is_chained(&self) -> bool {
         self.flags & UNW_FLAG_CHAININFO != 0
     }
-}
-
-/// Translate a table RVA and size into the bytes it occupies in the image.
-///
-/// The table must start inside a section's raw data and end no later than that
-/// section's raw data; the arithmetic is widened so no RVA range can overflow.
-fn table_bytes<'a>(
-    image: &'a [u8],
-    sections: &[SectionRange],
-    rva: u32,
-    size: u32,
-) -> Result<&'a [u8]> {
-    for section in sections {
-        let delta = match rva.checked_sub(section.virtual_address) {
-            Some(delta) => delta,
-            None => continue,
-        };
-        if delta >= section.raw_size {
-            continue;
-        }
-        if u64::from(delta) + u64::from(size) > u64::from(section.raw_size) {
-            return Err(Error::InvalidImage);
-        }
-        let start = section
-            .raw_offset
-            .checked_add(delta as usize)
-            .ok_or(Error::InvalidImage)?;
-        let end = start
-            .checked_add(size as usize)
-            .ok_or(Error::InvalidImage)?;
-        return image.get(start..end).ok_or(Error::InvalidImage);
-    }
-    Err(Error::InvalidImage)
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let raw: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
-    Some(u32::from_le_bytes(raw))
 }
 
 #[cfg(test)]

@@ -11,6 +11,9 @@
 //! boundary without the parser noticing.
 
 use crate::error::{Error, Result};
+use crate::pe_common::{read_array, read_name, read_u32, rva_add};
+
+pub use crate::pe_common::{MAX_NAME_LEN, SectionRange};
 
 /// Maximum number of import descriptors accepted before the terminator.
 pub const MAX_IMPORT_MODULES: usize = 256;
@@ -18,26 +21,9 @@ pub const MAX_IMPORT_MODULES: usize = 256;
 /// Maximum number of thunks accepted in one lookup table before its terminator.
 pub const MAX_IMPORT_THUNKS: usize = 4096;
 
-/// Maximum length in bytes of a DLL or function name, excluding its NUL.
-pub const MAX_NAME_LEN: usize = 255;
-
 const DESCRIPTOR_SIZE: usize = 20;
 const THUNK_SIZE: usize = 8;
 const ORDINAL_FLAG: u64 = 1 << 63;
-
-/// One section's RVA-to-file mapping, taken from its section header.
-///
-/// Only the raw data is addressable: an RVA in the virtual tail beyond
-/// `raw_size` has no bytes in the image and does not resolve.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SectionRange {
-    /// Section virtual address relative to the image base.
-    pub virtual_address: u32,
-    /// Offset of the section's raw data in the image bytes.
-    pub raw_offset: usize,
-    /// Number of raw data bytes available in the image.
-    pub raw_size: u32,
-}
 
 /// The import data directory of one image: its RVA, size and section map.
 #[derive(Clone, Copy, Debug)]
@@ -159,9 +145,9 @@ impl<'a> ImportModules<'a> {
 
         // Descriptor layout: OriginalFirstThunk, TimeDateStamp,
         // ForwarderChain, Name, FirstThunk.
-        let original_first_thunk = le_u32(&raw, 0);
-        let name_rva = le_u32(&raw, 12);
-        let first_thunk = le_u32(&raw, 16);
+        let original_first_thunk = read_u32(&raw, 0)?;
+        let name_rva = read_u32(&raw, 12)?;
+        let first_thunk = read_u32(&raw, 16)?;
         let lookup_rva = if original_first_thunk != 0 {
             original_first_thunk
         } else {
@@ -265,85 +251,6 @@ impl<'a> Iterator for ImportThunks<'a> {
             }
         }
     }
-}
-
-/// Translate an RVA to its file offset and the bytes readable from there.
-///
-/// Returns `(offset, available)` where `available` counts bytes up to the end
-/// of the containing section's raw data, clipped to the image length.
-fn resolve(bytes: &[u8], sections: &[SectionRange], rva: u32) -> Result<(usize, usize)> {
-    for section in sections {
-        let delta = match rva.checked_sub(section.virtual_address) {
-            Some(delta) => delta,
-            None => continue,
-        };
-        if delta >= section.raw_size {
-            continue;
-        }
-        let offset = section
-            .raw_offset
-            .checked_add(delta as usize)
-            .ok_or(Error::InvalidImage)?;
-        let raw_end = section
-            .raw_offset
-            .checked_add(section.raw_size as usize)
-            .ok_or(Error::InvalidImage)?;
-        let limit = raw_end.min(bytes.len());
-        if offset >= limit {
-            return Err(Error::InvalidImage);
-        }
-        return Ok((offset, limit - offset));
-    }
-    Err(Error::InvalidImage)
-}
-
-/// Read a fixed-size value at an RVA, confined to one section's raw data.
-fn read_array<const N: usize>(
-    bytes: &[u8],
-    sections: &[SectionRange],
-    rva: u32,
-) -> Result<[u8; N]> {
-    let (offset, available) = resolve(bytes, sections, rva)?;
-    if available < N {
-        return Err(Error::InvalidImage);
-    }
-    let end = offset.checked_add(N).ok_or(Error::InvalidImage)?;
-    let source = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    <[u8; N]>::try_from(source).map_err(|_| Error::InvalidImage)
-}
-
-/// Read a NUL-terminated printable ASCII name of at most `MAX_NAME_LEN` bytes.
-///
-/// The terminator must appear inside the containing section's raw data.
-fn read_name<'a>(bytes: &'a [u8], sections: &[SectionRange], rva: u32) -> Result<&'a str> {
-    let (offset, available) = resolve(bytes, sections, rva)?;
-    // Scan at most one byte past the maximum so an over-long name is detected.
-    let window_len = available.min(MAX_NAME_LEN + 1);
-    let end = offset.checked_add(window_len).ok_or(Error::InvalidImage)?;
-    let window = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    let nul = window
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(Error::InvalidName)?;
-    if nul == 0 {
-        return Err(Error::InvalidName);
-    }
-    let text = window.get(..nul).ok_or(Error::InvalidName)?;
-    if !text.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
-        return Err(Error::InvalidName);
-    }
-    core::str::from_utf8(text).map_err(|_| Error::InvalidName)
-}
-
-fn rva_add(base: u32, delta: usize) -> Result<u32> {
-    let delta = u32::try_from(delta).map_err(|_| Error::InvalidImage)?;
-    base.checked_add(delta).ok_or(Error::InvalidImage)
-}
-
-fn le_u32(bytes: &[u8; DESCRIPTOR_SIZE], offset: usize) -> u32 {
-    let mut value = [0u8; 4];
-    value.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_le_bytes(value)
 }
 
 #[cfg(test)]
