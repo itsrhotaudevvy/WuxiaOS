@@ -30,9 +30,28 @@ impl LoadSegment {
     }
 
     /// Page-aligned address one past the last mapped byte.
-    pub const fn end(self) -> u64 {
-        self.address + self.page_count() * PAGE_SIZE
+    ///
+    /// Returns [`Error::OutOfRange`] when the rounded range is not
+    /// representable, which only happens for hand-built segments.
+    pub const fn end(self) -> Result<u64> {
+        let bytes = match self.page_count().checked_mul(PAGE_SIZE) {
+            Some(bytes) => bytes,
+            None => return Err(Error::OutOfRange),
+        };
+        match self.address.checked_add(bytes) {
+            Some(end) => Ok(end),
+            None => Err(Error::OutOfRange),
+        }
     }
+}
+
+/// Whether `entry` lies inside an executable segment that the plan maps.
+fn entry_is_executable(segments: &[Option<LoadSegment>], entry: u64) -> bool {
+    segments.iter().flatten().any(|segment| {
+        segment.permissions.executable
+            && entry >= segment.address
+            && entry - segment.address < segment.memory_size
+    })
 }
 
 /// A bounded, validated list of segments for one image.
@@ -46,7 +65,8 @@ impl<const N: usize> LoaderPlan<N> {
     /// Derive a plan from an ELF64 executable.
     ///
     /// Rejects writable-executable segments, unaligned ranges, ranges above
-    /// the user limit and images with no loadable segment.
+    /// the user limit, images with no loadable segment and entry points that
+    /// do not lie inside an executable segment.
     pub fn from_elf(bytes: &[u8]) -> Result<Self> {
         let elf = Elf64Image::parse(bytes)?;
         if elf.info().kind != ElfKind::Executable {
@@ -88,7 +108,7 @@ impl<const N: usize> LoaderPlan<N> {
             });
             count += 1;
         }
-        if count == 0 {
+        if count == 0 || !entry_is_executable(&segments, elf.entry()) {
             return Err(Error::InvalidImage);
         }
         Ok(Self {
@@ -155,7 +175,7 @@ impl<const N: usize> LoaderPlan<N> {
             });
             count += 1;
         }
-        if count == 0 {
+        if count == 0 || !entry_is_executable(&segments, entry) {
             return Err(Error::InvalidImage);
         }
         Ok(Self { entry, segments })
@@ -183,10 +203,12 @@ impl<const N: usize> LoaderPlan<N> {
 
     /// Page-aligned end of the highest segment.
     pub fn max_end(&self) -> Result<u64> {
-        self.segments()
-            .map(|segment| segment.end())
-            .max()
-            .ok_or(Error::InvalidImage)
+        let mut max = None;
+        for segment in self.segments() {
+            let end = segment.end()?;
+            max = Some(max.map_or(end, |current: u64| current.max(end)));
+        }
+        max.ok_or(Error::InvalidImage)
     }
 }
 
@@ -233,6 +255,7 @@ mod tests {
         bytes[0x68..0x6c].copy_from_slice(&0x1000u32.to_le_bytes());
         bytes[0x70..0x78].copy_from_slice(&0x140000000u64.to_le_bytes());
         bytes[0x58 + 56..0x58 + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+        bytes[0x78..0x7c].copy_from_slice(&0x1000u32.to_le_bytes());
 
         let text = 0x148;
         bytes[text..text + 5].copy_from_slice(b".text");
@@ -297,11 +320,97 @@ mod tests {
 
     #[test]
     fn writable_segments_are_not_executable() {
-        let elf = tiny_elf(6, 0x8000_0000, 0x1000);
+        // The entry point must live in the executable segment, so add one
+        // after the writable segment instead of pointing the entry at data.
+        let mut elf = tiny_elf(6, 0x8000_0000, 0x1000);
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let second = 0x40 + 56;
+        elf[second..second + 4].copy_from_slice(&1u32.to_le_bytes());
+        elf[second + 4..second + 8].copy_from_slice(&5u32.to_le_bytes());
+        elf[second + 8..second + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[second + 16..second + 24].copy_from_slice(&0x8000_1000u64.to_le_bytes());
+        elf[second + 32..second + 40].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[second + 40..second + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[second + 48..second + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x8000_1000u64.to_le_bytes());
+
         let plan = LoaderPlan::<4>::from_elf(&elf).unwrap();
-        let segment = plan.segments().next().unwrap();
-        assert_eq!(segment.permissions, PagePermissions::USER_READ_WRITE);
-        assert!(!segment.permissions.executable);
+        let mut segments = plan.segments();
+        let data = segments.next().unwrap();
+        assert_eq!(data.permissions, PagePermissions::USER_READ_WRITE);
+        assert!(!data.permissions.executable);
+        assert_eq!(
+            segments.next().unwrap().permissions,
+            PagePermissions::USER_CODE
+        );
+    }
+
+    #[test]
+    fn entry_must_lie_in_an_executable_segment() {
+        // Entry just past the only (executable) segment.
+        let mut elf = tiny_elf(5, 0x8000_0000, 0x1000);
+        elf[24..32].copy_from_slice(&0x8000_1000u64.to_le_bytes());
+        assert!(matches!(
+            LoaderPlan::<4>::from_elf(&elf),
+            Err(Error::InvalidImage)
+        ));
+
+        // Entry in a read-only segment is not executable.
+        let elf = tiny_elf(4, 0x8000_0000, 0x1000);
+        assert!(matches!(
+            LoaderPlan::<4>::from_elf(&elf),
+            Err(Error::InvalidImage)
+        ));
+
+        // PE entry pointing into the writable .data section.
+        let mut image = tiny_pe64(0x6000_0020, 0x2000);
+        image[0x58 + 16..0x58 + 20].copy_from_slice(&0x2000u32.to_le_bytes());
+        assert!(matches!(
+            LoaderPlan::<4>::from_pe(&image),
+            Err(Error::InvalidImage)
+        ));
+    }
+
+    #[test]
+    fn pe_image_base_arithmetic_cannot_wrap_or_reach_kernel_space() {
+        // image base + entry RVA wraps past u64::MAX.
+        let mut image = tiny_pe64(0x6000_0020, 0x2000);
+        image[0x70..0x78].copy_from_slice(&(u64::MAX - 0xfff).to_le_bytes());
+        assert!(matches!(
+            LoaderPlan::<4>::from_pe(&image),
+            Err(Error::OutOfRange)
+        ));
+
+        // The executable section starts exactly at the user limit.
+        let mut image = tiny_pe64(0x6000_0020, 0x2000);
+        image[0x70..0x78].copy_from_slice(&0x7fff_ffff_f000u64.to_le_bytes());
+        assert!(matches!(
+            LoaderPlan::<4>::from_pe(&image),
+            Err(Error::BadAddress)
+        ));
+    }
+
+    #[test]
+    fn segment_end_reports_overflow_instead_of_wrapping() {
+        let segment = |address, memory_size| LoadSegment {
+            address,
+            file_size: 0,
+            memory_size,
+            file_offset: 0,
+            permissions: PagePermissions::USER_READ_ONLY,
+        };
+        assert_eq!(segment(0x1000, 1).end(), Ok(0x2000));
+        assert_eq!(
+            segment(0xffff_ffff_ffff_e000, 0x1000).end(),
+            Ok(0xffff_ffff_ffff_f000)
+        );
+        // Rounding the last partial page up runs past u64::MAX.
+        assert_eq!(
+            segment(0xffff_ffff_ffff_f000, 1).end(),
+            Err(Error::OutOfRange)
+        );
+        // page_count * PAGE_SIZE is not representable.
+        assert_eq!(segment(0, u64::MAX).end(), Err(Error::OutOfRange));
     }
 
     #[test]
