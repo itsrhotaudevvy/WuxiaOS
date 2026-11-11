@@ -6,7 +6,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 ## Repository layout
 
-- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE metadata parsing, physical frames, HHDM translation, x86_64 paging encoding and a table walker, and syscall vocabulary.
+- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE metadata parsing, physical frames, HHDM translation, x86_64 paging encoding, a table walker, a per-process address-space model and syscall vocabulary.
 - `crates/kernel`: the real `no_std` x86_64 Limine kernel, bootstrap serial console, descriptor tables, physical-memory allocator and bootstrap page-table construction.
 - `crates/xtask`: host-side build, test, ISO and QEMU orchestration.
 - `docs`: architecture, security, compatibility and research decisions.
@@ -18,7 +18,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
 - The kernel validates Limine's HHDM offset, builds a four-level page-table chain for a user code page and stack, clones the active PML4 into a fresh root, loads that root into CR3 and re-resolves both pages through the active tables.
 - `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X.
-- 37 `wuxia-core` host tests pass.
+- 43 `wuxia-core` host tests pass.
 - PE parsing validates container metadata only. No Windows program or driver is executed yet.
 - The GDT, user segments, TSS and an IDT with CPL0/CPL3 gates are loaded; the `int3` self-test returns through the full stub path.
 - The kernel enters CPL3 with `iretq`, runs a generated user program, rejects an out-of-region `write` pointer, copies a real message from user memory to the serial console through `write(1, …)` and ends on `exit(0)`.

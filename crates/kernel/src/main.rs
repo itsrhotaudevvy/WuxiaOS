@@ -149,7 +149,29 @@ pub extern "C" fn _start() -> ! {
     program[55..59].copy_from_slice(&(MESSAGE.len() as u32).to_le_bytes());
     paging::write_frame(direct_map, first, &program).expect("cannot write the user code page");
 
-    user::set_region(image.code_address, image.data_address + 0x1000);
+    let mut space = wuxia_core::AddressSpace::<4>::new();
+    space
+        .map(
+            image.code_address,
+            0x1000,
+            wuxia_core::PagePermissions::USER_CODE,
+        )
+        .expect("the code region cannot be modeled");
+    space
+        .map(
+            image.stack_address,
+            0x1000,
+            wuxia_core::PagePermissions::USER_READ_WRITE,
+        )
+        .expect("the stack region cannot be modeled");
+    space
+        .map(
+            image.data_address,
+            0x1000,
+            wuxia_core::PagePermissions::USER_READ_ONLY,
+        )
+        .expect("the data region cannot be modeled");
+    user::set_space(space);
     serial::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.code_address, image.stack_address + 0x1000 - 16);
 }

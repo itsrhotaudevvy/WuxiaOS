@@ -6,6 +6,7 @@
 //! Executable parsers validate untrusted metadata without executing it; actual
 //! mapping and ABI emulation belong to the architecture-specific kernel.
 
+pub mod address_space;
 pub mod capability;
 pub mod error;
 pub mod hhdm;
@@ -17,6 +18,7 @@ pub mod personality;
 pub mod region;
 pub mod syscall;
 
+pub use address_space::AddressSpace;
 pub use capability::{Handle, HandleTable, Rights};
 pub use error::{Error, Result};
 pub use hhdm::DirectMap;

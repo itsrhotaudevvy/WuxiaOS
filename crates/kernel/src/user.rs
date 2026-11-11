@@ -7,27 +7,28 @@
 use core::arch::asm;
 use core::ptr::{addr_of, addr_of_mut, read_volatile};
 
+use wuxia_core::address_space::AddressSpace;
+
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 const INTERRUPTS_ENABLED: u64 = 1 << 1;
 
-/// Inclusive-exclusive bounds of the mapped user image.
-static mut REGION: (u64, u64) = (0, 0);
+/// Per-process region model kept in sync with the installed page tables.
+static mut SPACE: Option<AddressSpace<4>> = None;
 
-/// Record the mapped user region so syscalls can reject foreign pointers.
-pub fn set_region(start: u64, end: u64) {
+/// Record the mapped user regions so syscalls can reject foreign pointers.
+pub fn set_space(space: AddressSpace<4>) {
     // SAFETY: written once before ring 3 starts and read only afterwards.
     unsafe {
-        *addr_of_mut!(REGION) = (start, end);
+        *addr_of_mut!(SPACE) = Some(space);
     }
 }
 
-/// Whether `[address, address + length)` lies inside the mapped user image.
+/// Whether `[address, address + length)` lies inside one mapped user region.
 pub fn region_contains(address: u64, length: u64) -> bool {
-    // SAFETY: the tuple is written once before ring 3 starts.
-    let (start, end) = unsafe { read_volatile(addr_of!(REGION)) };
-    match address.checked_add(length) {
-        Some(last) => address >= start && last <= end,
+    // SAFETY: the model is written once before ring 3 starts.
+    match unsafe { read_volatile(addr_of!(SPACE)) } {
+        Some(space) => space.contains(address, length),
         None => false,
     }
 }
