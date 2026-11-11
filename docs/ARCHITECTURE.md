@@ -8,35 +8,86 @@ WuxiaOS aims to run Windows applications and drivers in a UNIX/POSIX-compatible 
 
 The executive owns physical memory, page tables, threads, scheduling, synchronization and object lifetimes. A process explicitly selects either `Personality::Posix` or `Personality::Nt`. Each personality owns its namespace, syscall ABI and error/status mapping. POSIX file descriptors and NT handles are not interchangeable numeric values.
 
+Current state: the personality is recorded per process, and an NT thread decodes NT service numbers. Separate namespaces and handle spaces are not implemented. The NT calls in the kernel index the same per-process descriptor table as the POSIX calls, so an NT handle and a POSIX descriptor are the same number today. The separation described above is the target.
+
 NT support requires per-build syscall tables, NT object namespaces, handles, access tokens, registry keys, process/thread context, IRQL and synchronization semantics. POSIX requires file-descriptor namespaces, signals, fork-like process behavior and a separately documented syscall ABI. Shared internals do not collapse these semantics into a single lowest-common-denominator API.
 
 ## Current execution boundary
 
-`crates/core` is `no_std` and `forbid(unsafe_code)`. It contains host-testable contracts, not an executing compatibility layer. `crates/kernel` is a real `no_std` x86_64 kernel with a Limine high-half entry, COM1 serial output, memory-map ingestion and a bootstrap bump allocator.
+The sub-sections describe the bootstrap kernel as it runs today. Anything not described here is not implemented.
 
-Paging contracts in `crates/core/src/paging.rs` validate lower-half, page-aligned user addresses and encode PML4-through-PT entries. Leaves reject the null frame, addresses beyond 52-bit physical addressing, and any writable-executable combination. These functions only produce `u64` entries; they do not dereference memory.
+### Core and kernel split
 
-`crates/core/src/hhdm.rs` validates Limine's higher-half direct-map offset and performs checked physical-to-virtual and virtual-to-physical translation. The kernel uses it to zero and write allocated frames. The bootstrap builder links a PML4/PDPT/PD/PT chain for an executable code page and a writable stack page in a previously absent lower-half slot, clones the active PML4 into a fresh frame, installs the subtree, and loads the clone into CR3. Because every bootloader entry is copied, the kernel image, direct map and stack remain reachable after the switch. `paging::resolve` then walks both user addresses through the now-active root.
+`crates/core` is `no_std` and `forbid(unsafe_code)`. It holds host-testable contracts, not an executing compatibility layer. `crates/kernel` is a `no_std` x86_64 kernel with a Limine high-half entry, COM1 serial output, memory-map ingestion, a reclaimable frame pool, and a set of embedded test images. The kernel calls `wuxia_core` for validation and bookkeeping. The core modules it does not call are listed in the section "Host-tested models not yet used by the kernel".
 
-Userspace runs under a round-robin scheduler: `yield` and the timer interrupt save the full trap frame (including user `rsp`/`ss`), switches CR3 to the next runnable thread and restores that thread's frame, so the shared stub resumes it exactly where it stopped. `exit` marks the current thread unrunnable and resumes the next one. Each thread owns a `Process` record, so `getpid`, descriptor lookup and exit act on the running thread rather than on a single bootstrap process. The `map` syscall chooses a page-aligned gap above every mapped region, allocates frames from the published pool, inserts 4 KiB writable leaves into the running root's existing user subtree and records the frames for teardown. `unmap` clears the leaf entries, issues `invlpg` per page, drops the frames from the teardown record and returns them to the pool; a later access faults because the region is gone. The loader records every frame an image allocates (tables, leaves and root), and exit returns all of them to the published frame pool before the scheduler switches roots, so a terminated process leaks nothing and its frames are immediately reusable. The bootstrap remaps the 8259 PIC away from the exception vectors, programs the 8254 PIT for periodic IRQ0 ticks, unmasks only the timer line and waits for a bounded number of ticks before continuing; the timer handler increments a counter and acknowledges the PIC. The `wuxia-user` crate is linked at a fixed 512 GiB base and embedded into the kernel by its build script. The host-tested `LoaderPlan` parses the ELF64 program headers, rejects writable-executable segments and unaligned or out-of-range addresses, and the loader then allocates a zeroed frame per page, copies each segment's file bytes, maps read-only data, executable code and a writable stack with distinct permissions, and clones the bootloader root before entering. The kernel then enters CPL3 with `iretq` using the ring-3 code/data descriptors. A dedicated 16 KiB trap stack is installed as `TSS.RSP0`, so a ring-3 `int 0x80` arrives on kernel memory the bootstrap stack does not own. The shared stub saves all general-purpose registers, dispatches to Rust and returns with `iretq`. Syscall numbers are decoded by the host-tested `PosixRequest::decode`, which rejects unknown numbers, invalid descriptors, null buffers, oversized transfers and overflowing ranges before any pointer is used. The kernel records the process (identifier, personality, address space, lifecycle) in a host-tested `Process` model at boot and rejects any `write` buffer outside them before touching memory; accepted buffers are read through the direct map by walking the active hierarchy and checking the leaf's user bit, so a supervisor-only or absent page is refused. `write(1, …)` checks that descriptor 1 is open in the process descriptor table, forwards the bytes to the serial console and `getpid` returns the recorded identifier and `exit` moves the process to `Exited` exactly once. The kernel then starts a second embedded image that writes through an unmapped address; the page-fault handler detects the CPL3 frame, reports the error code, faulting address and instruction pointer and terminates the process without unwinding into the kernel. There is still no scheduler, no switching between multiple processes and no file system.
+### Boot and paging
 
-The bootstrap bump allocator owns a bounded normalized map and never returns a frame twice. It does not free frames; early page tables are permanent for the lifetime of bootstrap. General reclaim requires ownership and reference tracking, not simply changing the cursor backward.
+- `crates/core/src/paging.rs` validates lower-half, page-aligned user addresses and encodes PML4-through-PT entries. Leaf entries reject the null frame, physical addresses beyond 52-bit physical addressing, and any writable-executable combination. These functions only produce `u64` entries and do not dereference memory.
+- `crates/core/src/hhdm.rs` validates Limine's higher-half direct-map offset and performs checked physical-to-virtual and virtual-to-physical translation. The kernel uses it to zero and write frames and to walk page tables.
+- `crates/kernel/src/paging.rs` builds a PML4/PDPT/PD/PT chain for an image's segments and stack inside one previously absent lower-half PML4 slot; a present slot is refused. It clones the active PML4 into a fresh frame, installs the subtree and loads the clone into CR3. Every bootloader entry is copied, so the kernel image, direct map and stack remain reachable after the switch. `paging::resolve` then walks the entry point, each segment and the stack through the active root.
+- Boot runs an `int3` self-test through the full trap stub, remaps the 8259 PIC away from the exception vectors, programs the 8254 PIT at 100 Hz, unmasks only IRQ0 and waits for five ticks before continuing. The timer handler increments a counter and acknowledges the PIC.
+
+### User entry and syscalls
+
+- The kernel build script embeds four test images: `wuxia-user`, which is linked at a fixed 512 GiB base (`0x8000000000`), `wuxia-fault`, `wuxia-second`, and a hand-built PE32+ image.
+- `crates/core/src/load.rs` builds a `LoaderPlan` from an ELF64 or PE32+ image. Planning rejects writable-executable segments, unaligned or out-of-range addresses, and an entry point outside an executable segment. The kernel loader then allocates a zeroed frame per page, copies each segment's file bytes, and maps read-only data, executable code and a writable stack with distinct permissions.
+- `user::enter` returns to CPL3 with `iretq` on the ring-3 code and data selectors. It pushes RFLAGS `0x2`, so the first user thread runs with interrupts disabled until its first trap. Only the scheduler's switch path forces IF on in the frame it restores. The TSS `RSP0` points to a dedicated 16 KiB trap stack, so a ring-3 `int 0x80` or interrupt arrives on kernel memory that the bootstrap stack does not own. The shared stub saves all general-purpose registers, dispatches to Rust and returns with `iretq`.
+- Syscall numbers are decoded by `wuxia_core::syscall::PosixRequest::decode`, which rejects unknown numbers and malformed arguments before the kernel dereferences any pointer.
+- POSIX calls implemented in the kernel: `getpid`, `yield`, `sleep`, `exit`, `open`, `read`, `write`, `seek`, file size, `close`, `map` and `unmap`.
+- NT calls implemented for threads of the NT personality: `NtWriteFile` (handle 1 only), `NtClose`, `NtAllocateVirtualMemory` and `NtTerminateProcess`. `NtReadFile` returns `NOT_IMPLEMENTED`.
+- `write` on a descriptor that is not open, or on a buffer outside the process's modeled regions, is rejected before any memory is touched. Accepted buffers are copied through the direct map after walking the active hierarchy. Each leaf must have its user bit set, and copies into user memory also need the writable bit, so supervisor-only or absent pages are refused. Descriptors 1 and 2 go to the serial console; other descriptors write to the file store.
+- A page fault raised from CPL3 is reported, not contained. The handler prints the error code, faulting address and instruction pointer, prints the test-pass marker, exits QEMU through the debug-exit port and halts. It does not reclaim the faulting image's frames and does not return to the scheduler. The fault self-test image stores to unmapped address `0x1000`; it is started only after every scheduled thread has exited.
+
+### Scheduling
+
+- The scheduler is round-robin over saved trap frames. A `yield`, a timer tick from CPL3, a `sleep` or an `exit` saves the running frame, selects the next runnable thread with `wuxia_core::schedule::next_runnable`, loads that thread's CR3 root and restores its frame with interrupts enabled. A thread is not preempted in the tick in which it was resumed.
+- Up to four threads (`MAX_THREADS`) are registered at boot; no syscall creates processes or threads at run time. Each thread owns a `Process<8>` with its own identifier, personality, address space and descriptor table, so `getpid`, descriptor lookups and `exit` act on the running thread.
+- Two POSIX threads start runnable. One NT thread is registered deferred and starts only after the runnable threads have exited.
+- `sleep` converts milliseconds to timer ticks, rounding up, and marks the thread with a wake tick. Another thread runs if one is ready; otherwise the kernel halts until the deadline. A process that exits while a thread sleeps waits for that thread and then resumes it.
+- `exit` marks the process `Exited` through the host-tested `Process` model. A second exit is rejected. The thread's frames are then reclaimed (see below).
+- Not implemented: priority scheduling in the kernel (`wuxia_core::priority` is host-tested only), SMP, and any blocking I/O beyond `sleep`.
+
+### Memory reclaim
+
+- The kernel allocates physical frames from `wuxia_core::frames::FramePool<65536>` (`crates/kernel/src/memory.rs`). Its regions come from Limine's `USABLE` entries, page-aligned and normalized. The pool is last-in-first-out, rejects the null and misaligned frames, and rejects frees of frames it does not own or that are already free.
+- Each image's `FrameTracker` records every frame the image takes: PDPT, page tables, leaves, stack and root, up to 64 per image. When a thread exits, its recorded frames return to the pool before the next root is loaded. Once no runnable thread remains, the kernel allocates and frees one frame to confirm that the pool can reuse returned frames.
+- `map` takes zeroed frames from the pool, records them and maps 4 KiB writable leaves above every existing mapping. `unmap` requires the exact range of one mapped region, clears its leaves, invalidates each page with `invlpg` and returns the frames to the pool. An access to the range afterwards faults.
+- Limits: page-table frames of an unmapped region stay allocated until the thread exits. The faulting path described above does not reclaim frames. `region::BumpAllocator` (which cannot free frames) remains in `crates/core` for its own tests only; the kernel does not use it.
+
+### Files
+
+- The kernel holds one boot-time, flat, in-memory store (`crates/kernel/src/vfs.rs`, `wuxia_core::vfs::MemFs<4, 512>`): room for four files and 512 bytes of contents. It is populated before ring 3 starts with `hello` and `motd`, and every process shares it.
+- POSIX `open`, `read`, `write`, `seek`, file size and `close` operate on per-process descriptors with per-process offsets over the shared contents. A write may extend a file only when that file ends the used data area; otherwise the write is clipped to the current length.
+- Userspace cannot create, delete or rename files, and there are no directories. The inode directory tree in `wuxia_core::dirtree` is host-tested only.
+- Nothing is persisted across boots.
+
+## Host-tested models not yet used by the kernel
+
+The following `crates/core` modules have host tests but no reference in `crates/kernel`. Each was checked with `grep -rn "wuxia_core::<module>" crates/kernel`, which found no match for any of them. Some of them are reached only through a type that the kernel does call: `Process` owns `AddressSpace` and `DescriptorTable`, `LoaderPlan` parses ELF through `elf` and PE through `image`, and `wuxia_core::Error` is defined in `error`. Those five modules (`address_space`, `descriptor`, `elf`, `image`, `error`) run in the kernel and are not listed here.
+
+- Image formats and loader support: `elf_reloc` (ELF dynamic RELATIVE relocations), `initstack` (System V initial stacks), `pe_export`, `pe_import`, `pe_pdata`, `pe_reloc` and `pe_tls`. The `pe_*` modules reference only each other, so the kernel cannot reach them.
+- NT object model and names: `acl`, `dispatcher`, `dospath`, `nt_string`, `object_namespace`, `path`, `registry` and `sid`.
+- POSIX process and I/O: `credentials`, `cow` (copy-on-write bookkeeping), `dirtree`, `futex`, `pipe`, `proctree`, `rlimit` and `signal`.
+- Policy and capabilities: `capability` (generational handle tables with rights attenuation), `pledge` and `unveil`.
+- Status codes: `errno` (errno and NTSTATUS mapping).
+- Scheduling, time and services: `priority`, `timer`, `klog` (kernel log ring) and `random` (ChaCha20 RNG with ASLR base selection).
+- Memory: `memory`, a bounded frame pool that the kernel superseded with `frames`.
 
 ## Memory and isolation roadmap
 
-1. Discover and normalize Limine usable regions, excluding firmware, kernel, framebuffer and reserved memory.
-2. Allocate distinct physical frames for page-table roots and lower-level tables.
-3. Establish an explicit higher-half direct-map (HHDM) physical-to-virtual translation contract.
-4. Construct x86_64 page tables with canonical-address checks, NX on writable data and no executable writable mappings.
-5. Add protected userspace transitions, syscall entry and per-process address spaces.
-6. Implement ELF64 and then PE32+ mapping, imports, relocations and process initialization.
-7. Implement POSIX userspace services and an NT native ABI, then Win32 subsystem services.
-8. Stage 32-bit PE32/WOW64 compatibility only after the x86_64 kernel, userspace and sandboxing contracts are validated.
-9. Driver compatibility starts with a narrow XP-era contract in a controlled process/address-space environment before considering trusted in-kernel execution.
+1. Discover and normalize Limine usable regions, excluding firmware, kernel, framebuffer and reserved memory. *Status:* done for the bootstrap; only Limine `USABLE` entries are kept.
+2. Allocate distinct physical frames for page-table roots and lower-level tables. *Status:* done; every frame is tracked per image and returned on exit.
+3. Establish an explicit higher-half direct-map (HHDM) physical-to-virtual translation contract. *Status:* done.
+4. Construct x86_64 page tables with canonical-address checks, NX on writable data and no executable writable mappings. *Status:* done for user mappings built by the loader and `map`.
+5. Add protected userspace transitions, syscall entry and per-process address spaces. *Status:* implemented in bootstrap form: CPL3 entry, `int 0x80`, and one CR3 root per thread.
+6. Implement ELF64 and then PE32+ mapping, imports, relocations and process initialization. *Status:* ELF64 and a hand-built PE32+ image are mapped and run. The kernel does not apply imports, relocations or TLS.
+7. Implement POSIX userspace services and an NT native ABI, then Win32 subsystem services. *Status:* not started beyond the kernel-side syscall subsets listed above. There are no POSIX userspace services and no Win32 subsystem.
+8. Stage 32-bit PE32/WOW64 compatibility only after the x86_64 kernel, userspace and sandboxing contracts are validated. *Status:* not started.
+9. Driver compatibility starts with a narrow XP-era contract in a controlled process/address-space environment before considering trusted in-kernel execution. *Status:* not started.
 
 ## Security boundaries
 
-All pointers, offsets, lengths and service numbers crossing a personality boundary are untrusted. PE and ELF64 parsing does not map or execute images; both feed the same validated load plan, so a future NT loader inherits the same W^X, alignment and address-limit checks. Handle tables use generations and rights attenuation; NT status values and POSIX errors are not interchangeable. The bootstrap allocates physical frames from a validated pool: regions are page-aligned, the null frame and misaligned addresses are rejected, allocation is last-in-first-out and a freed frame is reused rather than leaked.
+All pointers, offsets, lengths and service numbers crossing a personality boundary are untrusted. PE and ELF64 parsing does not map or execute images; both feed the same validated load plan, so a future NT loader inherits the same W^X, alignment and address-limit checks. The host-tested capability tables in `wuxia_core::capability` use generations and rights attenuation, but the kernel does not use them yet. NT status values and POSIX errors are not interchangeable. The bootstrap allocates physical frames from a validated pool: regions are page-aligned, the null frame and misaligned addresses are rejected, allocation is last-in-first-out and a freed frame is reused rather than leaked.
 
 A future NT driver personality must preserve IRQL rules, nonpaged-memory restrictions, IRP completion ownership, cancellation and synchronization behavior. Arbitrary native drivers must not execute in the kernel address space until address-space isolation, exception containment and explicit memory protections are implemented.
 
