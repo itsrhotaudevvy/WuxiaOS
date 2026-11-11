@@ -18,10 +18,10 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
 - The kernel validates Limine's HHDM offset, builds a four-level page-table chain for a user code page and stack, clones the active PML4 into a fresh root, loads that root into CR3 and re-resolves both pages through the active tables.
 - `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X.
-- 34 `wuxia-core` host tests pass.
+- 36 `wuxia-core` host tests pass.
 - PE parsing validates container metadata only. No Windows program or driver is executed yet.
 - The GDT, user segments, TSS and an IDT with CPL0/CPL3 gates are loaded; the `int3` self-test returns through the full stub path.
-- The kernel enters CPL3 with `iretq`, runs a four-byte user program, services `int 0x80` on the TSS trap stack, returns to user mode and ends on a `ud2` fault delivered with `CS=0x1b`.
+- The kernel enters CPL3 with `iretq`, runs a 21-byte user program, decodes numbered `int 0x80` calls, returns `getpid` through the saved register frame and ends on `exit(0)`.
 - No POSIX userspace, filesystem, scheduler, network stack, Windows application or Windows driver support exists yet.
 
 ## Build and test
@@ -61,8 +61,8 @@ WUXIA_USER_IMAGE_OK
 WUXIA_CR3_OK
 WUXIA_POST_SWITCH_PASS
 WUXIA_ENTER_USER
-WUXIA_SYSCALL_OK
-WUXIA_USER_FAULT_OK
+WUXIA_SYSCALL_GETPID
+WUXIA_SYSCALL_EXIT
 WUXIA_TEST_PASS
 ```
 

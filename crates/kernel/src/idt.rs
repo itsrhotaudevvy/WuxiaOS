@@ -239,21 +239,21 @@ unsafe extern "C" fn common_stub() {
 extern "C" fn dispatch(frame: *mut InterruptFrame) {
     // SAFETY: the stub builds a complete frame and passes its address; no other
     // reference to the frame exists during the call.
-    let frame = unsafe { &*frame };
+    let frame = unsafe { &mut *frame };
     match frame.vector {
         3 => serial::write_str("WUXIA_BREAKPOINT_OK\n"),
         6 => {
-            serial::write_str("WUXIA_USER_FAULT_OK\n");
+            serial::write_str("WUXIA_TEST_FAIL: unexpected user fault\n");
             serial::write_hex(frame.rip);
-            serial::write_hex(frame.cs);
-            serial::write_str("WUXIA_TEST_PASS\n");
-            serial::debug_exit(0x10);
+            serial::debug_exit(1);
             halt();
         }
         13 => {
             serial::write_str("WUXIA_GP_FAULT\n");
             serial::write_hex(frame.error);
             serial::write_hex(frame.rip);
+            serial::debug_exit(1);
+            halt();
         }
         14 => {
             let address = read_cr2();
@@ -261,11 +261,46 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
             serial::write_hex(frame.error);
             serial::write_hex(address);
             serial::write_hex(frame.rip);
+            serial::debug_exit(1);
+            halt();
         }
-        0x80 => serial::write_str("WUXIA_SYSCALL_OK\n"),
+        0x80 => service_syscall(frame),
         _ => {
             serial::write_str("WUXIA_UNEXPECTED_VECTOR\n");
             serial::write_hex(frame.vector);
+        }
+    }
+}
+
+fn service_syscall(frame: &mut InterruptFrame) {
+    let registers = wuxia_core::syscall::Registers {
+        args: [
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ],
+    };
+    match wuxia_core::syscall::PosixRequest::decode(frame.rax, &registers) {
+        Ok(wuxia_core::syscall::PosixRequest::GetPid) => {
+            serial::write_str("WUXIA_SYSCALL_GETPID\n");
+            frame.rax = 1;
+        }
+        Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
+            serial::write_str("WUXIA_SYSCALL_EXIT\n");
+            serial::write_hex(code);
+            serial::write_str("WUXIA_TEST_PASS\n");
+            serial::debug_exit(0x10);
+            halt();
+        }
+        Ok(request) => {
+            serial::write_str("WUXIA_SYSCALL_OK\n");
+            serial::write_hex(frame.rax);
+            // Unimplemented requests report a successful no-op result.
+            let _ = request;
+            frame.rax = 0;
+        }
+        Err(_) => {
+            serial::write_str("WUXIA_SYSCALL_INVALID\n");
+            serial::write_hex(frame.rax);
+            frame.rax = u64::MAX;
         }
     }
 }

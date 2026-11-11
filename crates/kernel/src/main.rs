@@ -81,8 +81,12 @@ pub extern "C" fn _start() -> ! {
     serial::write_str("WUXIA_HHDM_OK\n");
     serial::write_hex(direct_map.offset());
 
-    // int 0x80 returns to CPL3; ud2 then traps back into the kernel.
-    const USER_CODE: [u8; 4] = [0xcd, 0x80, 0x0f, 0x0b];
+    // mov rax, 39; int 0x80; mov rax, 60; xor rdi, rdi; int 0x80
+    // getpid returns to CPL3, then exit(0) ends the self-test.
+    const USER_CODE: [u8; 21] = [
+        0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00,
+        0x00, 0x48, 0x31, 0xff, 0xcd, 0x80,
+    ];
     paging::write_frame(direct_map, first, &USER_CODE)
         .expect("cannot write the user code page");
     let stack = allocator
