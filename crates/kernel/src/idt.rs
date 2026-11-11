@@ -27,3 +27,17 @@ impl IdtEntry {
         }
     }
 }
+
+/// A small IDT that can be initialized once the handler path exists.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(16))]
+pub struct Idt {
+    entries: [IdtEntry; 256],
+}
+
+impl Idt {
+    /// Construct an empty IDT with all descriptors marked not-present.
+    pub const fn new() -> Self {
+        Self { entries: [IdtEntry::default(); 256] }
+    }
+}
