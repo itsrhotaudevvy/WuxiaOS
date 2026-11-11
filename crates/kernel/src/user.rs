@@ -1,71 +1,18 @@
-//! Ring-3 entry and the bootstrap process record.
-//!
-//! The process owns the address-space model, so syscalls validate pointers
-//! against the same regions the page tables were built from.
+//! Ring-3 entry and the image started after the bootstrap process ends.
 
 use core::arch::asm;
 use core::ptr::{addr_of, addr_of_mut, read_volatile};
 
-use wuxia_core::process::Process;
-
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
+use crate::paging::UserImage;
 
 const INTERRUPTS_ENABLED: u64 = 1 << 1;
 
-/// The single bootstrap process.
-static mut PROCESS: Option<Process<8>> = None;
-
 /// The image started after the bootstrap process exits.
-static mut NEXT_IMAGE: Option<crate::paging::UserImage> = None;
-
-/// Install the bootstrap process after its address space is populated.
-pub fn set_process(process: Process<8>) {
-    // SAFETY: written once before ring 3 starts and read only afterwards.
-    unsafe {
-        *addr_of_mut!(PROCESS) = Some(process);
-    }
-}
-
-/// Return the current process identifier, or zero before installation.
-pub fn process_id() -> u64 {
-    // SAFETY: the process is written once before ring 3 starts.
-    match unsafe { read_volatile(addr_of!(PROCESS)) } {
-        Some(process) => process.id(),
-        None => 0,
-    }
-}
-
-/// Whether `[address, address + length)` lies inside one mapped user region.
-pub fn region_contains(address: u64, length: u64) -> bool {
-    // SAFETY: the process is written once before ring 3 starts.
-    match unsafe { read_volatile(addr_of!(PROCESS)) } {
-        Some(process) => process.space().contains(address, length),
-        None => false,
-    }
-}
-
-/// Whether the process has `descriptor` open.
-pub fn descriptor_open(descriptor: u32) -> bool {
-    // SAFETY: the process is written once before ring 3 starts.
-    match unsafe { read_volatile(addr_of!(PROCESS)) } {
-        Some(process) => process.descriptors().is_open(descriptor),
-        None => false,
-    }
-}
-
-/// Close a process descriptor, rejecting unknown or already closed slots.
-pub fn close_descriptor(descriptor: u32) -> bool {
-    // SAFETY: bootstrap is single-threaded and the slot is written once.
-    unsafe {
-        match &mut *addr_of_mut!(PROCESS) {
-            Some(process) => process.descriptors_mut().close(descriptor).is_ok(),
-            None => false,
-        }
-    }
-}
+static mut NEXT_IMAGE: Option<UserImage> = None;
 
 /// Store the image started after the bootstrap process exits.
-pub fn set_next_image(image: crate::paging::UserImage) {
+pub fn set_next_image(image: UserImage) {
     // SAFETY: written once before ring 3 starts.
     unsafe {
         *addr_of_mut!(NEXT_IMAGE) = Some(image);
@@ -73,21 +20,9 @@ pub fn set_next_image(image: crate::paging::UserImage) {
 }
 
 /// Return the image started after the bootstrap process exits.
-pub fn next_image() -> Option<crate::paging::UserImage> {
+pub fn next_image() -> Option<UserImage> {
     // SAFETY: the image is written once before ring 3 starts.
     unsafe { read_volatile(addr_of!(NEXT_IMAGE)) }
-}
-
-/// Mark the current process exited. Returns false if it is absent or already
-/// terminated, so a second `exit` is rejected rather than silently ignored.
-pub fn exit_process(code: u64) -> bool {
-    // SAFETY: bootstrap is single-threaded and the slot is written once.
-    unsafe {
-        match &mut *addr_of_mut!(PROCESS) {
-            Some(process) => process.exit(code).is_ok(),
-            None => false,
-        }
-    }
 }
 
 /// Enter CPL3 at `entry` with `stack_pointer` and never return.

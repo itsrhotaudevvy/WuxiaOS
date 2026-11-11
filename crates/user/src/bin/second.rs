@@ -9,6 +9,11 @@ core::arch::global_asm!(
     ".section .text._start, \"ax\"",
     ".global _start",
     "_start:",
+    // getpid: this process must be the second one
+    "mov rax, 39",
+    "int 0x80",
+    "cmp rax, 2",
+    "jne 3f",
     // write(1, message, 15)
     "mov rax, 1",
     "mov rdi, 1",
@@ -22,6 +27,7 @@ core::arch::global_asm!(
     "mov rax, 60",
     "xor rdi, rdi",
     "int 0x80",
+    "3:",
     "ud2",
     message = sym MESSAGE,
 );

@@ -165,17 +165,40 @@ pub extern "C" fn _start() -> ! {
             wuxia_core::PagePermissions::USER_READ_WRITE,
         )
         .expect("the user stack cannot be modeled");
-    user::set_process(process);
     user::set_next_image(fault);
+
+    let mut second_process = wuxia_core::Process::<8>::new(2, wuxia_core::Personality::Posix)
+        .expect("the second process cannot be created");
+    for segment in second.segments() {
+        second_process
+            .space_mut()
+            .map(segment.address, segment.length, segment.permissions)
+            .expect("a second-process segment cannot be modeled");
+    }
+    second_process
+        .space_mut()
+        .map(
+            second.stack_address,
+            u64::from(wuxia_core::paging::PAGE_SIZE),
+            wuxia_core::PagePermissions::USER_READ_WRITE,
+        )
+        .expect("the second-process stack cannot be modeled");
+
     let stack_top = image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     let second_stack_top = second.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     assert_eq!(
-        sched::register(image.new_pml4, image.entry, stack_top),
+        sched::register(image.new_pml4, image.entry, stack_top, process),
         Some(0),
         "the bootstrap thread cannot be registered"
     );
     assert!(
-        sched::register(second.new_pml4, second.entry, second_stack_top).is_some(),
+        sched::register(
+            second.new_pml4,
+            second.entry,
+            second_stack_top,
+            second_process
+        )
+        .is_some(),
         "the second thread cannot be registered"
     );
     serial::write_str("WUXIA_ENTER_USER\n");

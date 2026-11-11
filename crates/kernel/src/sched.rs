@@ -6,6 +6,8 @@
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
+use wuxia_core::process::Process;
+
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::idt::InterruptFrame;
 use crate::serial;
@@ -25,6 +27,8 @@ pub struct Thread {
     pub frame: InterruptFrame,
     /// Whether the thread can still be scheduled.
     pub runnable: bool,
+    /// Process identity, address space and descriptors for this thread.
+    pub process: Process<8>,
 }
 
 static mut THREADS: [Option<Thread>; MAX_THREADS] = [None; MAX_THREADS];
@@ -60,7 +64,7 @@ pub const fn initial_frame(entry: u64, stack_top: u64) -> InterruptFrame {
 }
 
 /// Register a runnable thread and return its index.
-pub fn register(root: u64, entry: u64, stack_top: u64) -> Option<usize> {
+pub fn register(root: u64, entry: u64, stack_top: u64, process: Process<8>) -> Option<usize> {
     // SAFETY: bootstrap registration happens once, before ring 3 starts.
     unsafe {
         let threads = &mut *addr_of_mut!(THREADS);
@@ -72,16 +76,60 @@ pub fn register(root: u64, entry: u64, stack_top: u64) -> Option<usize> {
             root,
             frame: initial_frame(entry, stack_top),
             runnable: true,
+            process,
         });
         write_volatile(addr_of_mut!(COUNT), count + 1);
         Some(count)
     }
 }
 
-/// Index of the running thread.
-pub fn current() -> usize {
-    // SAFETY: single-threaded kernel; the index is written only by the scheduler.
-    unsafe { read_volatile(addr_of!(CURRENT)) }
+/// Process identifier of the running thread.
+pub fn process_id() -> u64 {
+    current_thread().map_or(0, |thread| thread.process.id())
+}
+
+/// Whether the running process has `descriptor` open.
+pub fn descriptor_open(descriptor: u32) -> bool {
+    current_thread().is_some_and(|thread| thread.process.descriptors().is_open(descriptor))
+}
+
+/// Close a descriptor of the running process.
+pub fn close_descriptor(descriptor: u32) -> bool {
+    // SAFETY: traps are non-nesting and the current index is stable here.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current]
+            .as_mut()
+            .is_some_and(|thread| thread.process.descriptors_mut().close(descriptor).is_ok())
+    }
+}
+
+/// Whether `[address, address + length)` is mapped by the running process.
+pub fn region_contains(address: u64, length: u64) -> bool {
+    current_thread().is_some_and(|thread| thread.process.space().contains(address, length))
+}
+
+/// Mark the running process exited, rejecting a second exit.
+pub fn exit_process(code: u64) -> bool {
+    // SAFETY: traps are non-nesting and the current index is stable here.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current]
+            .as_mut()
+            .is_some_and(|thread| thread.process.exit(code).is_ok())
+    }
+}
+
+fn current_thread() -> Option<Thread> {
+    // SAFETY: the thread table is written during bootstrap and by the
+    // scheduler between traps; `Option<Thread>` is copied out atomically.
+    unsafe {
+        let threads = &*addr_of!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads.get(current).copied().flatten()
+    }
 }
 
 /// Save `frame`, switch to the next runnable thread and load its frame.

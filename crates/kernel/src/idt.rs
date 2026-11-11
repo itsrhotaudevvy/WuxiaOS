@@ -305,7 +305,7 @@ fn service_syscall(frame: &mut InterruptFrame) {
     match wuxia_core::syscall::PosixRequest::decode(frame.rax, &registers) {
         Ok(wuxia_core::syscall::PosixRequest::GetPid) => {
             serial::write_str("WUXIA_SYSCALL_GETPID\n");
-            frame.rax = crate::user::process_id();
+            frame.rax = crate::sched::process_id();
             serial::write_hex(frame.rax);
         }
         Ok(wuxia_core::syscall::PosixRequest::Yield) => {
@@ -313,7 +313,7 @@ fn service_syscall(frame: &mut InterruptFrame) {
             crate::sched::yield_current(frame);
         }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
-            if crate::sched::current() == 0 && !crate::user::exit_process(code) {
+            if !crate::sched::exit_process(code) {
                 serial::write_str("WUXIA_SYSCALL_INVALID\n");
                 frame.rax = u64::MAX;
                 return;
@@ -337,8 +337,8 @@ fn service_syscall(frame: &mut InterruptFrame) {
         }
         Ok(wuxia_core::syscall::PosixRequest::Write { descriptor, buffer }) => {
             if descriptor != 1
-                || !crate::user::descriptor_open(descriptor)
-                || !crate::user::region_contains(buffer.address, buffer.length)
+                || !crate::sched::descriptor_open(descriptor)
+                || !crate::sched::region_contains(buffer.address, buffer.length)
             {
                 serial::write_str("WUXIA_SYSCALL_REJECTED\n");
                 frame.rax = u64::MAX;
@@ -356,7 +356,7 @@ fn service_syscall(frame: &mut InterruptFrame) {
             }
         }
         Ok(wuxia_core::syscall::PosixRequest::Close { descriptor }) => {
-            if crate::user::close_descriptor(descriptor) {
+            if crate::sched::close_descriptor(descriptor) {
                 serial::write_str("WUXIA_SYSCALL_CLOSE\n");
                 frame.rax = 0;
             } else {
