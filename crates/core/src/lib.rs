@@ -10,6 +10,7 @@ pub mod address_space;
 pub mod capability;
 pub mod descriptor;
 pub mod elf;
+pub mod errno;
 pub mod error;
 pub mod frames;
 pub mod hhdm;
