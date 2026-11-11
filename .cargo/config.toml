@@ -1,0 +1,3 @@
+[alias]
+xtask = "run --package wuxia-xtask --"
+kernel = "build --package wuxia-kernel --target x86_64-unknown-none"

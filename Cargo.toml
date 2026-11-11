@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/core", "crates/kernel", "crates/xtask"]
+default-members = ["crates/core"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["WuxiaOS contributors"]
+repository = "https://github.com/itsrhotaudevvy/WuxiaOS"
+rust-version = "1.88"
+
+[workspace.dependencies]
+limine = "0.5.0"
+spin = "0.10.0"
+wuxia-core = { path = "crates/core" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+strip = false

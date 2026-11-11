@@ -1,0 +1,23 @@
+[package]
+name = "wuxia-kernel"
+description = "WuxiaOS x86_64 kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+limine = "0.5.0"
+wuxia-core.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wuxia-kernel"
+path = "src/main.rs"
+test = false
+bench = false
