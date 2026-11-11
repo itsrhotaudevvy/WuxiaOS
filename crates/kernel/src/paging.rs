@@ -8,13 +8,13 @@
 use core::arch::asm;
 
 use wuxia_core::Error;
+use wuxia_core::frames::FramePool;
 use wuxia_core::hhdm::DirectMap;
 use wuxia_core::load::{LoadSegment, LoaderPlan};
 use wuxia_core::paging::{
     ENTRIES_PER_TABLE, PAGE_SIZE, PagePermissions, PageTableReader, USER_ADDRESS_LIMIT, is_present,
     leaf, physical_address, table_entry, table_index, walk,
 };
-use wuxia_core::region::BumpAllocator;
 
 /// Maximum `PT_LOAD` segments the bootstrap loader tracks.
 pub const MAX_USER_SEGMENTS: usize = 8;
@@ -62,7 +62,7 @@ impl UserImage {
 /// never aliases kernel memory. Writable and executable segments are rejected
 /// by the load plan before any page is mapped.
 pub fn load_user_image<const N: usize>(
-    allocator: &mut BumpAllocator<N>,
+    allocator: &mut FramePool<N>,
     direct_map: DirectMap,
     bytes: &[u8],
 ) -> Result<UserImage, Error> {
@@ -76,7 +76,7 @@ pub fn load_user_image<const N: usize>(
         return Err(Error::AlreadyExists);
     }
 
-    let pdpt = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    let pdpt = allocator.allocate().ok_or(Error::TableFull)?;
     zero_frame(direct_map, pdpt)?;
 
     let mut segments = [None; MAX_USER_SEGMENTS];
@@ -94,7 +94,7 @@ pub fn load_user_image<const N: usize>(
             if table_index(address, 0)? != slot || address >= USER_ADDRESS_LIMIT {
                 return Err(Error::BadAddress);
             }
-            let frame = allocator.allocate_frame().ok_or(Error::TableFull)?;
+            let frame = allocator.allocate().ok_or(Error::TableFull)?;
             zero_frame(direct_map, frame)?;
             copy_segment_bytes(direct_map, frame, address, segment, bytes)?;
             let entry = map_page(
@@ -121,7 +121,7 @@ pub fn load_user_image<const N: usize>(
     if stack_address >= USER_ADDRESS_LIMIT || table_index(stack_address, 0)? != slot {
         return Err(Error::BadAddress);
     }
-    let stack_physical = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    let stack_physical = allocator.allocate().ok_or(Error::TableFull)?;
     zero_frame(direct_map, stack_physical)?;
     let stack_entry = map_page(
         allocator,
@@ -132,7 +132,7 @@ pub fn load_user_image<const N: usize>(
         PagePermissions::USER_READ_WRITE,
     )?;
 
-    let new_pml4 = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    let new_pml4 = allocator.allocate().ok_or(Error::TableFull)?;
     zero_frame(direct_map, new_pml4)?;
     let new_root = frame_pointer(direct_map, new_pml4)?;
     for index in 0..ENTRIES_PER_TABLE {
@@ -247,7 +247,7 @@ fn write_frame_at(
 
 /// Ensure a present subtable at `index`, allocating and zeroing one if absent.
 fn ensure_table<const N: usize>(
-    allocator: &mut BumpAllocator<N>,
+    allocator: &mut FramePool<N>,
     direct_map: DirectMap,
     table: *mut u64,
     index: usize,
@@ -256,7 +256,7 @@ fn ensure_table<const N: usize>(
     if is_present(current) {
         return Ok(physical_address(current));
     }
-    let frame = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    let frame = allocator.allocate().ok_or(Error::TableFull)?;
     zero_frame(direct_map, frame)?;
     write_entry(table, index, table_entry(frame, true)?);
     Ok(frame)
@@ -264,7 +264,7 @@ fn ensure_table<const N: usize>(
 
 /// Map one 4 KiB user page, creating intermediate tables on demand.
 fn map_page<const N: usize>(
-    allocator: &mut BumpAllocator<N>,
+    allocator: &mut FramePool<N>,
     direct_map: DirectMap,
     pdpt: u64,
     address: u64,

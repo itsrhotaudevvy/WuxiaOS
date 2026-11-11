@@ -70,13 +70,12 @@ pub extern "C" fn _start() -> ! {
         .expect("Limine did not provide a memory map");
     let map =
         memory::from_limine::<32>(response).expect("invalid or oversized physical memory map");
-    let mut allocator = memory::BumpAllocator::new(&map);
-    let first = allocator
-        .allocate_frame()
-        .expect("no usable physical frame");
+    let mut allocator = memory::frame_pool::<65536, 32>(&map)
+        .expect("the usable memory map exceeds the frame pool");
+    let first = allocator.allocate().expect("no usable physical frame");
     assert_ne!(first, 0, "the bootstrap must not allocate the null page");
     let second = allocator
-        .allocate_frame()
+        .allocate()
         .expect("a second usable frame is required");
     assert_ne!(first, second, "frame allocator returned a duplicate");
     serial::write_str("WUXIA_MEMORY_MAP_READY\n");
@@ -107,6 +106,17 @@ pub extern "C" fn _start() -> ! {
 
     let fault = paging::load_user_image(&mut allocator, direct_map, FAULT_ELF)
         .expect("cannot load the fault self-test image");
+
+    let reclaimed = allocator.allocate().expect("no frame to reclaim");
+    allocator
+        .free(reclaimed)
+        .expect("a freshly allocated frame is not free");
+    assert_eq!(
+        allocator.allocate(),
+        Some(reclaimed),
+        "the frame pool did not reuse a freed frame"
+    );
+    serial::write_str("WUXIA_FRAME_RECLAIM_OK\n");
 
     paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");

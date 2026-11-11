@@ -35,5 +35,16 @@ pub fn from_limine<const N: usize>(
     Ok(map)
 }
 
-/// The bootstrap frame allocator with deterministic, non-reusing allocation.
-pub use wuxia_core::region::BumpAllocator;
+/// A reclaimable pool of physical frames.
+pub use wuxia_core::frames::FramePool;
+
+/// Build a frame pool from every page-aligned frame in the usable map.
+pub fn frame_pool<const N: usize, const R: usize>(
+    map: &MemoryMap<R>,
+) -> Result<FramePool<N>, wuxia_core::Error> {
+    let mut pool = FramePool::<N>::new();
+    for region in map.iter() {
+        pool.add_region(region.start, region.length)?;
+    }
+    Ok(pool)
+}
