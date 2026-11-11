@@ -21,6 +21,7 @@ pub mod frames;
 pub mod futex;
 pub mod hhdm;
 pub mod image;
+pub mod initstack;
 pub mod load;
 pub mod memory;
 pub mod nt;
