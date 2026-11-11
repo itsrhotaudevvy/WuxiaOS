@@ -21,6 +21,7 @@ pub mod memory;
 pub mod nt;
 pub mod object_namespace;
 pub mod paging;
+pub mod pe_reloc;
 pub mod personality;
 pub mod pipe;
 pub mod pledge;
