@@ -447,9 +447,63 @@ pub extern "C" fn _start() -> ! {
     );
     log::write_str("WUXIA_DRIVER_OBJECT_OK\n");
     log::write_hex(received);
+    // The driver created a device and the loader linked it into its own driver
+    // object, so the chain is walked from the driver object rather than from the
+    // address the driver was handed.
+    // SAFETY: the driver object is the page this loader published.
+    let head = unsafe {
+        core::ptr::read_volatile(
+            (driver.driver_object + wuxia_core::driver_object::DEVICE_OBJECT_OFFSET as u64)
+                as *const u64,
+        )
+    };
+    assert_ne!(head, 0, "the driver's device object was not linked");
+    // SAFETY: `head` is a device object this kernel wrote into a mapped page.
+    let (device_type, device_size, next, extension, owner) = unsafe {
+        (
+            core::ptr::read_volatile((head + 0x48) as *const u32),
+            core::ptr::read_volatile((head + 0x02) as *const u16),
+            core::ptr::read_volatile(
+                (head + wuxia_core::device_object::NEXT_DEVICE_OFFSET as u64) as *const u64,
+            ),
+            core::ptr::read_volatile(
+                (head + wuxia_core::device_object::DEVICE_EXTENSION_OFFSET as u64) as *const u64,
+            ),
+            core::ptr::read_volatile(
+                (head + wuxia_core::device_object::DRIVER_OBJECT_OFFSET as u64) as *const u64,
+            ),
+        )
+    };
+    assert_eq!(device_type, 0x22, "the driver's device type did not arrive");
+    assert_eq!(
+        device_size,
+        wuxia_core::device_object::DEVICE_OBJECT_SIZE as u16
+    );
+    assert_eq!(next, 0, "the first device started a new chain");
+    assert_eq!(
+        extension,
+        head + wuxia_core::device_object::DEVICE_OBJECT_SIZE as u64,
+        "the extension does not follow the object"
+    );
+    assert_eq!(
+        owner, driver.driver_object,
+        "the device names another driver"
+    );
+    // The driver stored the object it got back; it must be the one on the chain.
+    // SAFETY: the slot is inside the driver's writable data section.
+    let handed = unsafe { core::ptr::read_volatile((driver.base + 0x2080) as *const u64) };
+    // SAFETY: the status slot is the following word of the same section.
+    let status = unsafe { core::ptr::read_volatile((driver.base + 0x2088) as *const u32) };
+    assert_eq!(status, 0, "IoCreateDevice reported a failure");
+    assert_eq!(
+        handed, head,
+        "the driver was handed a device outside the chain"
+    );
+    log::write_str("WUXIA_DEVICE_OBJECT_OK\n");
+    log::write_hex(head);
     log::write_str("WUXIA_DRIVER_IMPORTS\n");
     log::write_hex(driver.imports as u64);
-    assert_eq!(driver.imports, 4, "not every import was bound");
+    assert_eq!(driver.imports, 5, "not every import was bound");
     // The driver asked RtlZeroMemory to clear sixteen bytes of its own data; the
     // boot checks the result, which proves the routine ran with both arguments.
     let mut cleared = 0;

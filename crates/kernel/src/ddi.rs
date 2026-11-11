@@ -24,11 +24,12 @@ use crate::log;
 const MAX_MESSAGE: usize = 128;
 
 /// Names a driver may import, in the order they are offered.
-pub const EXPORT_NAMES: [&str; 4] = [
+pub const EXPORT_NAMES: [&str; 5] = [
     "DbgPrint",
     "RtlZeroMemory",
     "KeGetCurrentIrql",
     "MmMapIoSpace",
+    "IoCreateDevice",
 ];
 
 /// Where driver device mappings start.
@@ -39,6 +40,18 @@ pub const DRIVER_MMIO_BASE: u64 = 0xffff_9800_0000_0000;
 
 /// Next free byte in the driver device window.
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Where the device objects a driver creates live.
+///
+/// Its own page-map slot, so a driver's device objects can never alias its
+/// mappings or the kernel's own windows.
+pub const DRIVER_DEVICE_BASE: u64 = 0xffff_9900_0000_0000;
+
+/// Next free byte in the device object window.
+static DEVICE_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Lowest supervisor address. Anything below it is a user address.
+const SUPERVISOR_BASE: u64 = 0xffff_8000_0000_0000;
 
 /// The module whose imports the loader can serve.
 pub const SERVED_MODULE: &str = "ntoskrnl.exe";
@@ -51,6 +64,15 @@ unsafe extern "C" {
     fn wuxia_ddi_rtl_zero_memory(destination: *mut u8, length: usize) -> u64;
     fn wuxia_ddi_ke_get_current_irql() -> u64;
     fn wuxia_ddi_mm_map_io_space(physical: u64, length: u64, cache: u32) -> u64;
+    fn wuxia_ddi_io_create_device(
+        driver_object: u64,
+        extension_size: u32,
+        device_name: u64,
+        device_type: u32,
+        characteristics: u32,
+        exclusive: u32,
+        device_object_out: *mut u64,
+    ) -> u32;
 }
 
 // Each thunk moves the Windows argument registers into the System V ones and
@@ -90,10 +112,31 @@ core::arch::global_asm!(
     "call {map_io_space}",
     "add rsp, 0x28",
     "ret",
+    // `IoCreateDevice` takes seven arguments, so the last three travel on the
+    // stack. A Windows caller leaves them at `[rsp+0x28]` onward; the System V
+    // callee wants the seventh at `[rsp]` before the call, so the fourth and fifth
+    // are read from the caller's frame first and then re-pushed in the new order.
+    ".globl wuxia_ddi_io_create_device",
+    ".p2align 4",
+    "wuxia_ddi_io_create_device:",
+    "mov r10, [rsp+0x38]",
+    "mov r11, [rsp+0x28]",
+    "mov eax, [rsp+0x30]",
+    "push r10",
+    "mov rdi, rcx",
+    "mov esi, edx",
+    "mov rdx, r8",
+    "mov ecx, r9d",
+    "mov r8d, r11d",
+    "mov r9d, eax",
+    "call {create_device}",
+    "add rsp, 8",
+    "ret",
     dbg_print = sym dbg_print,
     zero_memory = sym rtl_zero_memory,
     irql = sym ke_get_current_irql,
     map_io_space = sym mm_map_io_space,
+    create_device = sym io_create_device,
 );
 
 /// Append NUL-terminated `message` to the kernel log and report success.
@@ -172,6 +215,84 @@ extern "sysv64" fn mm_map_io_space(physical: u64, length: u64, cache: u32) -> u6
     }
 }
 
+/// Create a device object for `driver_object` and link it into its device chain.
+///
+/// The object and the extension the driver asked for share one page, so the
+/// extension can never reach the kernel's own memory. `device_name` is accepted
+/// and ignored: there is no object-manager namespace to name a device in yet, and
+/// pretending to register one would be worse than saying so.
+///
+/// Returns `STATUS_SUCCESS`, or `STATUS_UNSUCCESSFUL` when the driver object is not
+/// a supervisor address, the out pointer is null, the extension is larger than the
+/// rest of a page, or the page cannot be mapped. The out pointer is only written
+/// on success, so a driver that checks its status never sees half an object.
+extern "sysv64" fn io_create_device(
+    driver_object: u64,
+    extension_size: u32,
+    device_name: u64,
+    device_type: u32,
+    characteristics: u32,
+    exclusive: u32,
+    device_object_out: *mut u64,
+) -> u32 {
+    let _ = (device_name, exclusive);
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    if driver_object < SUPERVISOR_BASE || device_object_out.is_null() {
+        return STATUS_UNSUCCESSFUL;
+    }
+    if extension_size as usize > wuxia_core::device_object::MAX_EXTENSION {
+        return STATUS_UNSUCCESSFUL;
+    }
+    let page_bytes = wuxia_core::paging::PAGE_SIZE;
+    let offset = DEVICE_NEXT.fetch_add(page_bytes, Ordering::AcqRel);
+    let Some(address) = DRIVER_DEVICE_BASE.checked_add(offset) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Some(direct_map) = crate::paging::current_direct_map() else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Ok(frame) = crate::paging::map_kernel_data_page(crate::memory::pool(), direct_map, address)
+    else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    // SAFETY: the frame is a freshly zeroed page the kernel just mapped writable at
+    // `address`, and only this function writes to it.
+    let block = unsafe {
+        core::slice::from_raw_parts_mut(
+            direct_map.physical_to_virtual(frame).unwrap_or(0) as *mut u8,
+            page_bytes as usize,
+        )
+    };
+    if wuxia_core::device_object::write(
+        block,
+        address,
+        driver_object,
+        extension_size,
+        device_type,
+        characteristics,
+    )
+    .is_err()
+    {
+        return STATUS_UNSUCCESSFUL;
+    }
+    // Link the new device at the head of its driver's chain. A driver object is a
+    // supervisor structure belonging to the same driver, so this write is the one
+    // the object was created for.
+    let head = (driver_object + wuxia_core::driver_object::DEVICE_OBJECT_OFFSET as u64) as *mut u64;
+    // SAFETY: the driver object is a page this kernel mapped and the offset is
+    // inside it; the previous head, if any, is another device object of ours.
+    unsafe {
+        let previous = core::ptr::read_volatile(head);
+        core::ptr::write_volatile(
+            (address + wuxia_core::device_object::NEXT_DEVICE_OFFSET as u64) as *mut u64,
+            previous,
+        );
+        core::ptr::write_volatile(head, address);
+        core::ptr::write_volatile(device_object_out, address);
+    }
+    0
+}
+
 /// Resolve `module!name` to the address a driver should call.
 ///
 /// Errors: `NotFound` for a module this kernel does not serve or a name it does
@@ -189,6 +310,7 @@ pub fn resolve(module: &str, name: &str) -> Result<u64, wuxia_core::Error> {
         "RtlZeroMemory" => Ok(wuxia_ddi_rtl_zero_memory as usize as u64),
         "KeGetCurrentIrql" => Ok(wuxia_ddi_ke_get_current_irql as usize as u64),
         "MmMapIoSpace" => Ok(wuxia_ddi_mm_map_io_space as usize as u64),
+        "IoCreateDevice" => Ok(wuxia_ddi_io_create_device as usize as u64),
         _ => Err(wuxia_core::Error::NotFound),
     }
 }
