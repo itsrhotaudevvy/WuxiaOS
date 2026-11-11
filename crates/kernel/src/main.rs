@@ -140,8 +140,20 @@ pub extern "C" fn _start() -> ! {
             log::write_hex(u64::from(bar.is_io));
             log::write_hex(bar.base);
         }
+        for index in 0..8u8 {
+            if let Some(size) = pci::size_bar(function, index) {
+                log::write_str("WUXIA_PCI_BAR_SIZE\n");
+                log::write_hex(u64::from(index));
+                log::write_hex(size);
+            }
+        }
         if network.is_none() && function.class == pci::CLASS_NETWORK {
             network = pci::mmio_base(function);
+            if let Some((before, after)) = pci::enable(function) {
+                log::write_str("WUXIA_PCI_COMMAND\n");
+                log::write_hex(u64::from(before));
+                log::write_hex(u64::from(after));
+            }
         }
     });
     log::write_str("WUXIA_PCI_OK\n");

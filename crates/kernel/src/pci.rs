@@ -130,6 +130,129 @@ pub fn bars(function: &Function) -> [Option<wuxia_core::pci::Bar>; 6] {
     decoded
 }
 
+/// Configuration offset of the Command register.
+const COMMAND: u8 = 0x04;
+/// Command bit 1: respond to memory-space accesses.
+pub const COMMAND_MEMORY: u16 = 1 << 1;
+/// Command bit 2: act as a bus master.
+pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
+
+/// Read the Command register of a function.
+fn read_command(function: &Function) -> Option<u16> {
+    read_config(function.bus, function.device, function.function, COMMAND).map(|value| value as u16)
+}
+
+/// Write the Command register of a function.
+fn write_command(function: &Function, value: u16) -> Option<()> {
+    let address =
+        ConfigAddress::new(function.bus, function.device, function.function, COMMAND).ok()?;
+    // The upper half of the register belongs to the Status register and must be
+    // preserved, so read-modify-write instead of overwriting both halves.
+    let current = read_config(function.bus, function.device, function.function, COMMAND)?;
+    let merged = (current & 0xffff_0000) | u32::from(value);
+    // SAFETY: the configuration ports are fixed legacy ports and the address was
+    // validated above.
+    unsafe {
+        outl(CONFIG_ADDRESS, address.raw());
+        outl(CONFIG_DATA, merged);
+    }
+    Some(())
+}
+
+/// Enable memory-space decoding and bus mastering for a function.
+///
+/// DMA and memory-mapped register access both require these bits, and neither
+/// is useful before the ranges are known. Returns the command register before
+/// and after the change so the caller can log them.
+pub fn enable(function: &Function) -> Option<(u16, u16)> {
+    let before = read_command(function)?;
+    let wanted = before | COMMAND_MEMORY | COMMAND_BUS_MASTER;
+    if wanted != before {
+        write_command(function, wanted)?;
+    }
+    let after = read_command(function)?;
+    Some((before, after))
+}
+
+/// Measure one BAR by writing all ones and restoring the original value.
+///
+/// The Command register is read, memory and port decoding are disabled for the
+/// duration of the probe, and the original value is restored afterwards. A
+/// 64-bit memory BAR is probed through both halves. Returns the range length in
+/// bytes, or zero when the register implements no addresses.
+///
+/// The probe is skipped for a function with no BARs and refuses an index that
+/// the function does not expose.
+pub fn size_bar(function: &Function, index: u8) -> Option<u64> {
+    if !function.header.has_bars() || index >= 6 {
+        return None;
+    }
+    let offset = 0x10 + index * 4;
+    let save = read_config(function.bus, function.device, function.function, COMMAND)?;
+    let original_low = read_config(function.bus, function.device, function.function, offset)?;
+    let is_io = original_low & 1 != 0;
+    let words = match is_io {
+        true => 1,
+        // Bits 2:1 of a memory BAR select the width; 64-bit BARs use two words.
+        false if (original_low >> 1) & 0x3 == 0x2 => 2,
+        false => 1,
+    };
+    let original_high = match words {
+        2 => read_config(function.bus, function.device, function.function, offset + 4)?,
+        _ => 0,
+    };
+    // Disable decoding so the all-ones value cannot reach the bus.
+    write_command(function, (save & 0xffff) as u16 & !0x3)?;
+    let address = |register: u8| {
+        ConfigAddress::new(function.bus, function.device, function.function, register).ok()
+    };
+    // SAFETY: the ports are the fixed legacy configuration pair and both
+    // addresses were validated.
+    unsafe {
+        outl(CONFIG_ADDRESS, address(offset)?.raw());
+        outl(CONFIG_DATA, u32::MAX);
+        if words == 2 {
+            outl(CONFIG_ADDRESS, address(offset + 4)?.raw());
+            outl(CONFIG_DATA, u32::MAX);
+        }
+    }
+    let mask_low = read_config(function.bus, function.device, function.function, offset)?;
+    let mask_high = match words {
+        2 => read_config(function.bus, function.device, function.function, offset + 4)?,
+        _ => 0,
+    };
+    // SAFETY: restore the original base and the original command word.
+    unsafe {
+        outl(CONFIG_ADDRESS, address(offset)?.raw());
+        outl(CONFIG_DATA, original_low);
+        if words == 2 {
+            outl(CONFIG_ADDRESS, address(offset + 4)?.raw());
+            outl(CONFIG_DATA, original_high);
+        }
+    }
+    write_command(function, save as u16)?;
+    // Truncate the readback to the register's address width: hardware answers
+    // with ones above the implemented width, and a 32-bit BAR cannot describe
+    // an address above 4 GiB.
+    let width_bits = match (is_io, words) {
+        (true, _) => 16,
+        (false, 2) => 52,
+        (false, _) => 32,
+    };
+    let address_mask = if width_bits == 52 {
+        (1u64 << 52) - 1
+    } else {
+        (1u64 << width_bits) - 1
+    };
+    let low_mask = if is_io {
+        u64::from(mask_low & 0xfffc)
+    } else {
+        u64::from(mask_low & !0xf)
+    };
+    let mask = (low_mask | (u64::from(mask_high) << 32)) & address_mask;
+    wuxia_core::pci::bar_size(mask, is_io, width_bits).ok()
+}
+
 /// Write `value` to a 32-bit port.
 ///
 /// # Safety

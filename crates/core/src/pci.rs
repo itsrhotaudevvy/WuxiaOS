@@ -150,6 +150,43 @@ impl Header {
     }
 }
 
+/// Decode the length of a BAR from its all-ones readback.
+///
+/// A device answers an all-ones write by clearing the address bits it does not
+/// implement, so the length is the size of that zero run. `width_bits` is the
+/// address width of the register (16 for an I/O BAR, 32 for a 32-bit memory BAR,
+/// 52 for a 64-bit one), because the complement must be taken inside the address
+/// width: a 32-bit mask of `0xff00_0000` describes a 16 MiB window, and its
+/// 64-bit complement would describe a nonsensical one.
+///
+/// `mask` is the readback with the type bits already cleared. A zero mask means
+/// the BAR implements no addresses and yields a length of zero.
+///
+/// Errors: [`Error::InvalidInput`] for a width outside 1..=52 bits, address bits
+/// set above the width, uncleared type bits, a length that is not a power of
+/// two, or a length above the 64 KiB port-space limit.
+pub fn bar_size(mask: u64, is_io: bool, width_bits: u32) -> Result<u64> {
+    if width_bits == 0 || width_bits > 52 {
+        return Err(Error::InvalidInput);
+    }
+    let all = (1u64 << width_bits) - 1;
+    if mask & !all != 0 {
+        return Err(Error::InvalidInput);
+    }
+    if mask == 0 {
+        return Ok(0);
+    }
+    if mask & 0x3 != 0 {
+        return Err(Error::InvalidInput);
+    }
+    let size = (!mask & all).checked_add(1).ok_or(Error::OutOfRange)?;
+    let limit = if is_io { 0x1_0000 } else { 1 << 52 };
+    if !size.is_power_of_two() || size > limit {
+        return Err(Error::InvalidInput);
+    }
+    Ok(size)
+}
+
 /// A field read from a function's configuration space.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Function {
@@ -298,6 +335,31 @@ mod tests {
         assert_eq!(function.class, 0x06);
         assert!(function.is_bridge());
         assert!(!function.is_storage());
+    }
+
+    #[test]
+    fn bar_sizes_come_from_the_all_ones_readback() {
+        // A 64 KiB memory window clears bits 16 and above.
+        assert_eq!(bar_size(0xffff_0000, false, 32), Ok(0x1_0000));
+        // A 16 MiB window clears bits 24 and above.
+        assert_eq!(bar_size(0xff00_0000, false, 32), Ok(0x0100_0000));
+        // A 128 KiB window clears bits 17 and above.
+        assert_eq!(bar_size(0xfffe_0000, false, 32), Ok(0x2_0000));
+        // A 64-byte I/O window clears bits 6 and above.
+        assert_eq!(bar_size(0x0000_ffc0, true, 16), Ok(0x40));
+        // An unimplemented BAR answers with no address bits set.
+        assert_eq!(bar_size(0, false, 32), Ok(0));
+        // Type bits must be cleared, and port space stops at 64 KiB.
+        assert_eq!(bar_size(0x3, true, 16), Err(Error::InvalidInput));
+        assert_eq!(bar_size(0xfffc_0000, true, 16), Err(Error::InvalidInput));
+        // Address bits above the register width are a caller error.
+        assert_eq!(
+            bar_size(0xffff_0000_0000, false, 32),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(bar_size(0xfffe_0000, false, 0), Err(Error::InvalidInput));
+        // A non-power-of-two zero run is a protocol violation.
+        assert_eq!(bar_size(0xfffa_0000, false, 32), Err(Error::InvalidInput));
     }
 
     #[test]
