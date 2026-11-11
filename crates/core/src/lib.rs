@@ -9,6 +9,7 @@
 pub mod address_space;
 pub mod capability;
 pub mod descriptor;
+pub mod dispatcher;
 pub mod elf;
 pub mod error;
 pub mod frames;
