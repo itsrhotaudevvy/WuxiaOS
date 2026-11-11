@@ -16,6 +16,7 @@ use limine::request::{
 mod gdt;
 mod idt;
 mod interrupts;
+mod log;
 mod memory;
 mod paging;
 mod sched;
@@ -65,14 +66,14 @@ pub extern "C" fn _start() -> ! {
         panic!("Limine base revision 3 is unsupported");
     }
     serial::init();
-    serial::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
+    log::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
     gdt::init();
-    serial::write_str("WUXIA_GDT_OK\n");
+    log::write_str("WUXIA_GDT_OK\n");
     idt::self_test();
     interrupts::init(interrupts::TIMER_HZ as u32);
-    serial::write_str("WUXIA_TIMER_STARTED\n");
+    log::write_str("WUXIA_TIMER_STARTED\n");
     interrupts::wait_for_ticks(5);
-    serial::write_str("WUXIA_TIMER_OK\n");
+    log::write_str("WUXIA_TIMER_OK\n");
     let response = MEMORY_MAP_REQUEST
         .get_response()
         .expect("Limine did not provide a memory map");
@@ -86,30 +87,30 @@ pub extern "C" fn _start() -> ! {
         .allocate()
         .expect("a second usable frame is required");
     assert_ne!(first, second, "frame allocator returned a duplicate");
-    serial::write_str("WUXIA_MEMORY_MAP_READY\n");
-    serial::write_str("WUXIA_FRAME_ALLOC_OK\n");
-    serial::write_hex(first);
-    serial::write_hex(second);
+    log::write_str("WUXIA_MEMORY_MAP_READY\n");
+    log::write_str("WUXIA_FRAME_ALLOC_OK\n");
+    log::write_hex(first);
+    log::write_hex(second);
 
     let hhdm = HHDM_REQUEST
         .get_response()
         .expect("Limine did not provide a direct map");
     let direct_map = wuxia_core::DirectMap::new(hhdm.offset())
         .expect("the direct-map offset is not aligned higher-half memory");
-    serial::write_str("WUXIA_HHDM_OK\n");
-    serial::write_hex(direct_map.offset());
+    log::write_str("WUXIA_HHDM_OK\n");
+    log::write_hex(direct_map.offset());
     paging::record_direct_map(direct_map);
 
     let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)
         .expect("cannot load the user ELF image");
-    serial::write_str("WUXIA_ELF_OK\n");
-    serial::write_str("WUXIA_USER_IMAGE_OK\n");
-    serial::write_hex(image.old_pml4);
-    serial::write_hex(image.new_pml4);
-    serial::write_hex(image.entry);
-    serial::write_hex(image.stack_address);
+    log::write_str("WUXIA_ELF_OK\n");
+    log::write_str("WUXIA_USER_IMAGE_OK\n");
+    log::write_hex(image.old_pml4);
+    log::write_hex(image.new_pml4);
+    log::write_hex(image.entry);
+    log::write_hex(image.stack_address);
     for segment in image.segments() {
-        serial::write_hex(segment.address);
+        log::write_hex(segment.address);
     }
 
     let fault = paging::load_user_image(&mut allocator, direct_map, FAULT_ELF)
@@ -127,12 +128,12 @@ pub extern "C" fn _start() -> ! {
         Some(reclaimed),
         "the frame pool did not reuse a freed frame"
     );
-    serial::write_str("WUXIA_FRAME_RECLAIM_OK\n");
+    log::write_str("WUXIA_FRAME_RECLAIM_OK\n");
 
     let pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE)
         .expect("the PE self-test image cannot be loaded");
-    serial::write_str("WUXIA_PE_IMAGE_OK\n");
-    serial::write_hex(pe.entry);
+    log::write_str("WUXIA_PE_IMAGE_OK\n");
+    log::write_hex(pe.entry);
     memory::install_pool(allocator);
 
     let mut files = vfs::KernelFs::new();
@@ -153,11 +154,11 @@ pub extern "C" fn _start() -> ! {
         ),
         "the bootstrap file cannot be read back"
     );
-    serial::write_str("WUXIA_FS_OK\n");
+    log::write_str("WUXIA_FS_OK\n");
 
     paging::activate(image.new_pml4);
-    serial::write_str("WUXIA_CR3_OK\n");
-    serial::write_hex(paging::read_cr3());
+    log::write_str("WUXIA_CR3_OK\n");
+    log::write_hex(paging::read_cr3());
 
     let entry = paging::resolve(direct_map, image.entry)
         .expect("the new root does not resolve the entry point");
@@ -172,9 +173,9 @@ pub extern "C" fn _start() -> ! {
         stack_leaf, image.stack_entry,
         "the stack leaf changed after activation"
     );
-    serial::write_str("WUXIA_POST_SWITCH_PASS\n");
-    serial::write_hex(entry);
-    serial::write_hex(stack_leaf);
+    log::write_str("WUXIA_POST_SWITCH_PASS\n");
+    log::write_hex(entry);
+    log::write_hex(stack_leaf);
 
     let mut process = wuxia_core::Process::<8>::new(
         wuxia_core::process::FIRST_PROCESS_ID,
@@ -299,7 +300,7 @@ pub extern "C" fn _start() -> ! {
         .is_some(),
         "the fault thread cannot be registered"
     );
-    serial::write_str("WUXIA_ENTER_USER\n");
+    log::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.entry, stack_top);
 }
 

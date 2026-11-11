@@ -10,7 +10,7 @@ use core::mem::size_of;
 use core::ptr::addr_of_mut;
 
 use crate::gdt::KERNEL_CODE_SELECTOR;
-use crate::serial;
+use crate::log::console as serial;
 
 /// A 64-bit interrupt gate descriptor in the hardware-required layout.
 #[derive(Clone, Copy, Debug, Default)]
@@ -522,6 +522,7 @@ fn finish() -> ! {
         serial::write_hex(frame);
         let _ = crate::memory::free_frame(frame);
     }
+    crate::log::verify();
     serial::write_str("WUXIA_TEST_PASS\n");
     serial::debug_exit(0x10);
     halt();
