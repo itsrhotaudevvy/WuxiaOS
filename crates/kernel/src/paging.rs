@@ -7,7 +7,7 @@
 use wuxia_core::Error;
 use wuxia_core::hhdm::DirectMap;
 use wuxia_core::paging::{
-    ENTRIES_PER_TABLE, PagePermissions, is_table, leaf, physical_address, table_entry, table_index,
+    ENTRIES_PER_TABLE, PagePermissions, PageTableReader, leaf, table_entry, table_index, walk,
 };
 use wuxia_core::region::BumpAllocator;
 
@@ -57,8 +57,8 @@ pub fn build<const N: usize>(
 
     verify(
         direct_map,
-        [pml4, pdpt, pd, pt],
-        &[index0, index1, index2, index3],
+        pml4,
+        virtual_address,
         leaf_value,
     )?;
 
@@ -69,29 +69,32 @@ pub fn build<const N: usize>(
     })
 }
 
-/// Walk the hierarchy and confirm every level links to the expected frame.
+/// Walk the hierarchy through the direct map and confirm it resolves.
 fn verify(
     direct_map: DirectMap,
-    frames: [u64; 4],
-    indices: &[usize; 4],
+    pml4: u64,
+    virtual_address: u64,
     expected_leaf: u64,
 ) -> Result<(), Error> {
-    let mut table = frames[0];
-    for level in 0..3 {
-        let entry = read_entry(frame_pointer(direct_map, table)?, indices[level]);
-        if !is_table(entry) {
-            return Err(Error::InvalidState);
-        }
-        let next = physical_address(entry);
-        if next != frames[level + 1] {
-            return Err(Error::InvalidState);
-        }
-        table = next;
-    }
-    if read_entry(frame_pointer(direct_map, table)?, indices[3]) != expected_leaf {
+    let reader = DirectMapReader { direct_map };
+    if walk(&reader, pml4, virtual_address)? != expected_leaf {
         return Err(Error::InvalidState);
     }
     Ok(())
+}
+
+/// A [`PageTableReader`] that reads physical frames through the HHDM.
+struct DirectMapReader {
+    direct_map: DirectMap,
+}
+
+impl PageTableReader for DirectMapReader {
+    fn read_entry(&self, table_frame: u64, index: usize) -> u64 {
+        match frame_pointer(self.direct_map, table_frame) {
+            Ok(pointer) => read_entry(pointer, index),
+            Err(_) => 0,
+        }
+    }
 }
 
 fn zero_frame(direct_map: DirectMap, frame: u64) -> Result<(), Error> {

@@ -147,6 +147,57 @@ pub const fn is_executable(entry: u64) -> bool {
     entry & NO_EXECUTE == 0
 }
 
+/// Whether a page-table entry is present in the hierarchy.
+pub const fn is_present(entry: u64) -> bool {
+    entry & PRESENT != 0
+}
+
+/// Read-only access to a physical page-table entry.
+///
+/// Implementations translate a physical table frame through whatever mapping
+/// is active; the walker itself never dereferences memory.
+pub trait PageTableReader {
+    /// Return the raw entry at `index` in the table stored at `table_frame`.
+    fn read_entry(&self, table_frame: u64, index: usize) -> u64;
+}
+
+/// Resolve a four-kibibyte user page to its present leaf entry.
+///
+/// Huge intermediate entries and 2 MiB leaves are rejected with
+/// [`Error::Unsupported`] because the bootstrap map is 4 KiB only. Absent
+/// entries return [`Error::NotFound`].
+pub fn walk<R: PageTableReader>(
+    reader: &R,
+    root: u64,
+    virtual_address: u64,
+) -> Result<u64> {
+    if !is_user_address(virtual_address) {
+        return Err(Error::BadAddress);
+    }
+    let mut table = root;
+    for level in 0..3 {
+        let entry = reader.read_entry(table, table_index(virtual_address, level)?);
+        if !is_present(entry) {
+            return Err(Error::NotFound);
+        }
+        if entry & HUGE != 0 {
+            return Err(Error::Unsupported);
+        }
+        table = physical_address(entry);
+        if table == 0 {
+            return Err(Error::InvalidState);
+        }
+    }
+    let leaf_entry = reader.read_entry(table, table_index(virtual_address, 3)?);
+    if !is_present(leaf_entry) {
+        return Err(Error::NotFound);
+    }
+    if leaf_entry & HUGE != 0 {
+        return Err(Error::Unsupported);
+    }
+    Ok(leaf_entry)
+}
+
 /// Whether a physical address is a usable, nonzero 4 KiB page frame.
 const fn is_physical_page(address: u64) -> bool {
     address != 0 && address % PAGE_SIZE == 0 && address & !ADDRESS_MASK == 0
@@ -267,5 +318,68 @@ mod tests {
         assert!(is_table(table_entry(0x2000, true).unwrap()));
         assert!(!is_table(0));
         assert!(!is_table(PRESENT | HUGE | 0x2000));
+    }
+
+    /// A sparse four-entry reader used to exercise the walker without memory.
+    struct Sparse {
+        entries: [(u64, usize, u64); 4],
+    }
+
+    impl PageTableReader for Sparse {
+        fn read_entry(&self, table_frame: u64, index: usize) -> u64 {
+            self.entries
+                .iter()
+                .find(|(frame, slot, _)| *frame == table_frame && *slot == index)
+                .map_or(0, |(_, _, value)| *value)
+        }
+    }
+
+    #[test]
+    fn walker_resolves_a_populated_chain() {
+        // 0x400000 indexes PML4[0], PDPT[0], PD[2], PT[0].
+        let leaf_entry = leaf(0x400000, 0x9000, PagePermissions::USER_READ_ONLY).unwrap();
+        let reader = Sparse {
+            entries: [
+                (0x1000, 0, table_entry(0x2000, true).unwrap()),
+                (0x2000, 0, table_entry(0x3000, true).unwrap()),
+                (0x3000, 2, table_entry(0x4000, true).unwrap()),
+                (0x4000, 0, leaf_entry),
+            ],
+        };
+        assert_eq!(walk(&reader, 0x1000, 0x400000), Ok(leaf_entry));
+    }
+
+    #[test]
+    fn walker_reports_absent_and_unsupported_levels() {
+        let missing = Sparse {
+            entries: [
+                (0x1000, 0, table_entry(0x2000, true).unwrap()),
+                (0x2000, 0, 0),
+                (0, 0, 0),
+                (0, 0, 0),
+            ],
+        };
+        assert_eq!(walk(&missing, 0x1000, 0x400000), Err(Error::NotFound));
+
+        let huge = Sparse {
+            entries: [
+                (0x1000, 0, PRESENT | HUGE | 0x2000),
+                (0, 0, 0),
+                (0, 0, 0),
+                (0, 0, 0),
+            ],
+        };
+        assert_eq!(walk(&huge, 0x1000, 0x400000), Err(Error::Unsupported));
+
+        let null_table = Sparse {
+            entries: [
+                (0x1000, 0, PRESENT | 0),
+                (0, 0, 0),
+                (0, 0, 0),
+                (0, 0, 0),
+            ],
+        };
+        assert_eq!(walk(&null_table, 0x1000, 0x400000), Err(Error::InvalidState));
+        assert_eq!(walk(&null_table, 0x1000, 0x1001), Err(Error::BadAddress));
     }
 }
