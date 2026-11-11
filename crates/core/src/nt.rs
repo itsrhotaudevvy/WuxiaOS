@@ -1,5 +1,6 @@
 //! Small NT vocabulary types used by the future native personality.
 
+use crate::nt_service::{NtService, ServiceTable};
 use crate::syscall::{MAX_READ_LENGTH, MAX_WRITE_LENGTH, Registers, UserBuffer};
 use crate::{Error, Result};
 
@@ -110,6 +111,17 @@ impl NtCall {
             _ => None,
         }
     }
+
+    /// The build-independent service this bootstrap number stands for.
+    pub const fn service(self) -> NtService {
+        match self {
+            Self::Close => NtService::Close,
+            Self::AllocateVirtualMemory => NtService::AllocateVirtualMemory,
+            Self::TerminateProcess => NtService::TerminateProcess,
+            Self::ReadFile => NtService::ReadFile,
+            Self::WriteFile => NtService::WriteFile,
+        }
+    }
 }
 
 /// A decoded NT request with validated arguments.
@@ -148,29 +160,51 @@ pub enum NtRequest {
 
 impl NtRequest {
     /// Decode a service number and register block without trusting pointers.
+    ///
+    /// Uses the fixed bootstrap numbering of [`NtCall`].
     pub fn decode(call: u64, registers: &Registers) -> Result<Self> {
-        match NtCall::from_raw(call).ok_or(Error::InvalidInput)? {
-            NtCall::Close => Ok(Self::Close {
+        let call = NtCall::from_raw(call).ok_or(Error::InvalidInput)?;
+        Self::decode_service(call.service(), registers)
+    }
+
+    /// Decode a raw service number through a per-build [`ServiceTable`].
+    ///
+    /// A number the table does not list is `InvalidInput`; a listed service
+    /// without a decoder is `Unsupported`.
+    pub fn decode_with_table(
+        table: &ServiceTable,
+        call: u64,
+        registers: &Registers,
+    ) -> Result<Self> {
+        let service = table.service(call).ok_or(Error::InvalidInput)?;
+        Self::decode_service(service, registers)
+    }
+
+    /// Decode the arguments of an already resolved abstract service.
+    pub fn decode_service(service: NtService, registers: &Registers) -> Result<Self> {
+        match service {
+            NtService::Close => Ok(Self::Close {
                 handle: decode_handle(registers.args[0])?,
             }),
-            NtCall::AllocateVirtualMemory => {
+            NtService::AllocateVirtualMemory => {
                 let length = registers.args[1];
                 if length == 0 || length > crate::syscall::MAX_MAP_LENGTH {
                     return Err(Error::InvalidInput);
                 }
                 Ok(Self::AllocateVirtualMemory { length })
             }
-            NtCall::TerminateProcess => Ok(Self::TerminateProcess {
+            NtService::TerminateProcess => Ok(Self::TerminateProcess {
                 status: u32::try_from(registers.args[0]).map_err(|_| Error::InvalidInput)?,
             }),
-            NtCall::ReadFile => Ok(Self::ReadFile {
+            NtService::ReadFile => Ok(Self::ReadFile {
                 handle: decode_handle(registers.args[0])?,
                 buffer: decode_buffer(registers.args[1], registers.args[2], MAX_READ_LENGTH)?,
             }),
-            NtCall::WriteFile => Ok(Self::WriteFile {
+            NtService::WriteFile => Ok(Self::WriteFile {
                 handle: decode_handle(registers.args[0])?,
                 buffer: decode_buffer(registers.args[1], registers.args[2], MAX_WRITE_LENGTH)?,
             }),
+            _ => Err(Error::Unsupported),
         }
     }
 }
@@ -266,6 +300,61 @@ mod tests {
             NtRequest::decode(0x99, &registers),
             Err(Error::InvalidInput)
         );
+    }
+
+    #[test]
+    fn nt_requests_decode_through_per_build_tables() {
+        use crate::nt_service::WindowsBuild;
+        let registers = Registers {
+            args: [3, 0x8000_1000, 64, 0, 0, 0],
+        };
+        let write = Ok(NtRequest::WriteFile {
+            handle: 3,
+            buffer: UserBuffer {
+                address: 0x8000_1000,
+                length: 64,
+            },
+        });
+        let win7 = WindowsBuild::Windows7Sp1.service_table();
+        let win10 = WindowsBuild::Windows10_22H2.service_table();
+        assert_eq!(NtRequest::decode_with_table(win7, 0x05, &registers), write);
+        assert_eq!(NtRequest::decode_with_table(win10, 0x08, &registers), write);
+        assert_eq!(
+            NtRequest::decode_with_table(win7, 0x29, &registers),
+            Ok(NtRequest::TerminateProcess { status: 3 })
+        );
+        assert_eq!(
+            NtRequest::decode_with_table(win10, 0x2c, &registers),
+            Ok(NtRequest::TerminateProcess { status: 3 })
+        );
+        // Listed in the table but not yet decodable.
+        assert_eq!(
+            NtRequest::decode_with_table(win10, 0x55, &registers),
+            Err(Error::Unsupported)
+        );
+        // Not listed at all.
+        assert_eq!(
+            NtRequest::decode_with_table(win10, 0x29, &registers),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(
+            NtRequest::decode_with_table(win10, u64::MAX, &registers),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn bootstrap_calls_map_to_abstract_services() {
+        for raw in [0x06, 0x08, 0x0f, 0x18, 0x29] {
+            let call = NtCall::from_raw(raw).unwrap();
+            let registers = Registers {
+                args: [3, 0x8000_1000, 64, 0, 0, 0],
+            };
+            assert_eq!(
+                NtRequest::decode(raw, &registers),
+                NtRequest::decode_service(call.service(), &registers)
+            );
+        }
     }
 
     #[test]
