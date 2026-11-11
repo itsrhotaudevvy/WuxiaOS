@@ -24,6 +24,7 @@ pub mod paging;
 pub mod path;
 pub mod pe_import;
 pub mod pe_reloc;
+pub mod pe_tls;
 pub mod personality;
 pub mod pipe;
 pub mod pledge;
