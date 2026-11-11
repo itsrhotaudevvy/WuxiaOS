@@ -40,6 +40,8 @@ pub struct Thread {
     pub process: Process<8>,
     /// Frames owned by the thread's image.
     pub frames: crate::paging::FrameTracker,
+    /// Pledge promises for the thread's process; only ever narrowed.
+    pub pledge: wuxia_core::pledge::Pledge,
 }
 
 static mut THREADS: [Option<Thread>; MAX_THREADS] = [None; MAX_THREADS];
@@ -97,6 +99,7 @@ pub fn register(
             resume_tick: 0,
             deferred: false,
             start_label: "",
+            pledge: wuxia_core::pledge::Pledge::new(),
             process,
             frames,
         });
@@ -139,6 +142,25 @@ pub fn is_nt() -> bool {
 /// Process identifier of the running thread.
 pub fn process_id() -> u64 {
     current_thread().map_or(0, |thread| thread.process.id())
+}
+
+/// Whether the running process's promises allow `call`.
+///
+/// A thread without a process (only before ring 3 starts) is not restricted.
+pub fn permits(call: wuxia_core::syscall::PosixCall) -> bool {
+    current_thread().is_none_or(|thread| thread.pledge.permits(call))
+}
+
+/// Narrow the running process's promise set, which can only shrink.
+pub fn restrict_promises(promises: wuxia_core::pledge::Promises) -> bool {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current]
+            .as_mut()
+            .is_some_and(|thread| thread.pledge.restrict(promises).is_ok())
+    }
 }
 
 /// Whether the running process has `descriptor` open.

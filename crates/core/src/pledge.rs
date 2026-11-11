@@ -110,6 +110,8 @@ pub const fn required(call: PosixCall) -> Promises {
         PosixCall::Map | PosixCall::Unmap => Promises::VM,
         // Exiting must always succeed so a restricted process can still end.
         PosixCall::Exit => Promises::NONE,
+        // A pledge can only remove promises, so it needs no promise itself.
+        PosixCall::Pledge => Promises::NONE,
     }
 }
 
@@ -160,7 +162,7 @@ impl Pledge {
 mod tests {
     use super::*;
 
-    const CALLS: [PosixCall; 12] = [
+    const CALLS: [PosixCall; 13] = [
         PosixCall::Read,
         PosixCall::Write,
         PosixCall::Open,
@@ -173,6 +175,7 @@ mod tests {
         PosixCall::Sleep,
         PosixCall::GetPid,
         PosixCall::Exit,
+        PosixCall::Pledge,
     ];
 
     #[test]
@@ -248,7 +251,8 @@ mod tests {
         for call in CALLS {
             let need = required(call);
             if need == Promises::NONE {
-                assert_eq!(call, PosixCall::Exit);
+                assert!(matches!(call, PosixCall::Exit | PosixCall::Pledge));
+                assert!(Pledge::new().permits(call));
                 continue;
             }
 
@@ -279,6 +283,16 @@ mod tests {
         assert_eq!(required(PosixCall::Map), Promises::VM);
         assert_eq!(required(PosixCall::Unmap), Promises::VM);
         assert_eq!(required(PosixCall::Exit), Promises::NONE);
+        assert_eq!(required(PosixCall::Pledge), Promises::NONE);
+    }
+
+    #[test]
+    fn pledging_stays_available_after_every_promise_is_dropped() {
+        let mut pledge = Pledge::new();
+        assert_eq!(pledge.restrict(Promises::NONE), Ok(()));
+        assert!(pledge.permits(PosixCall::Pledge));
+        assert!(pledge.permits(PosixCall::Exit));
+        assert!(!pledge.permits(PosixCall::Write));
     }
 
     #[test]

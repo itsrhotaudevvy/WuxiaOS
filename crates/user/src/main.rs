@@ -225,13 +225,38 @@ core::arch::global_asm!(
     "lea rsi, [rip + {second}]",
     "mov rdx, 15",
     "int 0x80",
-    // exit(0)
+    // pledge("stdio rpath"): the VM promise is dropped from here on
+    "mov rax, 108",
+    "mov rdi, 3",
+    "int 0x80",
+    "test rax, rax",
+    "jne 13f",
+    // map must now be refused, and the process must stay alive
+    "mov rax, 9",
+    "mov rdi, 4096",
+    "int 0x80",
+    "cmp rax, -1",
+    "jne 13f",
+    // stdio still works under the narrowed promise set
+    "mov rax, 1",
+    "mov rdi, 1",
+    "lea rsi, [rip + {pledged}]",
+    "mov rdx, 8",
+    "int 0x80",
+    // drop every remaining promise; exit must still be permitted
+    "mov rax, 108",
+    "xor rdi, rdi",
+    "int 0x80",
+    "test rax, rax",
+    "jne 13f",
     "mov rax, 60",
     "xor rdi, rdi",
     "int 0x80",
+    "13:",
     "ud2",
     message = sym MESSAGE,
     second = sym SECOND,
+    pledged = sym PLEDGED,
 
 );
 
@@ -242,6 +267,10 @@ static MESSAGE: [u8; 16] = *b"HELLO FROM USER\n";
 /// Written after the yield resumes, proving the saved frame was restored.
 #[used]
 static SECOND: [u8; 15] = *b"A SECOND PHASE\n";
+
+/// Written after `pledge` drops every promise except stdio and rpath.
+#[used]
+static PLEDGED: [u8; 8] = *b"PLEDGED\n";
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {

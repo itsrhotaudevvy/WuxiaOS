@@ -305,7 +305,15 @@ fn service_syscall(frame: &mut InterruptFrame) {
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ],
     };
-    match wuxia_core::syscall::PosixRequest::decode(frame.rax, &registers) {
+    let request = wuxia_core::syscall::PosixRequest::decode(frame.rax, &registers);
+    if let Ok(request) = request {
+        if !crate::sched::permits(request.call()) {
+            serial::write_str("WUXIA_PLEDGE_DENIED\n");
+            frame.rax = u64::MAX;
+            return;
+        }
+    }
+    match request {
         Ok(wuxia_core::syscall::PosixRequest::GetPid) => {
             serial::write_str("WUXIA_SYSCALL_GETPID\n");
             frame.rax = crate::sched::process_id();
@@ -325,6 +333,17 @@ fn service_syscall(frame: &mut InterruptFrame) {
         }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
             terminate(frame, code, "WUXIA_SYSCALL_EXIT\n");
+        }
+        Ok(wuxia_core::syscall::PosixRequest::Pledge { promises }) => {
+            if crate::sched::restrict_promises(promises) {
+                serial::write_str("WUXIA_PLEDGE_OK\n");
+                serial::write_hex(u64::from(promises.bits()));
+                frame.rax = 0;
+            } else {
+                // The request would regain a promise, so nothing changed.
+                serial::write_str("WUXIA_PLEDGE_DENIED\n");
+                frame.rax = u64::MAX;
+            }
         }
         Ok(wuxia_core::syscall::PosixRequest::Open { path }) => {
             let mut scratch = [0u8; wuxia_core::syscall::MAX_PATH_LENGTH as usize];

@@ -49,6 +49,8 @@ pub enum PosixCall {
     Exit = 60,
     /// Return the length of an open file.
     FileSize = 61,
+    /// Narrow the process's promise set; the number matches OpenBSD `pledge`.
+    Pledge = 108,
 }
 
 impl PosixCall {
@@ -67,6 +69,7 @@ impl PosixCall {
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
             61 => Some(Self::FileSize),
+            108 => Some(Self::Pledge),
             _ => None,
         }
     }
@@ -160,6 +163,11 @@ pub enum PosixRequest {
         /// Exit status reported to the parent.
         code: u64,
     },
+    /// Narrow the promise set; the request can only remove promises.
+    Pledge {
+        /// Requested promises, already checked against the known bits.
+        promises: crate::pledge::Promises,
+    },
 }
 
 impl PosixRequest {
@@ -207,8 +215,39 @@ impl PosixRequest {
             PosixCall::Exit => Ok(Self::Exit {
                 code: registers.args[0],
             }),
+            PosixCall::Pledge => Ok(Self::Pledge {
+                promises: decode_promises(registers.args[0])?,
+            }),
         }
     }
+
+    /// The call this request was decoded from.
+    ///
+    /// Policy checks such as [`crate::pledge::required`] need the call even
+    /// though the decoded request already carries validated arguments.
+    pub const fn call(&self) -> PosixCall {
+        match self {
+            Self::Read { .. } => PosixCall::Read,
+            Self::Open { .. } => PosixCall::Open,
+            Self::Write { .. } => PosixCall::Write,
+            Self::Seek { .. } => PosixCall::Seek,
+            Self::FileSize { .. } => PosixCall::FileSize,
+            Self::Map { .. } => PosixCall::Map,
+            Self::Unmap { .. } => PosixCall::Unmap,
+            Self::Close { .. } => PosixCall::Close,
+            Self::Yield => PosixCall::Yield,
+            Self::Sleep { .. } => PosixCall::Sleep,
+            Self::GetPid => PosixCall::GetPid,
+            Self::Exit { .. } => PosixCall::Exit,
+            Self::Pledge { .. } => PosixCall::Pledge,
+        }
+    }
+}
+
+/// Decode a promise mask, rejecting bits the vocabulary does not define.
+fn decode_promises(raw: u64) -> Result<crate::pledge::Promises> {
+    let bits = u16::try_from(raw).map_err(|_| Error::InvalidInput)?;
+    crate::pledge::Promises::from_bits(bits).ok_or(Error::InvalidInput)
 }
 
 fn decode_sleep_millis(raw: u64) -> Result<u64> {
@@ -266,6 +305,7 @@ pub struct NtCall(pub u32);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pledge::Promises;
 
     #[test]
     fn raw_registers_are_not_assumed_to_be_pointers() {
@@ -462,5 +502,120 @@ mod tests {
             PosixRequest::decode(999, &Registers::default()),
             Err(Error::InvalidInput)
         );
+    }
+
+    #[test]
+    fn pledge_decodes_a_known_mask_and_rejects_stray_bits() {
+        let mask = Promises::STDIO.union(Promises::RPATH);
+        let request = PosixRequest::decode(
+            108,
+            &Registers {
+                args: [u64::from(mask.bits()), 0, 0, 0, 0, 0],
+            },
+        );
+        assert_eq!(request, Ok(PosixRequest::Pledge { promises: mask }));
+        assert_eq!(
+            PosixRequest::decode(108, &Registers::default()),
+            Ok(PosixRequest::Pledge {
+                promises: Promises::NONE
+            })
+        );
+
+        // Bits outside the vocabulary are rejected before any policy runs.
+        assert_eq!(
+            PosixRequest::decode(
+                108,
+                &Registers {
+                    args: [0x8000, 0, 0, 0, 0, 0]
+                }
+            ),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(
+            PosixRequest::decode(
+                108,
+                &Registers {
+                    args: [u64::from(u16::MAX) + 1, 0, 0, 0, 0, 0]
+                }
+            ),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn every_request_reports_the_call_it_came_from() {
+        let cases = [
+            (
+                0,
+                Registers {
+                    args: [1, 0x1000, 1, 0, 0, 0],
+                },
+                PosixCall::Read,
+            ),
+            (
+                1,
+                Registers {
+                    args: [1, 0x1000, 1, 0, 0, 0],
+                },
+                PosixCall::Write,
+            ),
+            (
+                2,
+                Registers {
+                    args: [0x1000, 5, 0, 0, 0, 0],
+                },
+                PosixCall::Open,
+            ),
+            (
+                3,
+                Registers {
+                    args: [1, 0, 0, 0, 0, 0],
+                },
+                PosixCall::Close,
+            ),
+            (
+                8,
+                Registers {
+                    args: [1, 0, 0, 0, 0, 0],
+                },
+                PosixCall::Seek,
+            ),
+            (
+                9,
+                Registers {
+                    args: [0x1000, 0, 0, 0, 0, 0],
+                },
+                PosixCall::Map,
+            ),
+            (
+                11,
+                Registers {
+                    args: [0x1000, 0x1000, 0, 0, 0, 0],
+                },
+                PosixCall::Unmap,
+            ),
+            (24, Registers::default(), PosixCall::Yield),
+            (
+                35,
+                Registers {
+                    args: [1, 0, 0, 0, 0, 0],
+                },
+                PosixCall::Sleep,
+            ),
+            (39, Registers::default(), PosixCall::GetPid),
+            (60, Registers::default(), PosixCall::Exit),
+            (
+                61,
+                Registers {
+                    args: [1, 0, 0, 0, 0, 0],
+                },
+                PosixCall::FileSize,
+            ),
+            (108, Registers::default(), PosixCall::Pledge),
+        ];
+        for (call, registers, expected) in cases {
+            let request = PosixRequest::decode(call, &registers).expect("decodes");
+            assert_eq!(request.call(), expected, "call {call}");
+        }
     }
 }
