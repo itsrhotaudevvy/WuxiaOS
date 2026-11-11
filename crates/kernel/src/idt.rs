@@ -323,6 +323,12 @@ fn service_syscall(frame: &mut InterruptFrame) {
             if crate::sched::exit_current(frame) {
                 return;
             }
+            serial::write_str("WUXIA_TEARDOWN_OK\n");
+            if let Some(frame) = crate::memory::allocate_frame() {
+                serial::write_str("WUXIA_TEARDOWN_REUSE_OK\n");
+                serial::write_hex(frame);
+                let _ = crate::memory::free_frame(frame);
+            }
             if let Some(image) = crate::user::next_image() {
                 serial::write_str("WUXIA_FAULT_TEST\n");
                 crate::paging::activate(image.new_pml4);

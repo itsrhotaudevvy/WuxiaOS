@@ -38,6 +38,41 @@ pub fn from_limine<const N: usize>(
 /// A reclaimable pool of physical frames.
 pub use wuxia_core::frames::FramePool;
 
+/// The pool capacity used by the bootstrap.
+pub type KernelFrames = FramePool<65536>;
+
+static mut POOL: Option<KernelFrames> = None;
+
+/// Publish the frame pool for post-bootstrap teardown.
+pub fn install_pool(pool: KernelFrames) {
+    // SAFETY: installed once after all bootstrap allocations are finished.
+    unsafe {
+        *core::ptr::addr_of_mut!(POOL) = Some(pool);
+    }
+}
+
+/// Take a frame from the installed pool.
+pub fn allocate_frame() -> Option<u64> {
+    // SAFETY: the pool is installed before ring 3 starts and traps do not nest.
+    unsafe {
+        match &mut *core::ptr::addr_of_mut!(POOL) {
+            Some(pool) => pool.allocate(),
+            None => None,
+        }
+    }
+}
+
+/// Return a frame to the installed pool.
+pub fn free_frame(frame: u64) -> Result<(), wuxia_core::Error> {
+    // SAFETY: the pool is installed before ring 3 starts and traps do not nest.
+    unsafe {
+        match &mut *core::ptr::addr_of_mut!(POOL) {
+            Some(pool) => pool.free(frame),
+            None => Err(wuxia_core::Error::InvalidState),
+        }
+    }
+}
+
 /// Build a frame pool from every page-aligned frame in the usable map.
 pub fn frame_pool<const N: usize, const R: usize>(
     map: &MemoryMap<R>,

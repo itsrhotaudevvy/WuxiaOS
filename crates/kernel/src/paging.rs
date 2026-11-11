@@ -19,6 +19,42 @@ use wuxia_core::paging::{
 /// Maximum `PT_LOAD` segments the bootstrap loader tracks.
 pub const MAX_USER_SEGMENTS: usize = 8;
 
+/// Maximum physical frames a single user image can own.
+pub const MAX_IMAGE_FRAMES: usize = 32;
+
+/// Records every frame an image allocation took, so teardown can return them.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameTracker {
+    frames: [u64; MAX_IMAGE_FRAMES],
+    len: usize,
+}
+
+impl FrameTracker {
+    /// Construct an empty tracker.
+    pub const fn new() -> Self {
+        Self {
+            frames: [0; MAX_IMAGE_FRAMES],
+            len: 0,
+        }
+    }
+
+    /// Take a frame from the pool and remember it.
+    fn allocate<const N: usize>(&mut self, allocator: &mut FramePool<N>) -> Result<u64, Error> {
+        if self.len == MAX_IMAGE_FRAMES {
+            return Err(Error::TableFull);
+        }
+        let frame = allocator.allocate().ok_or(Error::TableFull)?;
+        self.frames[self.len] = frame;
+        self.len += 1;
+        Ok(frame)
+    }
+
+    /// The recorded frames.
+    pub fn frames(&self) -> &[u64] {
+        &self.frames[..self.len]
+    }
+}
+
 /// One loaded user segment and its representative leaf entry.
 #[derive(Clone, Copy, Debug)]
 pub struct UserSegment {
@@ -47,6 +83,8 @@ pub struct UserImage {
     pub stack_entry: u64,
     /// Loaded segments in image order.
     pub segments: [Option<UserSegment>; MAX_USER_SEGMENTS],
+    /// Frames owned by this image, released when the process exits.
+    pub frames: FrameTracker,
 }
 
 impl UserImage {
@@ -76,7 +114,8 @@ pub fn load_user_image<const N: usize>(
         return Err(Error::AlreadyExists);
     }
 
-    let pdpt = allocator.allocate().ok_or(Error::TableFull)?;
+    let mut tracker = FrameTracker::new();
+    let pdpt = tracker.allocate(allocator)?;
     zero_frame(direct_map, pdpt)?;
 
     let mut segments = [None; MAX_USER_SEGMENTS];
@@ -94,12 +133,13 @@ pub fn load_user_image<const N: usize>(
             if table_index(address, 0)? != slot || address >= USER_ADDRESS_LIMIT {
                 return Err(Error::BadAddress);
             }
-            let frame = allocator.allocate().ok_or(Error::TableFull)?;
+            let frame = tracker.allocate(allocator)?;
             zero_frame(direct_map, frame)?;
             copy_segment_bytes(direct_map, frame, address, segment, bytes)?;
             let entry = map_page(
                 allocator,
                 direct_map,
+                &mut tracker,
                 pdpt,
                 address,
                 frame,
@@ -121,18 +161,19 @@ pub fn load_user_image<const N: usize>(
     if stack_address >= USER_ADDRESS_LIMIT || table_index(stack_address, 0)? != slot {
         return Err(Error::BadAddress);
     }
-    let stack_physical = allocator.allocate().ok_or(Error::TableFull)?;
+    let stack_physical = tracker.allocate(allocator)?;
     zero_frame(direct_map, stack_physical)?;
     let stack_entry = map_page(
         allocator,
         direct_map,
+        &mut tracker,
         pdpt,
         stack_address,
         stack_physical,
         PagePermissions::USER_READ_WRITE,
     )?;
 
-    let new_pml4 = allocator.allocate().ok_or(Error::TableFull)?;
+    let new_pml4 = tracker.allocate(allocator)?;
     zero_frame(direct_map, new_pml4)?;
     let new_root = frame_pointer(direct_map, new_pml4)?;
     for index in 0..ENTRIES_PER_TABLE {
@@ -147,6 +188,7 @@ pub fn load_user_image<const N: usize>(
         stack_address,
         stack_entry,
         segments,
+        frames: tracker,
     })
 }
 
@@ -249,6 +291,7 @@ fn write_frame_at(
 fn ensure_table<const N: usize>(
     allocator: &mut FramePool<N>,
     direct_map: DirectMap,
+    tracker: &mut FrameTracker,
     table: *mut u64,
     index: usize,
 ) -> Result<u64, Error> {
@@ -256,7 +299,7 @@ fn ensure_table<const N: usize>(
     if is_present(current) {
         return Ok(physical_address(current));
     }
-    let frame = allocator.allocate().ok_or(Error::TableFull)?;
+    let frame = tracker.allocate(allocator)?;
     zero_frame(direct_map, frame)?;
     write_entry(table, index, table_entry(frame, true)?);
     Ok(frame)
@@ -266,6 +309,7 @@ fn ensure_table<const N: usize>(
 fn map_page<const N: usize>(
     allocator: &mut FramePool<N>,
     direct_map: DirectMap,
+    tracker: &mut FrameTracker,
     pdpt: u64,
     address: u64,
     frame: u64,
@@ -274,12 +318,14 @@ fn map_page<const N: usize>(
     let pd = ensure_table(
         allocator,
         direct_map,
+        tracker,
         frame_pointer(direct_map, pdpt)?,
         table_index(address, 1)?,
     )?;
     let pt = ensure_table(
         allocator,
         direct_map,
+        tracker,
         frame_pointer(direct_map, pd)?,
         table_index(address, 2)?,
     )?;

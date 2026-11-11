@@ -29,6 +29,8 @@ pub struct Thread {
     pub runnable: bool,
     /// Process identity, address space and descriptors for this thread.
     pub process: Process<8>,
+    /// Frames owned by the thread's image.
+    pub frames: crate::paging::FrameTracker,
 }
 
 static mut THREADS: [Option<Thread>; MAX_THREADS] = [None; MAX_THREADS];
@@ -64,7 +66,13 @@ pub const fn initial_frame(entry: u64, stack_top: u64) -> InterruptFrame {
 }
 
 /// Register a runnable thread and return its index.
-pub fn register(root: u64, entry: u64, stack_top: u64, process: Process<8>) -> Option<usize> {
+pub fn register(
+    root: u64,
+    entry: u64,
+    stack_top: u64,
+    process: Process<8>,
+    frames: crate::paging::FrameTracker,
+) -> Option<usize> {
     // SAFETY: bootstrap registration happens once, before ring 3 starts.
     unsafe {
         let threads = &mut *addr_of_mut!(THREADS);
@@ -77,6 +85,7 @@ pub fn register(root: u64, entry: u64, stack_top: u64, process: Process<8>) -> O
             frame: initial_frame(entry, stack_top),
             runnable: true,
             process,
+            frames,
         });
         write_volatile(addr_of_mut!(COUNT), count + 1);
         Some(count)
@@ -185,6 +194,13 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
         let current = read_volatile(addr_of!(CURRENT));
         if let Some(thread) = threads[current].as_mut() {
             thread.runnable = false;
+            let mut failures = 0;
+            for &frame in thread.frames.frames() {
+                if crate::memory::free_frame(frame).is_err() {
+                    failures += 1;
+                }
+            }
+            assert_eq!(failures, 0, "process teardown could not return every frame");
         }
         let mut runnable = [false; MAX_THREADS];
         for (index, slot) in threads.iter().enumerate() {

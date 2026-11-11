@@ -124,6 +124,7 @@ pub extern "C" fn _start() -> ! {
         "the frame pool did not reuse a freed frame"
     );
     serial::write_str("WUXIA_FRAME_RECLAIM_OK\n");
+    memory::install_pool(allocator);
 
     paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");
@@ -187,7 +188,13 @@ pub extern "C" fn _start() -> ! {
     let stack_top = image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     let second_stack_top = second.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     assert_eq!(
-        sched::register(image.new_pml4, image.entry, stack_top, process),
+        sched::register(
+            image.new_pml4,
+            image.entry,
+            stack_top,
+            process,
+            image.frames
+        ),
         Some(0),
         "the bootstrap thread cannot be registered"
     );
@@ -196,7 +203,8 @@ pub extern "C" fn _start() -> ! {
             second.new_pml4,
             second.entry,
             second_stack_top,
-            second_process
+            second_process,
+            second.frames
         )
         .is_some(),
         "the second thread cannot be registered"
