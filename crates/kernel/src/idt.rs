@@ -424,6 +424,34 @@ fn service_syscall(frame: &mut InterruptFrame) {
                 frame.rax = u64::MAX;
             }
         }
+        Ok(wuxia_core::syscall::PosixRequest::Seek {
+            descriptor,
+            offset,
+            whence,
+        }) => match crate::sched::seek_descriptor(descriptor, offset, whence) {
+            Some(position) => {
+                serial::write_str("WUXIA_SYSCALL_SEEK\n");
+                serial::write_hex(position);
+                frame.rax = position;
+            }
+            None => {
+                serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                frame.rax = u64::MAX;
+            }
+        },
+        Ok(wuxia_core::syscall::PosixRequest::FileSize { descriptor }) => {
+            match crate::sched::descriptor_len(descriptor) {
+                Some(length) => {
+                    serial::write_str("WUXIA_SYSCALL_FILE_SIZE\n");
+                    serial::write_hex(length);
+                    frame.rax = length;
+                }
+                None => {
+                    serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
         Ok(wuxia_core::syscall::PosixRequest::Close { descriptor }) => {
             if crate::sched::close_descriptor(descriptor) {
                 serial::write_str("WUXIA_SYSCALL_CLOSE\n");

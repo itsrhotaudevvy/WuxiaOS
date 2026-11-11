@@ -211,6 +211,28 @@ pub fn write_file(descriptor: u32, data: &[u8]) -> Option<usize> {
     }
 }
 
+/// Reposition an open file descriptor.
+pub fn seek_descriptor(descriptor: u32, offset: i64, whence: u32) -> Option<u64> {
+    let (file, _) = descriptor_file(descriptor)?;
+    let length = crate::vfs::len(file)?;
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current]
+            .as_mut()?
+            .process
+            .descriptors_mut()
+            .seek(descriptor, offset, whence, length)
+            .ok()
+    }
+}
+
+/// Return the length behind an open file descriptor.
+pub fn descriptor_len(descriptor: u32) -> Option<u64> {
+    crate::vfs::len(current_thread()?.process.descriptors().file(descriptor)?)
+}
+
 /// Whether `[address, address + length)` is mapped by the running process.
 pub fn region_contains(address: u64, length: u64) -> bool {
     current_thread().is_some_and(|thread| thread.process.space().contains(address, length))

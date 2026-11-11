@@ -33,6 +33,8 @@ pub enum PosixCall {
     Open = 2,
     /// Close a process-local handle.
     Close = 3,
+    /// Reposition a file descriptor relative to start, current position or end.
+    Seek = 8,
     /// Map anonymous writable memory.
     Map = 9,
     /// Unmap a previously mapped anonymous range.
@@ -45,6 +47,8 @@ pub enum PosixCall {
     GetPid = 39,
     /// Terminate the calling thread or process.
     Exit = 60,
+    /// Return the length of an open file.
+    FileSize = 61,
 }
 
 impl PosixCall {
@@ -55,12 +59,14 @@ impl PosixCall {
             1 => Some(Self::Write),
             2 => Some(Self::Open),
             3 => Some(Self::Close),
+            8 => Some(Self::Seek),
             9 => Some(Self::Map),
             11 => Some(Self::Unmap),
             24 => Some(Self::Yield),
             35 => Some(Self::Sleep),
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
+            61 => Some(Self::FileSize),
             _ => None,
         }
     }
@@ -108,6 +114,20 @@ pub enum PosixRequest {
         descriptor: u32,
         /// Validated source range.
         buffer: UserBuffer,
+    },
+    /// Reposition a file descriptor using SEEK_SET, SEEK_CUR or SEEK_END.
+    Seek {
+        /// Descriptor to reposition.
+        descriptor: u32,
+        /// Signed byte displacement.
+        offset: i64,
+        /// 0=start, 1=current position, 2=end of file.
+        whence: u32,
+    },
+    /// Return the size of a descriptor's underlying file.
+    FileSize {
+        /// Descriptor to inspect.
+        descriptor: u32,
     },
     /// Map anonymous writable memory and return its address.
     Map {
@@ -164,6 +184,14 @@ impl PosixRequest {
             PosixCall::Map => Ok(Self::Map {
                 length: decode_map_length(registers.args[0])?,
             }),
+            PosixCall::Seek => Ok(Self::Seek {
+                descriptor: decode_descriptor(registers.args[0])?,
+                offset: registers.args[1] as i64,
+                whence: decode_whence(registers.args[2])?,
+            }),
+            PosixCall::FileSize => Ok(Self::FileSize {
+                descriptor: decode_descriptor(registers.args[0])?,
+            }),
             PosixCall::Unmap => Ok(Self::Unmap {
                 address: decode_unmap_address(registers.args[0])?,
                 length: decode_map_length(registers.args[1])?,
@@ -205,6 +233,13 @@ fn decode_map_length(raw: u64) -> Result<u64> {
         return Err(Error::InvalidInput);
     }
     Ok(raw)
+}
+
+fn decode_whence(raw: u64) -> Result<u32> {
+    u32::try_from(raw)
+        .ok()
+        .filter(|&whence| whence <= 2)
+        .ok_or(Error::InvalidInput)
 }
 
 fn decode_descriptor(raw: u64) -> Result<u32> {
@@ -373,6 +408,32 @@ mod tests {
         ] {
             assert!(PosixRequest::decode(1, &Registers { args }).is_err());
         }
+    }
+
+    #[test]
+    fn seek_and_file_size_validate_their_arguments() {
+        let mut registers = Registers {
+            args: [3, (-1i64) as u64, 2, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(8, &registers),
+            Ok(PosixRequest::Seek {
+                descriptor: 3,
+                offset: -1,
+                whence: 2,
+            })
+        );
+        registers.args[2] = 3;
+        assert_eq!(
+            PosixRequest::decode(8, &registers),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(
+            PosixRequest::decode(61, &registers),
+            Ok(PosixRequest::FileSize { descriptor: 3 })
+        );
+        assert_eq!(PosixCall::from_raw(8), Some(PosixCall::Seek));
+        assert_eq!(PosixCall::from_raw(19), None);
     }
 
     #[test]

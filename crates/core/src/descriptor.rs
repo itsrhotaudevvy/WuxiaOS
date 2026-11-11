@@ -112,6 +112,36 @@ impl<const N: usize> DescriptorTable<N> {
         Ok(())
     }
 
+    /// Set a descriptor's position relative to start, current position or end.
+    /// Negative results, results beyond `i64::MAX` (POSIX `off_t`) and
+    /// offsets on non-file streams are rejected without changing the position.
+    pub fn seek(
+        &mut self,
+        descriptor: u32,
+        offset: i64,
+        whence: u32,
+        file_length: u64,
+    ) -> Result<u64> {
+        let index = descriptor as usize;
+        if !self.is_open(descriptor) || self.files.get(index).copied().flatten().is_none() {
+            return Err(Error::InvalidHandle);
+        }
+        let base = match whence {
+            0 => 0,
+            1 => self.offsets[index],
+            2 => file_length,
+            _ => return Err(Error::InvalidInput),
+        };
+        self.offsets[index] = if offset >= 0 {
+            base.checked_add(offset as u64)
+        } else {
+            base.checked_sub(offset.unsigned_abs())
+        }
+        .filter(|&position| position <= i64::MAX as u64)
+        .ok_or(Error::OutOfRange)?;
+        Ok(self.offsets[index])
+    }
+
     /// Close an open descriptor, rejecting unknown or already closed slots.
     pub fn close(&mut self, descriptor: u32) -> Result<()> {
         match self.open.get_mut(descriptor as usize) {
@@ -178,6 +208,24 @@ mod tests {
         assert_eq!(table.file(descriptor), None);
         assert_eq!(table.offset(descriptor), 0);
         assert_eq!(table.open_file(FileId(2)), Ok(3));
+    }
+
+    #[test]
+    fn file_seeks_are_signed_and_transactional() {
+        let mut table = DescriptorTable::<5>::with_standard_streams();
+        let descriptor = table.open_file(FileId(0)).unwrap();
+        assert_eq!(table.seek(descriptor, 4, 0, 14), Ok(4));
+        assert_eq!(table.seek(descriptor, -2, 1, 14), Ok(2));
+        assert_eq!(table.seek(descriptor, -1, 2, 14), Ok(13));
+        assert_eq!(table.seek(descriptor, -1, 0, 14), Err(Error::OutOfRange));
+        assert_eq!(table.offset(descriptor), 13);
+        assert_eq!(table.seek(descriptor, i64::MAX, 0, 14), Ok(i64::MAX as u64));
+        assert_eq!(table.seek(descriptor, 1, 1, 14), Err(Error::OutOfRange));
+        assert_eq!(table.offset(descriptor), i64::MAX as u64);
+        assert_eq!(table.seek(descriptor, 0, 3, 14), Err(Error::InvalidInput));
+        assert_eq!(table.seek(1, 0, 0, 14), Err(Error::InvalidHandle));
+        table.close(descriptor).unwrap();
+        assert_eq!(table.seek(descriptor, 0, 0, 14), Err(Error::InvalidHandle));
     }
 
     #[test]
