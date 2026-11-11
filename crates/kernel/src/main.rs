@@ -9,7 +9,7 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{RequestsEndMarker, RequestsStartMarker, StackSizeRequest};
+use limine::request::{MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest};
 
 mod gdt;
 mod idt;
@@ -27,6 +27,10 @@ static REQUESTS_START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(0x100000);
 
 #[used]
+#[unsafe(link_section = ".requests")]
+static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
@@ -38,6 +42,11 @@ pub extern "C" fn _start() -> ! {
     }
     serial::init();
     serial::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
+    if let Some(response) = MEMORY_MAP_REQUEST.get_response() {
+        serial::write_str("WUXIA_MEMORY_MAP_READY\n");
+    } else {
+        panic!("Limine did not provide a memory map");
+    }
     halt_forever()
 }
 
