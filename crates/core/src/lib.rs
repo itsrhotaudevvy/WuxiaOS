@@ -49,6 +49,7 @@ pub mod region;
 pub mod registry;
 pub mod rlimit;
 pub mod schedule;
+pub mod security_descriptor;
 pub mod sid;
 pub mod signal;
 pub mod syscall;

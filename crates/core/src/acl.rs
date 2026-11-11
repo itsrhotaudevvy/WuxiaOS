@@ -194,6 +194,31 @@ impl<'a> Acl<'a> {
         self.ace_count
     }
 
+    /// Return `AclSize`: the header plus every body byte, including slack.
+    pub const fn size(&self) -> usize {
+        ACL_HEADER_LEN + self.body.len()
+    }
+
+    /// Encode the ACL into the start of `out`, returning the bytes written.
+    ///
+    /// The reserved header bytes are written as zero, so the output is
+    /// byte-identical to the first `AclSize` bytes that were parsed. Fails
+    /// with [`Error::OutOfRange`] if `out` is shorter than [`Acl::size`].
+    pub fn write(&self, out: &mut [u8]) -> Result<usize> {
+        let size = self.size();
+        let [size_lo, size_hi] = u16::try_from(size)
+            .map_err(|_| Error::OutOfRange)?
+            .to_le_bytes();
+        let [count_lo, count_hi] = self.ace_count.to_le_bytes();
+        let encoded = out.get_mut(..size).ok_or(Error::OutOfRange)?;
+        let (header, body) = encoded
+            .split_at_mut_checked(ACL_HEADER_LEN)
+            .ok_or(Error::OutOfRange)?;
+        header.copy_from_slice(&[self.revision, 0, size_lo, size_hi, count_lo, count_hi, 0, 0]);
+        body.copy_from_slice(self.body);
+        Ok(size)
+    }
+
     /// Iterate over the allowed and denied ACEs in order.
     ///
     /// Inherit-only ACEs are skipped. After a parse error the iterator yields
@@ -650,6 +675,24 @@ mod tests {
             &bad_revision,
         )]);
         assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn write_reproduces_parsed_bytes() {
+        // Include slack inside AclSize so it must be carried through.
+        let mut buf = dacl(&[ace(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &ALICE)]);
+        buf[2..4].copy_from_slice(&40u16.to_le_bytes());
+        let acl = Acl::parse(&buf).unwrap();
+        assert_eq!(acl.size(), 40);
+
+        let mut out = [0xeeu8; 64];
+        assert_eq!(acl.write(&mut out), Ok(40));
+        assert_eq!(out[..40], buf[..40]);
+        assert_eq!(Acl::parse(&out).unwrap(), acl);
+
+        for len in 0..40 {
+            assert_eq!(acl.write(&mut out[..len]), Err(Error::OutOfRange));
+        }
     }
 
     #[test]
