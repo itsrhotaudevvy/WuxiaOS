@@ -1,7 +1,9 @@
 //! Host-side build, test, ISO and QEMU orchestration for WuxiaOS.
 
+mod host;
+
+use host::{HostOs, Tool};
 use std::env;
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -169,6 +171,42 @@ fn elf_info() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The linker for the bare-metal build and whether it is rustup's `rust-lld`.
+///
+/// A host without LLVM installed still has `rust-lld` in the selected
+/// toolchain, so a missing `ld.lld` falls back to it instead of failing.
+fn linker_tool(rustc: &str) -> (PathBuf, bool) {
+    match tool(Tool::Lld) {
+        host::Resolved::At(path) => (PathBuf::from(path), false),
+        host::Resolved::OnPath(name) => match find_on_path(&name) {
+            Some(path) => (path, false),
+            None => match rust_lld(rustc) {
+                Some(path) => (path, true),
+                None => (PathBuf::from(name), false),
+            },
+        },
+    }
+}
+
+/// The `rust-lld` shipped beside the selected compiler.
+fn rust_lld(rustc: &str) -> Option<PathBuf> {
+    let verbose = Command::new(rustc).arg("-vV").output().ok()?;
+    if !verbose.status.success() {
+        return None;
+    }
+    let host = host::host_triple_from_rustc_verbose(&String::from_utf8_lossy(&verbose.stdout))?;
+    let sysroot = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    if !sysroot.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_owned();
+    let path = host::rust_lld_path(&sysroot, &host, HostOs::current());
+    Path::new(&path).is_file().then(|| PathBuf::from(path))
+}
+
 fn build_kernel() -> ExitCode {
     let rustc = Command::new("rustup")
         .args(["which", "rustc"])
@@ -180,13 +218,9 @@ fn build_kernel() -> ExitCode {
         eprintln!("rustup is required to select the x86_64 kernel toolchain");
         return ExitCode::FAILURE;
     };
-    let lld = env::var("WUXIA_LLD").unwrap_or_else(|_| {
-        if Path::new("/opt/homebrew/bin/ld.lld").exists() {
-            "/opt/homebrew/bin/ld.lld".into()
-        } else {
-            "ld.lld".into()
-        }
-    });
+    let (linker, rust_lld) = linker_tool(&rustc);
+    let linker = linker.to_string_lossy().into_owned();
+    let rustflags = host::encoded_linker_rustflags(&linker, rust_lld);
     let mut user = Command::new("cargo");
     user.env("RUSTC", &rustc);
     user.args([
@@ -198,7 +232,7 @@ fn build_kernel() -> ExitCode {
         "--target-dir",
         "target/user",
     ]);
-    user.env("RUSTFLAGS", format!("-C linker={lld}"));
+    user.env("CARGO_ENCODED_RUSTFLAGS", &rustflags);
     if !run(&mut user) {
         return ExitCode::FAILURE;
     }
@@ -220,7 +254,7 @@ fn build_kernel() -> ExitCode {
         "--target-dir",
         "target/kernel",
     ]);
-    command.env("RUSTFLAGS", format!("-C linker={lld}"));
+    command.env("CARGO_ENCODED_RUSTFLAGS", &rustflags);
     if run(&mut command) {
         ExitCode::SUCCESS
     } else {
@@ -236,12 +270,30 @@ const LIMINE_BOOT_FILES: &[&str] = &[
 ];
 /// UEFI loader copied into `EFI/BOOT` on the ISO.
 const LIMINE_UEFI_LOADER: &str = "BOOTX64.EFI";
-/// Well-known installation data directories, checked after PATH discovery.
-const WELL_KNOWN_LIMINE_DIRS: &[&str] = &[
-    "/opt/homebrew/share/limine",
-    "/usr/local/share/limine",
-    "/usr/share/limine",
-];
+/// Environment lookups for the host rules; empty values count as unset.
+fn getenv(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The directories of `PATH`, split as the host OS does.
+fn path_dirs(os: HostOs) -> Vec<String> {
+    env::var_os("PATH")
+        .map(|value| host::split_search_path(&value.to_string_lossy(), os))
+        .unwrap_or_default()
+}
+
+/// Decide how to run a host tool, including Windows install locations.
+fn tool(tool: Tool) -> host::Resolved {
+    let os = HostOs::current();
+    host::resolve_tool(tool, os, &getenv, &path_dirs(os), |path| {
+        Path::new(path).is_file()
+    })
+}
+
+/// Installation data directories the host OS uses for Limine.
+fn well_known_limine_dirs() -> Vec<String> {
+    host::well_known_limine_dirs(HostOs::current(), &getenv)
+}
 
 /// Every Limine data file the ISO step needs, in copy order.
 fn limine_required_files() -> impl Iterator<Item = &'static str> {
@@ -358,9 +410,13 @@ where
 
 /// Candidate order after the environment override: the `--print-datadir`
 /// result, the PATH-derived location, then the well-known directories.
-fn discovery_candidates(datadir: Candidate, path_binary: Candidate) -> Vec<Candidate> {
+fn discovery_candidates(
+    datadir: Candidate,
+    path_binary: Candidate,
+    well_known: &[String],
+) -> Vec<Candidate> {
     let mut candidates = vec![datadir, path_binary];
-    candidates.extend(WELL_KNOWN_LIMINE_DIRS.iter().map(|dir| Candidate {
+    candidates.extend(well_known.iter().map(|dir| Candidate {
         source: "well-known location".to_owned(),
         dir: Some(PathBuf::from(dir)),
     }));
@@ -369,17 +425,13 @@ fn discovery_candidates(datadir: Candidate, path_binary: Candidate) -> Vec<Candi
 
 /// Map `<prefix>/bin/limine` to `<prefix>/share/limine`.
 fn prefix_data_dir(binary: &Path) -> Option<PathBuf> {
-    let bin = binary.parent()?;
-    if bin.file_name() != Some(OsStr::new("bin")) {
-        return None;
-    }
-    Some(bin.parent()?.join("share").join("limine"))
+    host::prefix_data_dir(&binary.to_string_lossy(), HostOs::current()).map(PathBuf::from)
 }
 
 /// Ask the `limine` command for its data directory. Failure is not an error:
 /// older Limine releases lack `--print-datadir`.
 fn probe_datadir_command() -> Candidate {
-    let dir = Command::new("limine")
+    let dir = Command::new(tool(Tool::Limine).program())
         .arg("--print-datadir")
         .stderr(Stdio::null())
         .output()
@@ -396,10 +448,9 @@ fn probe_datadir_command() -> Candidate {
 
 /// Find the first `name` on PATH, as the shell would run it.
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    let os = HostOs::current();
+    host::find_in_dirs(name, &path_dirs(os), os, |path| Path::new(path).is_file())
+        .map(PathBuf::from)
 }
 
 /// Derive the data directory from the `limine` binary on PATH.
@@ -421,7 +472,11 @@ fn discover_limine_dir() -> Result<PathBuf, DiscoveryError> {
     let env_dir = env::var_os("WUXIA_LIMINE_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
-    let candidates = discovery_candidates(probe_datadir_command(), probe_path_binary());
+    let candidates = discovery_candidates(
+        probe_datadir_command(),
+        probe_path_binary(),
+        &well_known_limine_dirs(),
+    );
     select_limine_dir(env_dir, &candidates, |dir, file| dir.join(file).is_file())
 }
 
@@ -477,7 +532,7 @@ fn build_iso() -> ExitCode {
         eprintln!("cannot copy UEFI loader");
         return ExitCode::FAILURE;
     }
-    let mut xorriso = Command::new("xorriso");
+    let mut xorriso = Command::new(tool(Tool::Xorriso).program());
     xorriso.args([
         "-as",
         "mkisofs",
@@ -499,7 +554,7 @@ fn build_iso() -> ExitCode {
     if !run(&mut xorriso) {
         return ExitCode::FAILURE;
     }
-    let mut limine = Command::new("limine");
+    let mut limine = Command::new(tool(Tool::Limine).program());
     limine.args(["bios-install", "target/wuxia.iso"]);
     if run(&mut limine) {
         ExitCode::SUCCESS
@@ -516,7 +571,7 @@ fn qemu_test() -> ExitCode {
     let log = PathBuf::from("target/serial.log");
     let _ = fs::remove_file(&log);
     let serial = format!("file:{}", log.display());
-    let child = Command::new("qemu-system-x86_64")
+    let child = Command::new(tool(Tool::Qemu).program())
         .args([
             "-M",
             "q35",
@@ -552,12 +607,8 @@ fn qemu_test() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let serial_text = fs::read_to_string(&log).unwrap_or_default();
-    let missing: Vec<&str> = BOOT_MARKERS
-        .iter()
-        .copied()
-        .filter(|marker| !serial_text.contains(marker))
-        .collect();
+    let serial_text = host::normalize_serial(&fs::read(&log).unwrap_or_default());
+    let missing = host::missing_markers(&serial_text, BOOT_MARKERS);
     if !missing.is_empty() {
         eprintln!("boot log is missing markers: {missing:?}");
         eprintln!("--- serial log ---\n{serial_text}");
@@ -581,7 +632,7 @@ fn qemu_run() -> ExitCode {
     if build_iso() != ExitCode::SUCCESS {
         return ExitCode::FAILURE;
     }
-    let mut command = Command::new("qemu-system-x86_64");
+    let mut command = Command::new(tool(Tool::Qemu).program());
     command.args([
         "-M",
         "q35",
@@ -799,20 +850,15 @@ mod tests {
 
     #[test]
     fn candidate_order_is_datadir_then_path_then_well_known() {
-        let candidates = discovery_candidates(at("datadir", "/d"), at("path", "/p"));
+        let well_known = ["/w/one".to_owned(), "/w/two".to_owned()];
+        let candidates = discovery_candidates(at("datadir", "/d"), at("path", "/p"), &well_known);
         let dirs: Vec<Option<&str>> = candidates
             .iter()
             .map(|c| c.dir.as_deref().and_then(Path::to_str))
             .collect();
         assert_eq!(
             dirs,
-            [
-                Some("/d"),
-                Some("/p"),
-                Some("/opt/homebrew/share/limine"),
-                Some("/usr/local/share/limine"),
-                Some("/usr/share/limine"),
-            ]
+            [Some("/d"), Some("/p"), Some("/w/one"), Some("/w/two")]
         );
         assert_eq!(candidates[0].source, "datadir");
     }
