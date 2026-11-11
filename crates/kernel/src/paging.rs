@@ -8,8 +8,8 @@
 use core::arch::asm;
 
 use wuxia_core::Error;
-use wuxia_core::elf::{Elf64Image, ElfKind, ProgramSegment};
 use wuxia_core::hhdm::DirectMap;
+use wuxia_core::load::{LoadSegment, LoaderPlan};
 use wuxia_core::paging::{
     ENTRIES_PER_TABLE, PAGE_SIZE, PagePermissions, PageTableReader, USER_ADDRESS_LIMIT, is_present,
     leaf, physical_address, table_entry, table_index, walk,
@@ -60,46 +60,18 @@ impl UserImage {
 ///
 /// Every loadable segment gets independently allocated frames, so the image
 /// never aliases kernel memory. Writable and executable segments are rejected
-/// before any page is mapped.
+/// by the load plan before any page is mapped.
 pub fn load_user_image<const N: usize>(
     allocator: &mut BumpAllocator<N>,
     direct_map: DirectMap,
     bytes: &[u8],
 ) -> Result<UserImage, Error> {
-    let elf = Elf64Image::parse(bytes)?;
-    if elf.info().kind != ElfKind::Executable {
-        return Err(Error::Unsupported);
-    }
+    let plan = LoaderPlan::<MAX_USER_SEGMENTS>::from_elf(bytes)?;
     let old_pml4 = read_cr3();
     let old_root = frame_pointer(direct_map, old_pml4)?;
 
-    let mut plan = [None; MAX_USER_SEGMENTS];
-    let mut count = 0;
-    for index in 0..elf.program_header_count() {
-        let segment = match elf.segment(index) {
-            Ok(segment) => segment,
-            Err(Error::NotFound) => continue,
-            Err(error) => return Err(error),
-        };
-        if segment.is_writable_and_executable() {
-            return Err(Error::PermissionDenied);
-        }
-        if count >= MAX_USER_SEGMENTS {
-            return Err(Error::OutOfRange);
-        }
-        if !segment.virtual_address.is_multiple_of(PAGE_SIZE)
-            || segment.memory_end()? > USER_ADDRESS_LIMIT
-        {
-            return Err(Error::BadAddress);
-        }
-        plan[count] = Some(segment);
-        count += 1;
-    }
-    if count == 0 {
-        return Err(Error::InvalidImage);
-    }
-
-    let slot = table_index(plan[0].expect("at least one segment").virtual_address, 0)?;
+    let first = plan.segments().next().ok_or(Error::InvalidImage)?;
+    let slot = table_index(first.address, 0)?;
     if is_present(read_entry(old_root, slot)) {
         return Err(Error::AlreadyExists);
     }
@@ -108,22 +80,15 @@ pub fn load_user_image<const N: usize>(
     zero_frame(direct_map, pdpt)?;
 
     let mut segments = [None; MAX_USER_SEGMENTS];
-    for (index, segment) in plan[..count].iter().flatten().enumerate() {
-        if table_index(segment.virtual_address, 0)? != slot {
+    for (index, segment) in plan.segments().enumerate() {
+        if table_index(segment.address, 0)? != slot {
             return Err(Error::Unsupported);
         }
-        let permissions = if segment.is_writable() {
-            PagePermissions::USER_READ_WRITE
-        } else if segment.is_executable() {
-            PagePermissions::USER_CODE
-        } else {
-            PagePermissions::USER_READ_ONLY
-        };
-        let pages = segment.memory_size.div_ceil(PAGE_SIZE);
+        let pages = segment.page_count();
         let mut first_entry = 0;
         for page in 0..pages {
             let address = segment
-                .virtual_address
+                .address
                 .checked_add(page * PAGE_SIZE)
                 .ok_or(Error::OutOfRange)?;
             if table_index(address, 0)? != slot || address >= USER_ADDRESS_LIMIT {
@@ -132,26 +97,28 @@ pub fn load_user_image<const N: usize>(
             let frame = allocator.allocate_frame().ok_or(Error::TableFull)?;
             zero_frame(direct_map, frame)?;
             copy_segment_bytes(direct_map, frame, address, segment, bytes)?;
-            let entry = map_page(allocator, direct_map, pdpt, address, frame, permissions)?;
+            let entry = map_page(
+                allocator,
+                direct_map,
+                pdpt,
+                address,
+                frame,
+                segment.permissions,
+            )?;
             if page == 0 {
                 first_entry = entry;
             }
         }
         segments[index] = Some(UserSegment {
-            address: segment.virtual_address,
+            address: segment.address,
             length: pages * PAGE_SIZE,
             entry: first_entry,
-            permissions,
+            permissions: segment.permissions,
         });
     }
 
-    let highest = segments
-        .iter()
-        .flatten()
-        .map(|segment| segment.address + segment.length)
-        .max()
-        .ok_or(Error::InvalidImage)?;
-    if highest >= USER_ADDRESS_LIMIT || table_index(highest, 0)? != slot {
+    let stack_address = plan.max_end()?;
+    if stack_address >= USER_ADDRESS_LIMIT || table_index(stack_address, 0)? != slot {
         return Err(Error::BadAddress);
     }
     let stack_physical = allocator.allocate_frame().ok_or(Error::TableFull)?;
@@ -160,7 +127,7 @@ pub fn load_user_image<const N: usize>(
         allocator,
         direct_map,
         pdpt,
-        highest,
+        stack_address,
         stack_physical,
         PagePermissions::USER_READ_WRITE,
     )?;
@@ -176,8 +143,8 @@ pub fn load_user_image<const N: usize>(
     Ok(UserImage {
         old_pml4,
         new_pml4,
-        entry: elf.entry(),
-        stack_address: highest,
+        entry: plan.entry(),
+        stack_address,
         stack_entry,
         segments,
     })
@@ -235,21 +202,21 @@ fn copy_segment_bytes(
     direct_map: DirectMap,
     frame: u64,
     page_address: u64,
-    segment: &ProgramSegment,
+    segment: &LoadSegment,
     bytes: &[u8],
 ) -> Result<(), Error> {
     let segment_end = segment
-        .virtual_address
+        .address
         .checked_add(segment.file_size)
         .ok_or(Error::OutOfRange)?;
     let page_end = page_address + PAGE_SIZE;
-    let copy_start = segment.virtual_address.max(page_address);
+    let copy_start = segment.address.max(page_address);
     let copy_end = segment_end.min(page_end);
     if copy_start >= copy_end {
         return Ok(());
     }
     let offset = (copy_start - page_address) as usize;
-    let file_start = segment.file_offset + (copy_start - segment.virtual_address) as usize;
+    let file_start = segment.file_offset + (copy_start - segment.address) as usize;
     let length = (copy_end - copy_start) as usize;
     let source = bytes
         .get(file_start..file_start + length)

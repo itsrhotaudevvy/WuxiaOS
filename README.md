@@ -6,7 +6,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 ## Repository layout
 
-- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE and ELF64 metadata parsing, physical frames, HHDM translation, x86_64 paging encoding, a table walker, a per-process address-space model, a process lifecycle model, a POSIX descriptor table and syscall vocabulary.
+- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE and ELF64 metadata parsing, physical frames, HHDM translation, x86_64 paging encoding, a table walker, a per-process address-space model, a process lifecycle model, a POSIX descriptor table, a validated ELF load plan and syscall vocabulary.
 - `crates/kernel`: the real `no_std` x86_64 Limine kernel, bootstrap serial console, descriptor tables, physical-memory allocator and bootstrap page-table construction.
 - `crates/xtask`: host-side build, test, ISO and QEMU orchestration.
 - `docs`: architecture, security, compatibility and research decisions.
@@ -18,7 +18,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
 - The kernel validates Limine's HHDM offset, builds a four-level page-table chain for a user code page and stack, clones the active PML4 into a fresh root, loads that root into CR3 and re-resolves both pages through the active tables.
 - `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X.
-- 58 `wuxia-core` host tests pass.
+- 64 `wuxia-core` host tests pass.
 - PE and ELF64 parsing validate container metadata and segment ranges only. No Windows program or driver is executed yet.
 - The GDT, user segments, TSS and an IDT with CPL0/CPL3 gates are loaded; the `int3` self-test returns through the full stub path.
 - A separate `wuxia-user` crate is linked at 512 GiB and embedded in the kernel. The loader parses its ELF64 program headers, allocates and zero-fills frames per segment, applies per-segment permissions and maps the entry point.
