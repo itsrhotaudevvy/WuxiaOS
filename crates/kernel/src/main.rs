@@ -13,6 +13,7 @@ use limine::request::{
     HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
 };
 
+mod cpu;
 mod gdt;
 mod idt;
 mod interrupts;
@@ -69,6 +70,24 @@ pub extern "C" fn _start() -> ! {
     log::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
     gdt::init();
     log::write_str("WUXIA_GDT_OK\n");
+    let hardening = cpu::harden();
+    log::write_str("WUXIA_CPU_HARDENING_OK\n");
+    log::write_hex(hardening.bits());
+    if hardening.write_protect {
+        log::write_str("WUXIA_WP_OK\n");
+    }
+    if hardening.no_execute {
+        log::write_str("WUXIA_NX_OK\n");
+    }
+    if hardening.smep {
+        log::write_str("WUXIA_SMEP_OK\n");
+    }
+    if hardening.smap {
+        log::write_str("WUXIA_SMAP_OK\n");
+    }
+    if hardening.umip {
+        log::write_str("WUXIA_UMIP_OK\n");
+    }
     idt::self_test();
     interrupts::init(interrupts::TIMER_HZ as u32);
     log::write_str("WUXIA_TIMER_STARTED\n");

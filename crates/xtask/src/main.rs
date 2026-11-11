@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 
 /// Markers every successful boot must print, in order-independent presence.
 const BOOT_MARKERS: &[&str] = &[
+    "WUXIA_CPU_HARDENING_OK",
+    "WUXIA_WP_OK",
+    "WUXIA_NX_OK",
+    "WUXIA_SMEP_OK",
+    "WUXIA_SMAP_OK",
+    "WUXIA_UMIP_OK",
     "WUXIA_BOOT_OK",
     "WUXIA_GDT_OK",
     "WUXIA_BREAKPOINT_OK",
@@ -581,6 +587,10 @@ fn qemu_test() -> ExitCode {
         .args([
             "-M",
             "q35",
+            // A CPU model with SMEP, SMAP and UMIP lets the boot exercise the
+            // hardening path instead of silently skipping it.
+            "-cpu",
+            "max",
             "-m",
             "128M",
             "-display",
@@ -642,6 +652,9 @@ fn qemu_run() -> ExitCode {
     command.args([
         "-M",
         "q35",
+        // Keep the interactive runner on the same CPU features as the test.
+        "-cpu",
+        "max",
         "-m",
         "128M",
         "-display",

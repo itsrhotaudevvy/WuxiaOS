@@ -94,7 +94,7 @@ WUXIA_LIMINE_DIR=/path/to/limine/share/limine cargo run -p wuxia-xtask -- iso
 
 WuxiaOS has an architecture-independent executive with separate POSIX and NT personalities. POSIX and NT share objects, memory and scheduling primitives but retain their own names, status codes, handles and process semantics. Compatibility is staged: PE metadata and NT vocabulary exist; Windows application and driver execution do not yet exist.
 
-Security design takes inspiration from OpenBSD's attack-surface reduction, least privilege, pledge/unveil-style confinement and W^X. Performance work is guided by measured Linux designs and batching/NUMA/cache behavior, not slogans. No system is "bulletproof"; security claims are tied to concrete implementation and test coverage.
+Security design takes inspiration from OpenBSD's attack-surface reduction, least privilege, pledge/unveil-style confinement and W^X. Every boot enables the hardware the CPU offers: `CR0.WP`, `EFER.NXE`, `CR4.SMEP`, `CR4.SMAP` and `CR4.UMIP`, checked with CPUID before use and verified from the serial log; `qemu-test` selects `-cpu max` so those paths always run. Performance work is guided by measured Linux designs and batching/NUMA/cache behavior, not slogans. No system is "bulletproof"; security claims are tied to concrete implementation and test coverage.
 
 ## License
 
