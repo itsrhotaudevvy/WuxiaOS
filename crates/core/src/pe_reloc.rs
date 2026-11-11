@@ -7,6 +7,7 @@
 //! buffer, and only after every entry has been validated.
 
 use crate::error::{Error, Result};
+use crate::pe_common::{optional_header, read_u16, read_u32};
 
 /// Number of data directory slots the PE format can describe.
 pub const DIRECTORY_ENTRY_COUNT: usize = 16;
@@ -23,9 +24,6 @@ pub const REL_BASED_DIR64: u8 = 10;
 
 const PE32_MAGIC: u16 = 0x10b;
 const PE32_PLUS_MAGIC: u16 = 0x20b;
-const LFANEW_OFFSET: usize = 0x3c;
-const SIZE_OF_OPTIONAL_OFFSET: usize = 20;
-const OPTIONAL_OFFSET: usize = 24;
 const NUMBER_OF_RVA_AND_SIZES_OFFSET: usize = 108;
 const DIRECTORIES_OFFSET: usize = 112;
 const DIRECTORY_SIZE: usize = 8;
@@ -89,23 +87,7 @@ pub fn data_directory(image: &[u8], index: usize) -> Result<DataDirectory> {
     if index >= DIRECTORY_ENTRY_COUNT {
         return Err(Error::InvalidInput);
     }
-    if image.len() < 0x40 || image.get(..2) != Some(b"MZ") {
-        return Err(Error::InvalidImage);
-    }
-    let pe = read_u32(image, LFANEW_OFFSET)? as usize;
-    let signature_end = pe.checked_add(4).ok_or(Error::InvalidImage)?;
-    if image.get(pe..signature_end) != Some(b"PE\0\0") {
-        return Err(Error::InvalidImage);
-    }
-    let size_offset = offset_at(pe, SIZE_OF_OPTIONAL_OFFSET)?;
-    let optional_size = read_u16(image, size_offset)? as usize;
-    let optional_offset = offset_at(pe, OPTIONAL_OFFSET)?;
-    let optional_end = optional_offset
-        .checked_add(optional_size)
-        .ok_or(Error::InvalidImage)?;
-    let optional = image
-        .get(optional_offset..optional_end)
-        .ok_or(Error::InvalidImage)?;
+    let optional = optional_header(image)?;
     match read_u16(optional, 0)? {
         PE32_PLUS_MAGIC => {}
         PE32_MAGIC => return Err(Error::Unsupported),
@@ -260,25 +242,10 @@ fn dir64_target(limit: usize, page_rva: u32, offset: u16) -> Result<usize> {
     usize::try_from(start).map_err(|_| Error::InvalidImage)
 }
 
-fn offset_at(base: usize, delta: usize) -> Result<usize> {
-    base.checked_add(delta).ok_or(Error::InvalidImage)
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    let end = offset.checked_add(2).ok_or(Error::InvalidImage)?;
-    let bytes = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let end = offset.checked_add(4).ok_or(Error::InvalidImage)?;
-    let bytes = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pe_common::{LFANEW_OFFSET, OPTIONAL_OFFSET};
 
     const PE_OFFSET: usize = 0x40;
     const OPTIONAL: usize = PE_OFFSET + OPTIONAL_OFFSET;

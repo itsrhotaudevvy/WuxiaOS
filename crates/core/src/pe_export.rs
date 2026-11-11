@@ -14,7 +14,10 @@
 //! inside a section.
 
 use crate::error::{Error, Result};
-use crate::pe_import::{MAX_NAME_LEN, SectionRange};
+use crate::pe_common::{
+    MAX_NAME_LEN, SectionRange, is_printable, read_array, read_name, read_u16, read_u32, resolve,
+    slice_at, table_bytes,
+};
 use crate::pe_reloc;
 use core::cmp::Ordering;
 
@@ -129,13 +132,13 @@ impl<'a> ExportDirectory<'a> {
         // Layout: Characteristics, TimeDateStamp, Version (4 bytes), Name, Base,
         // NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames,
         // AddressOfNameOrdinals.
-        let name_rva = header_u32(&raw, 12);
-        let base = header_u32(&raw, 16);
-        let number_of_functions = header_u32(&raw, 20);
-        let number_of_names = header_u32(&raw, 24);
-        let functions_rva = header_u32(&raw, 28);
-        let names_rva = header_u32(&raw, 32);
-        let ordinals_rva = header_u32(&raw, 36);
+        let name_rva = read_u32(&raw, 12)?;
+        let base = read_u32(&raw, 16)?;
+        let number_of_functions = read_u32(&raw, 20)?;
+        let number_of_names = read_u32(&raw, 24)?;
+        let functions_rva = read_u32(&raw, 28)?;
+        let names_rva = read_u32(&raw, 32)?;
+        let ordinals_rva = read_u32(&raw, 36)?;
 
         if number_of_functions > MAX_EXPORTS || number_of_names > MAX_EXPORTS {
             return Err(Error::TableFull);
@@ -378,54 +381,6 @@ fn check_forwarder_ordinal(digits: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn is_printable(byte: u8) -> bool {
-    (0x20..=0x7e).contains(&byte)
-}
-
-/// Translate an RVA to its file offset and the bytes readable from there.
-///
-/// Returns `(offset, available)` where `available` counts bytes up to the end
-/// of the containing section's raw data, clipped to the image length.
-fn resolve(bytes: &[u8], sections: &[SectionRange], rva: u32) -> Result<(usize, usize)> {
-    for section in sections {
-        let delta = match rva.checked_sub(section.virtual_address) {
-            Some(delta) => delta,
-            None => continue,
-        };
-        if delta >= section.raw_size {
-            continue;
-        }
-        let offset = section
-            .raw_offset
-            .checked_add(delta as usize)
-            .ok_or(Error::InvalidImage)?;
-        let raw_end = section
-            .raw_offset
-            .checked_add(section.raw_size as usize)
-            .ok_or(Error::InvalidImage)?;
-        let limit = raw_end.min(bytes.len());
-        if offset >= limit {
-            return Err(Error::InvalidImage);
-        }
-        return Ok((offset, limit - offset));
-    }
-    Err(Error::InvalidImage)
-}
-
-/// Read a fixed-size value at an RVA, confined to one section's raw data.
-fn read_array<const N: usize>(
-    bytes: &[u8],
-    sections: &[SectionRange],
-    rva: u32,
-) -> Result<[u8; N]> {
-    let (offset, available) = resolve(bytes, sections, rva)?;
-    if available < N {
-        return Err(Error::InvalidImage);
-    }
-    let source = slice_at(bytes, offset, N)?;
-    <[u8; N]>::try_from(source).map_err(|_| Error::InvalidImage)
-}
-
 /// Resolve a table of `count` entries of `entry` bytes each.
 ///
 /// A zero count yields an empty table without touching `rva`. Otherwise the
@@ -443,57 +398,19 @@ fn table<'a>(
     let len = (count as usize)
         .checked_mul(entry)
         .ok_or(Error::InvalidImage)?;
-    let (offset, available) = resolve(bytes, sections, rva)?;
-    if available < len {
-        return Err(Error::InvalidImage);
-    }
-    slice_at(bytes, offset, len)
-}
-
-/// Read a NUL-terminated printable ASCII name of at most `MAX_NAME_LEN` bytes.
-///
-/// The terminator must appear inside the containing section's raw data.
-fn read_name<'a>(bytes: &'a [u8], sections: &[SectionRange], rva: u32) -> Result<&'a str> {
-    let (offset, available) = resolve(bytes, sections, rva)?;
-    // Scan at most one byte past the maximum so an over-long name is detected.
-    let window = slice_at(bytes, offset, available.min(MAX_NAME_LEN + 1))?;
-    let nul = window
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(Error::InvalidName)?;
-    if nul == 0 {
-        return Err(Error::InvalidName);
-    }
-    let text = window.get(..nul).ok_or(Error::InvalidName)?;
-    if !text.iter().all(|&b| is_printable(b)) {
-        return Err(Error::InvalidName);
-    }
-    core::str::from_utf8(text).map_err(|_| Error::InvalidName)
-}
-
-fn slice_at(bytes: &[u8], offset: usize, len: usize) -> Result<&[u8]> {
-    let end = offset.checked_add(len).ok_or(Error::InvalidImage)?;
-    bytes.get(offset..end).ok_or(Error::InvalidImage)
-}
-
-fn le_at<const N: usize>(table: &[u8], index: usize) -> Result<[u8; N]> {
-    let offset = index.checked_mul(N).ok_or(Error::InvalidImage)?;
-    let raw = slice_at(table, offset, N)?;
-    <[u8; N]>::try_from(raw).map_err(|_| Error::InvalidImage)
+    table_bytes(bytes, sections, rva, len)
 }
 
 fn u32_at(table: &[u8], index: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(le_at(table, index)?))
+    read_u32(table, entry_offset(index, 4)?)
 }
 
 fn u16_at(table: &[u8], index: usize) -> Result<u16> {
-    Ok(u16::from_le_bytes(le_at(table, index)?))
+    read_u16(table, entry_offset(index, 2)?)
 }
 
-fn header_u32(raw: &[u8; EXPORT_DIRECTORY_SIZE], offset: usize) -> u32 {
-    let mut value = [0u8; 4];
-    value.copy_from_slice(&raw[offset..offset + 4]);
-    u32::from_le_bytes(value)
+fn entry_offset(index: usize, width: usize) -> Result<usize> {
+    index.checked_mul(width).ok_or(Error::InvalidImage)
 }
 
 #[cfg(test)]
