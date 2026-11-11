@@ -387,21 +387,39 @@ fn service_syscall(frame: &mut InterruptFrame) {
             }
         }
         Ok(wuxia_core::syscall::PosixRequest::Write { descriptor, buffer }) => {
-            if descriptor != 1
-                || !crate::sched::descriptor_open(descriptor)
+            if !crate::sched::descriptor_open(descriptor)
                 || !crate::sched::region_contains(buffer.address, buffer.length)
             {
                 serial::write_str("WUXIA_SYSCALL_REJECTED\n");
                 frame.rax = u64::MAX;
                 return;
             }
-            match copy_user_to_serial(buffer.address, buffer.length) {
-                Ok(()) => {
-                    serial::write_str("WUXIA_SYSCALL_WRITE_OK\n");
-                    frame.rax = buffer.length;
+            if descriptor == 1 || descriptor == 2 {
+                match copy_user_to_serial(buffer.address, buffer.length) {
+                    Ok(()) => {
+                        serial::write_str("WUXIA_SYSCALL_WRITE_OK\n");
+                        frame.rax = buffer.length;
+                    }
+                    Err(_) => {
+                        serial::write_str("WUXIA_SYSCALL_FAULT\n");
+                        frame.rax = u64::MAX;
+                    }
                 }
-                Err(_) => {
-                    serial::write_str("WUXIA_SYSCALL_FAULT\n");
+                return;
+            }
+            let length = buffer.length.min(wuxia_core::syscall::MAX_READ_LENGTH) as usize;
+            let mut scratch = [0u8; wuxia_core::syscall::MAX_READ_LENGTH as usize];
+            let stored = copy_user_bytes(buffer.address, length as u64, &mut scratch)
+                .ok()
+                .and_then(|count| crate::sched::write_file(descriptor, &scratch[..count]));
+            match stored {
+                Some(count) => {
+                    serial::write_str("WUXIA_SYSCALL_FILE_WRITE_OK\n");
+                    serial::write_hex(count as u64);
+                    frame.rax = count as u64;
+                }
+                None => {
+                    serial::write_str("WUXIA_SYSCALL_INVALID\n");
                     frame.rax = u64::MAX;
                 }
             }

@@ -161,6 +161,25 @@ pub fn advance_descriptor(descriptor: u32, count: u64) -> bool {
     }
 }
 
+/// Write into the file behind an open descriptor at its current offset.
+pub fn write_file(descriptor: u32, data: &[u8]) -> Option<usize> {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        let thread = threads[current].as_mut()?;
+        let file = thread.process.descriptors().file(descriptor)?;
+        let offset = thread.process.descriptors().offset(descriptor);
+        let count = crate::vfs::write(file, offset, data)?;
+        thread
+            .process
+            .descriptors_mut()
+            .advance(descriptor, count as u64)
+            .ok()?;
+        Some(count)
+    }
+}
+
 /// Whether `[address, address + length)` is mapped by the running process.
 pub fn region_contains(address: u64, length: u64) -> bool {
     current_thread().is_some_and(|thread| thread.process.space().contains(address, length))

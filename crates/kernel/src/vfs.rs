@@ -24,6 +24,17 @@ pub fn lookup(name: &str) -> Option<FileId> {
     unsafe { (*core::ptr::addr_of_mut!(FS)).as_ref()?.lookup(name).ok() }
 }
 
+/// Write into a file at `offset` and return the byte count stored.
+pub fn write(file: FileId, offset: u64, data: &[u8]) -> Option<usize> {
+    // SAFETY: syscalls are the only writer and traps never nest.
+    unsafe {
+        (*core::ptr::addr_of_mut!(FS))
+            .as_mut()?
+            .write(file, offset, data)
+            .ok()
+    }
+}
+
 /// Read from a file at `offset` into `out`.
 pub fn read(file: FileId, offset: u64, out: &mut [u8]) -> Option<usize> {
     // SAFETY: the store is installed once and never mutated afterwards.

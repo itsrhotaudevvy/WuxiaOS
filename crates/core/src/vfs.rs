@@ -140,6 +140,43 @@ impl<const FILES: usize, const BYTES: usize> MemFs<FILES, BYTES> {
         Ok(count)
     }
 
+    /// Write at `offset` and return the number of bytes stored.
+    ///
+    /// A file only grows when its data ends the store, so growth can never
+    /// overwrite a later file; otherwise the write is clipped to the current
+    /// length.
+    pub fn write(&mut self, file: FileId, offset: u64, data: &[u8]) -> Result<usize> {
+        let index = file.0 as usize;
+        let stored = self
+            .files
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(Error::NotFound)?;
+        let offset = usize::try_from(offset).map_err(|_| Error::BadAddress)?;
+        if offset > stored.length {
+            return Err(Error::BadAddress);
+        }
+        let can_grow = stored.start + stored.length == self.used;
+        let limit = if can_grow {
+            BYTES - stored.start
+        } else {
+            stored.length
+        };
+        let count = data.len().min(limit.saturating_sub(offset));
+        if count == 0 {
+            return Err(Error::TableFull);
+        }
+        let start = stored.start + offset;
+        self.data[start..start + count].copy_from_slice(&data[..count]);
+        let length = stored.length.max(offset + count);
+        if can_grow {
+            self.used = stored.start + length;
+        }
+        self.files[index] = Some(File { length, ..stored });
+        Ok(count)
+    }
+
     fn file(&self, file: FileId) -> Result<File> {
         self.files
             .get(file.0 as usize)
@@ -179,6 +216,42 @@ mod tests {
         assert_eq!(&out[..2], b"ef");
         assert_eq!(fs.read(file, 6, &mut out), Ok(0));
         assert_eq!(fs.read(file, 99, &mut out), Ok(0));
+    }
+
+    #[test]
+    fn writes_update_bytes_and_can_grow_the_last_file() {
+        let mut fs = MemFs::<4, 16>::new();
+        let file = fs.create("data", b"abc").unwrap();
+        assert_eq!(fs.write(file, 1, b"XY"), Ok(2));
+        let mut out = [0u8; 8];
+        assert_eq!(fs.read(file, 0, &mut out), Ok(3));
+        assert_eq!(&out[..3], b"aXY");
+
+        assert_eq!(fs.write(file, 3, b"defgh"), Ok(5));
+        assert_eq!(fs.len(file), Ok(8));
+        assert_eq!(fs.read(file, 3, &mut out), Ok(5));
+        assert_eq!(&out[..5], b"defgh");
+
+        assert_eq!(fs.write(file, 8, b"ijkl"), Ok(4));
+        assert_eq!(fs.write(file, 12, b"more"), Ok(4));
+        assert_eq!(fs.len(file), Ok(16));
+        assert_eq!(fs.write(file, 16, b"!"), Err(Error::TableFull));
+        assert_eq!(fs.write(file, 17, b"!"), Err(Error::BadAddress));
+        assert_eq!(fs.write(FileId(9), 0, b"x"), Err(Error::NotFound));
+    }
+
+    #[test]
+    fn a_file_followed_by_another_cannot_grow() {
+        let mut fs = MemFs::<4, 32>::new();
+        let first = fs.create("one", b"abc").unwrap();
+        fs.create("two", b"xyz").unwrap();
+        assert_eq!(fs.write(first, 0, b"12345"), Ok(3));
+        assert_eq!(fs.len(first), Ok(3));
+        let mut out = [0u8; 8];
+        assert_eq!(fs.read(first, 0, &mut out), Ok(3));
+        assert_eq!(&out[..3], b"123");
+        assert_eq!(fs.read(FileId(1), 0, &mut out), Ok(3));
+        assert_eq!(&out[..3], b"xyz");
     }
 
     #[test]
