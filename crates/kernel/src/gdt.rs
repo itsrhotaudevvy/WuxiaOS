@@ -130,14 +130,13 @@ struct DescriptorTablePointer {
 static mut GDT: Gdt = Gdt::new();
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
-/// Size of the per-CPU stack used while a trap runs in the kernel.
+/// Size of the bootstrap stack used until a thread takes over.
 ///
-/// A `Thread` is several KiB because it owns the process address space model
-/// and the unveil table, so scheduler helpers that touch whole threads need
-/// more headroom than the minimum a trap frame requires.
-const TRAP_STACK_SIZE: usize = 64 * 1024;
+/// Traps taken from ring 3 run on the running thread's own stack in
+/// [`crate::sched`]; this one only serves the bootstrap and the idle paths.
+const TRAP_STACK_SIZE: usize = 16 * 1024;
 
-/// Value kept at the bottom of the trap stack to catch an overflow.
+/// Value kept at the bottom of the bootstrap stack to catch an overflow.
 const TRAP_STACK_GUARD: u64 = 0xfeed_face_cafe_d00d;
 
 /// A dedicated kernel stack for traps taken from CPL3.
@@ -145,6 +144,17 @@ const TRAP_STACK_GUARD: u64 = 0xfeed_face_cafe_d00d;
 struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
 
 static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+
+/// Point the trap stack register at another kernel stack.
+///
+/// Called on every context switch so a trap taken in ring 3 lands on the
+/// running thread's own kernel stack.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: the TSS is kernel-owned and the new stack belongs to a thread.
+    unsafe {
+        (*addr_of_mut!(TSS)).rsp0 = top;
+    }
+}
 
 /// Whether the guard word at the bottom of the trap stack is intact.
 pub fn trap_stack_guard_ok() -> bool {

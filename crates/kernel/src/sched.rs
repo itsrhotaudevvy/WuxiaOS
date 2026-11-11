@@ -44,7 +44,26 @@ pub struct Thread {
     pub pledge: wuxia_core::pledge::Pledge,
     /// Paths the thread's process may resolve; empty means unrestricted.
     pub unveil: wuxia_core::unveil::Unveil<8>,
+    /// Top of the kernel stack this thread uses for its own traps.
+    pub kernel_stack_top: u64,
 }
+
+/// Size of the kernel stack reserved for each thread's traps.
+///
+/// A trap may run scheduler helpers that walk the whole thread table, so the
+/// stack is generous; it is per thread so one thread's deep call chain cannot
+/// consume another thread's headroom.
+pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
+
+/// Value kept at the base of every kernel stack to catch an overflow.
+const KERNEL_STACK_GUARD: u64 = 0x6b73_7461_636b_646f;
+
+/// A dedicated kernel stack for one thread's traps.
+#[repr(align(16))]
+struct KernelStack(#[allow(dead_code)] [u8; KERNEL_STACK_SIZE]);
+
+static mut KERNEL_STACKS: [KernelStack; MAX_THREADS] =
+    [const { KernelStack([0; KERNEL_STACK_SIZE]) }; MAX_THREADS];
 
 static mut THREADS: [Option<Thread>; MAX_THREADS] = [None; MAX_THREADS];
 
@@ -94,6 +113,7 @@ pub fn register(
         if count >= MAX_THREADS {
             return None;
         }
+        let kernel_stack_top = install_kernel_stack(count)?;
         threads[count] = Some(Thread {
             root,
             frame: initial_frame(entry, stack_top),
@@ -106,9 +126,56 @@ pub fn register(
             unveil: wuxia_core::unveil::Unveil::new(),
             process,
             frames,
+            kernel_stack_top,
         });
         write_volatile(addr_of_mut!(COUNT), count + 1);
         Some(count)
+    }
+}
+
+/// Guard a thread's kernel stack and return the stack top to load into RSP0.
+///
+/// # Safety
+///
+/// `index` must be below [`MAX_THREADS`] and called during bootstrap.
+unsafe fn install_kernel_stack(index: usize) -> Option<u64> {
+    // SAFETY: the caller guarantees bootstrap exclusivity.
+    let stack = unsafe { (*addr_of_mut!(KERNEL_STACKS)).get_mut(index)? };
+    let base = stack.0.as_mut_ptr().cast::<u64>();
+    // SAFETY: the guard word is the first word of a stack nothing else uses.
+    unsafe { base.write_volatile(KERNEL_STACK_GUARD) };
+    Some(base as u64 + KERNEL_STACK_SIZE as u64)
+}
+
+/// Point the trap stack at the first registered thread before ring 3 starts.
+pub fn activate_first_stack() {
+    // SAFETY: bootstrap owns the TSS and every thread record.
+    unsafe {
+        let threads = &*addr_of!(THREADS);
+        let top = threads
+            .first()
+            .and_then(|slot| slot.as_ref())
+            .map(|thread| thread.kernel_stack_top);
+        if let Some(top) = top {
+            crate::gdt::set_kernel_stack(top);
+        }
+    }
+}
+
+/// Whether the running thread's kernel stack guard is intact.
+pub fn trap_stack_intact() -> bool {
+    // SAFETY: the guard is read from a kernel-owned static of the current
+    // thread; bootstrap traps without a thread use the GDT stack instead.
+    unsafe {
+        let threads = &*addr_of!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        match threads.get(current).and_then(|slot| slot.as_ref()) {
+            Some(thread) => {
+                let base = (thread.kernel_stack_top - KERNEL_STACK_SIZE as u64) as *const u64;
+                base.read_volatile() == KERNEL_STACK_GUARD
+            }
+            None => crate::gdt::trap_stack_guard_ok(),
+        }
     }
 }
 
@@ -568,9 +635,9 @@ fn switch(frame: &mut InterruptFrame, label: &str) -> bool {
         let Some(next) = wuxia_core::schedule::next_runnable(current, &ready) else {
             return false;
         };
-        let Some((saved_frame, saved_root)) = threads[next]
+        let Some((saved_frame, saved_root, saved_stack)) = threads[next]
             .as_ref()
-            .map(|thread| (thread.frame, thread.root))
+            .map(|thread| (thread.frame, thread.root, thread.kernel_stack_top))
         else {
             return false;
         };
@@ -580,6 +647,8 @@ fn switch(frame: &mut InterruptFrame, label: &str) -> bool {
         frame.rflags |= 0x200;
         write_volatile(addr_of_mut!(CURRENT), next);
         crate::paging::activate(saved_root);
+        // Traps in the resumed thread must land on its own kernel stack.
+        crate::gdt::set_kernel_stack(saved_stack);
         if let Some(thread) = threads[next].as_mut() {
             thread.resume_tick = now.saturating_add(1);
         }
@@ -626,9 +695,9 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
                 let Some(index) = deferred else {
                     return false;
                 };
-                let Some((saved_frame, saved_root)) = threads[index]
+                let Some((saved_frame, saved_root, saved_stack)) = threads[index]
                     .as_ref()
-                    .map(|thread| (thread.frame, thread.root))
+                    .map(|thread| (thread.frame, thread.root, thread.kernel_stack_top))
                 else {
                     return false;
                 };
@@ -636,6 +705,7 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
                 frame.rflags |= 0x200;
                 write_volatile(addr_of_mut!(CURRENT), index);
                 crate::paging::activate(saved_root);
+                crate::gdt::set_kernel_stack(saved_stack);
                 let label = match threads[index].as_mut() {
                     Some(thread) => {
                         thread.runnable = true;

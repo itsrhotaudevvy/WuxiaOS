@@ -247,7 +247,7 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
     // SAFETY: the stub builds a complete frame and passes its address; no other
     // reference to the frame exists during the call.
     let frame = unsafe { &mut *frame };
-    if !crate::gdt::trap_stack_guard_ok() {
+    if !crate::sched::trap_stack_intact() {
         serial::write_str("WUXIA_TRAP_STACK_OVERFLOW\n");
         serial::write_hex(frame.vector as u64);
         serial::debug_exit(1);

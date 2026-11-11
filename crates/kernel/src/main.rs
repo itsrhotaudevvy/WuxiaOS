@@ -319,6 +319,7 @@ pub extern "C" fn _start() -> ! {
         .is_some(),
         "the fault thread cannot be registered"
     );
+    sched::activate_first_stack();
     log::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.entry, stack_top);
 }

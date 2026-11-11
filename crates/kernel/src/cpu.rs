@@ -62,9 +62,9 @@ impl Hardening {
 pub fn harden() -> Hardening {
     let mut applied = Hardening::default();
 
-    // SAFETY: reading and writing the control registers is privileged and the
-    // kernel owns them at this point; every written bit is CPUID-checked.
-    unsafe {
+    // The helpers below are the unsafe surface; every written bit is
+    // CPUID-checked before it reaches a control register.
+    {
         let cr0 = read_cr0();
         write_cr0(cr0 | CR0_WRITE_PROTECT);
         applied.write_protect = read_cr0() & CR0_WRITE_PROTECT != 0;
