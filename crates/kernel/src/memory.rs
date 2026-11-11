@@ -45,3 +45,15 @@ impl<const N: usize> MemoryMap<N> {
         self.regions[..self.len].iter().map(|region| region.unwrap())
     }
 }
+
+/// Convert a Limine response into a validated bounded region list.
+pub fn from_limine<const N: usize>(response: &limine::memory_map::Response) -> Result<MemoryMap<N>, wuxia_core::Error> {
+    let mut map = MemoryMap::<N>::new();
+    for entry in response.entries().iter() {
+        if entry.entry_type != EntryType::USABLE {
+            continue;
+        }
+        map.add(entry.base, entry.length)?;
+    }
+    Ok(map)
+}
