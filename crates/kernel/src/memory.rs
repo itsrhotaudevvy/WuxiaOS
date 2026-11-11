@@ -5,7 +5,6 @@
 //! response into the validated core representation.
 
 use limine::memory_map::EntryType;
-use wuxia_core::region::RegionMap;
 
 /// A normalized physical memory map used by the bootstrap allocator.
 pub type MemoryMap<const N: usize> = wuxia_core::region::RegionMap<N>;

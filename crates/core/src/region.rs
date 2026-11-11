@@ -25,6 +25,12 @@ pub struct RegionMap<const N: usize> {
     len: usize,
 }
 
+impl<const N: usize> Default for RegionMap<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> RegionMap<N> {
     /// Construct an empty map.
     pub const fn new() -> Self {

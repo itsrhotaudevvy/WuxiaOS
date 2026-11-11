@@ -15,7 +15,7 @@ pub struct Frame(u64);
 impl Frame {
     /// Construct a frame only from a page-aligned physical address.
     pub const fn new(address: u64) -> Result<Self> {
-        if address % FRAME_SIZE == 0 {
+        if address.is_multiple_of(FRAME_SIZE) {
             Ok(Self(address))
         } else {
             Err(Error::InvalidInput)
@@ -34,6 +34,12 @@ pub struct FrameAllocator<const N: usize> {
     frames: [u64; N],
     used: [bool; N],
     len: usize,
+}
+
+impl<const N: usize> Default for FrameAllocator<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<const N: usize> FrameAllocator<N> {

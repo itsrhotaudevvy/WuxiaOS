@@ -23,7 +23,7 @@ pub struct DirectMap {
 impl DirectMap {
     /// Accept only a page-aligned offset inside the canonical higher half.
     pub const fn new(offset: u64) -> Result<Self> {
-        if offset < HIGHER_HALF_BASE || offset % PAGE_SIZE != 0 {
+        if offset < HIGHER_HALF_BASE || !offset.is_multiple_of(PAGE_SIZE) {
             return Err(Error::InvalidInput);
         }
         Ok(Self { offset })

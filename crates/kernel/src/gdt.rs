@@ -84,11 +84,6 @@ impl Gdt {
             ],
         }
     }
-
-    /// Return the selector for the first executable kernel segment.
-    pub const fn kernel_code_selector(&self) -> u16 {
-        KERNEL_CODE_SELECTOR
-    }
 }
 
 /// The 64-bit task state segment.
@@ -137,7 +132,7 @@ static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 /// A dedicated kernel stack for traps taken from CPL3.
 #[repr(align(16))]
-struct TrapStack([u8; 16 * 1024]);
+struct TrapStack(#[allow(dead_code)] [u8; 16 * 1024]);
 
 static mut TRAP_STACK: TrapStack = TrapStack([0; 16 * 1024]);
 
@@ -169,26 +164,17 @@ pub fn init() {
     load_task_register();
 }
 
-/// Read the current stack pointer for diagnostics.
-pub fn stack_pointer() -> u64 {
-    let rsp: u64;
-    // SAFETY: reading RSP has no side effects.
-    unsafe {
-        asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
-    }
-    rsp
-}
-
 fn reload_data_segments() {
     // SAFETY: the selectors index the GDT loaded by `init`.
     unsafe {
         asm!(
-            "mov ax, 0x10",
+            "mov ax, {data}",
             "mov ds, ax",
             "mov es, ax",
             "mov ss, ax",
             "mov fs, ax",
             "mov gs, ax",
+            data = const KERNEL_DATA_SELECTOR,
             out("ax") _,
             options(nomem, nostack, preserves_flags),
         );
@@ -198,7 +184,13 @@ fn reload_data_segments() {
 fn load_task_register() {
     // SAFETY: the TSS descriptor was installed at `TSS_SELECTOR` before `ltr`.
     unsafe {
-        asm!("mov ax, 0x28", "ltr ax", out("ax") _, options(nomem, nostack, preserves_flags));
+        asm!(
+            "mov ax, {tss}",
+            "ltr ax",
+            tss = const TSS_SELECTOR,
+            out("ax") _,
+            options(nomem, nostack, preserves_flags),
+        );
     }
 }
 
@@ -206,11 +198,12 @@ fn load_task_register() {
 #[unsafe(naked)]
 unsafe extern "C" fn reload_cs() {
     core::arch::naked_asm!(
-        "push 0x08",
+        "push {code}",
         "lea rax, [rip + 2f]",
         "push rax",
         "retfq",
         "2:",
         "ret",
+        code = const KERNEL_CODE_SELECTOR,
     );
 }

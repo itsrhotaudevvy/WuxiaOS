@@ -95,7 +95,7 @@ pub const fn user_page(address: u64) -> Result<u64> {
 
 /// Whether an address is page-aligned, nonzero, canonical and user-accessible.
 pub const fn is_user_address(address: u64) -> bool {
-    address != 0 && address % PAGE_SIZE == 0 && address < USER_ADDRESS_LIMIT
+    address != 0 && address.is_multiple_of(PAGE_SIZE) && address < USER_ADDRESS_LIMIT
 }
 
 /// Encode a 4 KiB leaf mapping after checking bounds and W^X.
@@ -201,7 +201,7 @@ pub fn walk<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> 
 
 /// Whether a physical address is a usable, nonzero 4 KiB page frame.
 const fn is_physical_page(address: u64) -> bool {
-    address != 0 && address % PAGE_SIZE == 0 && address & !ADDRESS_MASK == 0
+    address != 0 && address.is_multiple_of(PAGE_SIZE) && address & !ADDRESS_MASK == 0
 }
 
 #[cfg(test)]
@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(walk(&huge, 0x1000, 0x400000), Err(Error::Unsupported));
 
         let null_table = Sparse {
-            entries: [(0x1000, 0, PRESENT | 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)],
+            entries: [(0x1000, 0, PRESENT), (0, 0, 0), (0, 0, 0), (0, 0, 0)],
         };
         assert_eq!(
             walk(&null_table, 0x1000, 0x400000),

@@ -102,6 +102,12 @@ pub struct HandleTable<T, const N: usize> {
     entries: [Entry<T>; N],
 }
 
+impl<T, const N: usize> Default for HandleTable<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T, const N: usize> HandleTable<T, N> {
     /// Construct an empty table with valid nonzero generations.
     pub const fn new() -> Self {
