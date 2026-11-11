@@ -286,20 +286,80 @@ impl<const BYTES: usize> KernelLog<BYTES> {
     }
 }
 
+/// Longest record prefix: `<`, one level digit, `>[`, up to 20 tick digits and
+/// `] `.
+const PREFIX_MAX: usize = 1 + 1 + 2 + 20 + 2;
+
+/// Lowercase hex digits used by `\xHH` escapes.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 /// Format one record as `<level>[tick] message\n` into `out`.
 ///
-/// Returns the number of bytes written. Fails with `OutOfRange` when `out` is
-/// too small, and then `out` may hold a partial line.
+/// Each message byte outside printable ASCII (0x20..=0x7e), and the backslash
+/// itself, is written as `\xHH` with lowercase hex digits. The output is
+/// therefore always exactly one line, ending in the single trailing `\n`, and
+/// every `\` in it begins an escape, so the rendering is unambiguous. Stored
+/// record bytes are never modified; escaping happens only here.
+///
+/// Returns the number of bytes written. Escaping can expand each message byte
+/// to four bytes, so the full line length is computed before anything is
+/// written. Fails with `OutOfRange`, leaving `out` unchanged, when the line
+/// does not fit.
 pub fn format_line(level: Level, tick: u64, message: &[u8], out: &mut [u8]) -> Result<usize> {
-    let mut cursor = Cursor { out, at: 0 };
-    cursor.put(b"<")?;
-    cursor.put(&[b'0' + level as u8])?;
-    cursor.put(b">[")?;
-    put_decimal(&mut cursor, tick)?;
-    cursor.put(b"] ")?;
-    cursor.put(message)?;
-    cursor.put(b"\n")?;
-    Ok(cursor.at)
+    let mut prefix = [0u8; PREFIX_MAX];
+    let prefix_len = {
+        let mut head = Cursor {
+            out: &mut prefix[..],
+            at: 0,
+        };
+        head.put(b"<")?;
+        head.put(&[b'0' + level as u8])?;
+        head.put(b">[")?;
+        put_decimal(&mut head, tick)?;
+        head.put(b"] ")?;
+        head.at
+    };
+    let total = message
+        .iter()
+        .try_fold(prefix_len + 1, |total, &byte| {
+            total.checked_add(escaped_len(byte))
+        })
+        .ok_or(Error::OutOfRange)?;
+    if total > out.len() {
+        return Err(Error::OutOfRange);
+    }
+
+    let mut line = Cursor { out, at: 0 };
+    line.put(&prefix[..prefix_len])?;
+    for &byte in message {
+        put_escaped(&mut line, byte)?;
+    }
+    line.put(b"\n")?;
+    Ok(line.at)
+}
+
+/// Whether a message byte is written unchanged. The backslash is excluded so
+/// that every `\` in the output starts an escape sequence.
+fn is_plain(byte: u8) -> bool {
+    (0x20..=0x7e).contains(&byte) && byte != b'\\'
+}
+
+/// Output width of one message byte: one byte when plain, else `\xHH`.
+fn escaped_len(byte: u8) -> usize {
+    if is_plain(byte) { 1 } else { 4 }
+}
+
+fn put_escaped(cursor: &mut Cursor<'_>, byte: u8) -> Result<()> {
+    if is_plain(byte) {
+        cursor.put(&[byte])
+    } else {
+        cursor.put(&[
+            b'\\',
+            b'x',
+            HEX[usize::from(byte >> 4)],
+            HEX[usize::from(byte & 0x0f)],
+        ])
+    }
 }
 
 /// Bounded writer over an output buffer.
@@ -687,6 +747,84 @@ mod tests {
             format_line(LEVELS[6], 10, b"hi", &mut short),
             Err(Error::OutOfRange)
         );
+    }
+
+    #[test]
+    fn format_line_escapes_an_embedded_newline_so_the_line_stays_single() {
+        let mut out = [0u8; 64];
+        let len = format_line(LEVELS[6], 1, b"first\nsecond\r\nthird", &mut out).unwrap();
+        let line = &out[..len];
+        assert_eq!(line, b"<6>[1] first\\x0asecond\\x0d\\x0athird\n");
+        assert_eq!(line.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(line.last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn format_line_escapes_escape_sequences() {
+        let mut out = [0u8; 64];
+        let len = format_line(LEVELS[3], 2, b"\x1b[2J\x07", &mut out).unwrap();
+        assert_eq!(&out[..len], b"<3>[2] \\x1b[2J\\x07\n");
+    }
+
+    #[test]
+    fn format_line_escapes_backslash_so_escapes_are_unambiguous() {
+        // A literal backslash followed by "x41" must not read as the byte 'A'.
+        let mut out = [0u8; 64];
+        let len = format_line(LEVELS[6], 0, b"a\\x41", &mut out).unwrap();
+        assert_eq!(&out[..len], b"<6>[0] a\\x5cx41\n");
+    }
+
+    #[test]
+    fn format_line_escapes_nul_del_and_non_ascii_bytes() {
+        let mut out = [0u8; 64];
+        let message = [0x00, 0x7f, 0x80, 0xc3, 0xff];
+        let len = format_line(LEVELS[6], 0, &message, &mut out).unwrap();
+        assert_eq!(&out[..len], b"<6>[0] \\x00\\x7f\\x80\\xc3\\xff\n");
+    }
+
+    #[test]
+    fn every_byte_is_either_plain_or_escaped_and_no_output_has_a_stray_newline() {
+        const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let prefix = b"<6>[0] ";
+        for byte in 0..=255u8 {
+            let mut out = [0u8; 16];
+            let len = format_line(LEVELS[6], 0, &[byte], &mut out).unwrap();
+            let line = &out[..len];
+            assert_eq!(line.iter().filter(|&&b| b == b'\n').count(), 1);
+            assert_eq!(line.last(), Some(&b'\n'));
+            assert_eq!(&line[..prefix.len()], prefix);
+            let body = &line[prefix.len()..len - 1];
+            if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+                assert_eq!(body, &[byte]);
+            } else {
+                assert_eq!(
+                    body,
+                    &[
+                        b'\\',
+                        b'x',
+                        HEX_DIGITS[usize::from(byte >> 4)],
+                        HEX_DIGITS[usize::from(byte & 0x0f)],
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_output_is_exact_at_the_buffer_boundary_and_short_buffers_stay_untouched() {
+        // "<6>[10] " is 8 bytes. Each 0xff becomes the 4-byte "\xff", and the
+        // line ends with one newline: 8 + 3 * 4 + 1 = 21 bytes.
+        let message = [0xffu8; 3];
+        let mut exact = [0u8; 21];
+        assert_eq!(format_line(LEVELS[6], 10, &message, &mut exact), Ok(21));
+        assert_eq!(&exact[..], b"<6>[10] \\xff\\xff\\xff\n");
+
+        let mut short = [0xaau8; 20];
+        assert_eq!(
+            format_line(LEVELS[6], 10, &message, &mut short),
+            Err(Error::OutOfRange)
+        );
+        assert_eq!(short, [0xaau8; 20]);
     }
 
     /// Length of the stored message for a record appended with `len` bytes.
