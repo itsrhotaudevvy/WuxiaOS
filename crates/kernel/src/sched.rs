@@ -42,9 +42,12 @@ pub struct Thread {
     pub frames: crate::paging::FrameTracker,
     /// Pledge promises for the thread's process; only ever narrowed.
     pub pledge: wuxia_core::pledge::Pledge,
+    /// Paths the thread's process may resolve; empty means unrestricted.
+    pub unveil: wuxia_core::unveil::Unveil<8>,
 }
 
 static mut THREADS: [Option<Thread>; MAX_THREADS] = [None; MAX_THREADS];
+
 static mut CURRENT: usize = 0;
 static mut COUNT: usize = 0;
 
@@ -100,6 +103,7 @@ pub fn register(
             deferred: false,
             start_label: "",
             pledge: wuxia_core::pledge::Pledge::new(),
+            unveil: wuxia_core::unveil::Unveil::new(),
             process,
             frames,
         });
@@ -163,6 +167,61 @@ pub fn restrict_promises(promises: wuxia_core::pledge::Promises) -> bool {
     }
 }
 
+/// Reveal `path` for the running process with `perms`.
+///
+/// Fails once the table is frozen, when the path is not absolute, or when
+/// every slot is taken.
+pub fn unveil_add(path: &str, perms: wuxia_core::unveil::UnveilPerms) -> bool {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current]
+            .as_mut()
+            .is_some_and(|thread| thread.unveil.add(path, perms).is_ok())
+    }
+}
+
+/// Freeze the running process's visibility table.
+pub fn unveil_lock() -> bool {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current].as_mut().is_some_and(|thread| {
+            thread.unveil.lock();
+            true
+        })
+    }
+}
+
+/// Whether the running process may resolve the store entry `name` for reading.
+///
+/// The boot store is flat, so an entry named `name` has the virtual path
+/// `/<name>`, which is what an `unveil` decision sees.
+fn unveil_allows(name: &str) -> bool {
+    let Some(thread) = current_thread() else {
+        return true;
+    };
+    if !thread.unveil.is_restricted() {
+        return true;
+    }
+    let mut path = [0u8; 1 + wuxia_core::vfs::MAX_NAME_LENGTH];
+    let length = 1 + name.len();
+    if length > path.len() {
+        return false;
+    }
+    path[0] = b'/';
+    path[1..length].copy_from_slice(name.as_bytes());
+    let Ok(path) = core::str::from_utf8(&path[..length]) else {
+        return false;
+    };
+    thread
+        .unveil
+        .check(path, wuxia_core::unveil::UnveilPerms::READ)
+        .is_ok()
+}
+
 /// Whether the running process has `descriptor` open.
 pub fn descriptor_open(descriptor: u32) -> bool {
     current_thread().is_some_and(|thread| thread.process.descriptors().is_open(descriptor))
@@ -182,6 +241,9 @@ pub fn close_descriptor(descriptor: u32) -> bool {
 
 /// Resolve a path and open it on the running process.
 pub fn open_path(name: &str) -> Option<u32> {
+    if !unveil_allows(name) {
+        return None;
+    }
     let file = crate::vfs::lookup(name)?;
     // SAFETY: traps are non-nesting, so the current thread is stable.
     unsafe {
@@ -360,13 +422,13 @@ pub fn exit_process(code: u64) -> bool {
     }
 }
 
-fn current_thread() -> Option<Thread> {
+fn current_thread() -> Option<&'static Thread> {
     // SAFETY: the thread table is written during bootstrap and by the
-    // scheduler between traps; `Option<Thread>` is copied out atomically.
+    // scheduler between traps, and a reference is only used inside one trap.
     unsafe {
         let threads = &*addr_of!(THREADS);
         let current = read_volatile(addr_of!(CURRENT));
-        threads.get(current).copied().flatten()
+        threads.get(current)?.as_ref()
     }
 }
 
@@ -385,7 +447,9 @@ fn refresh(threads: &mut [Option<Thread>; MAX_THREADS], now: u64) {
 fn ready_flags(threads: &[Option<Thread>; MAX_THREADS]) -> [bool; MAX_THREADS] {
     let mut ready = [false; MAX_THREADS];
     for (index, slot) in threads.iter().enumerate() {
-        ready[index] = slot.is_some_and(|thread| thread.runnable && thread.wake_at == 0);
+        ready[index] = slot
+            .as_ref()
+            .is_some_and(|thread| thread.runnable && thread.wake_at == 0);
     }
     ready
 }
@@ -434,7 +498,10 @@ pub fn preempt(frame: &mut InterruptFrame) -> bool {
         let threads = &*addr_of!(THREADS);
         let current = read_volatile(addr_of!(CURRENT));
         let now = crate::interrupts::ticks();
-        if threads[current].is_some_and(|thread| now <= thread.resume_tick) {
+        if threads[current]
+            .as_ref()
+            .is_some_and(|thread| now <= thread.resume_tick)
+        {
             return false;
         }
     }
@@ -501,13 +568,18 @@ fn switch(frame: &mut InterruptFrame, label: &str) -> bool {
         let Some(next) = wuxia_core::schedule::next_runnable(current, &ready) else {
             return false;
         };
-        let thread = threads[next].expect("a ready thread exists");
-        *frame = thread.frame;
+        let Some((saved_frame, saved_root)) = threads[next]
+            .as_ref()
+            .map(|thread| (thread.frame, thread.root))
+        else {
+            return false;
+        };
+        *frame = saved_frame;
         // A saved trap frame may carry the cleared interrupt flag of the
         // syscall gate; user code must always resume with interrupts enabled.
         frame.rflags |= 0x200;
         write_volatile(addr_of_mut!(CURRENT), next);
-        crate::paging::activate(thread.root);
+        crate::paging::activate(saved_root);
         if let Some(thread) = threads[next].as_mut() {
             thread.resume_tick = now.saturating_add(1);
         }
@@ -550,21 +622,30 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
             if !idle_until_wakeup(threads) {
                 let deferred = threads
                     .iter()
-                    .position(|slot| slot.is_some_and(|thread| thread.deferred));
+                    .position(|slot| slot.as_ref().is_some_and(|thread| thread.deferred));
                 let Some(index) = deferred else {
                     return false;
                 };
-                let thread = threads[index].expect("a deferred thread exists");
-                *frame = thread.frame;
+                let Some((saved_frame, saved_root)) = threads[index]
+                    .as_ref()
+                    .map(|thread| (thread.frame, thread.root))
+                else {
+                    return false;
+                };
+                *frame = saved_frame;
                 frame.rflags |= 0x200;
                 write_volatile(addr_of_mut!(CURRENT), index);
-                crate::paging::activate(thread.root);
-                if let Some(thread) = threads[index].as_mut() {
-                    thread.runnable = true;
-                    thread.deferred = false;
-                    thread.resume_tick = crate::interrupts::ticks().saturating_add(1);
-                }
-                serial::write_str(thread.start_label);
+                crate::paging::activate(saved_root);
+                let label = match threads[index].as_mut() {
+                    Some(thread) => {
+                        thread.runnable = true;
+                        thread.deferred = false;
+                        thread.resume_tick = crate::interrupts::ticks().saturating_add(1);
+                        thread.start_label
+                    }
+                    None => "",
+                };
+                serial::write_str(label);
                 serial::write_hex(index as u64);
                 return true;
             }

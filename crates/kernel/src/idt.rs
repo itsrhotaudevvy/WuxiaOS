@@ -247,6 +247,12 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
     // SAFETY: the stub builds a complete frame and passes its address; no other
     // reference to the frame exists during the call.
     let frame = unsafe { &mut *frame };
+    if !crate::gdt::trap_stack_guard_ok() {
+        serial::write_str("WUXIA_TRAP_STACK_OVERFLOW\n");
+        serial::write_hex(frame.vector as u64);
+        serial::debug_exit(1);
+        halt();
+    }
     match frame.vector {
         3 => serial::write_str("WUXIA_BREAKPOINT_OK\n"),
         6 => {
@@ -333,6 +339,41 @@ fn service_syscall(frame: &mut InterruptFrame) {
         }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
             terminate(frame, code, "WUXIA_SYSCALL_EXIT\n");
+        }
+        Ok(wuxia_core::syscall::PosixRequest::Unveil { path, perms }) => {
+            let mut path_scratch = [0u8; wuxia_core::unveil::MAX_PATH_LENGTH];
+            let mut perms_scratch = [0u8; 4];
+            let revealed = copy_user_bytes(path.address, path.length, &mut path_scratch)
+                .ok()
+                .and_then(|count| core::str::from_utf8(&path_scratch[..count]).ok())
+                .zip(
+                    copy_user_bytes(perms.address, perms.length, &mut perms_scratch)
+                        .ok()
+                        .and_then(|count| core::str::from_utf8(&perms_scratch[..count]).ok()),
+                )
+                .and_then(|(path, perms)| {
+                    let perms = wuxia_core::unveil::UnveilPerms::parse(perms).ok()?;
+                    crate::sched::unveil_add(path, perms).then_some(())
+                });
+            match revealed {
+                Some(()) => {
+                    serial::write_str("WUXIA_UNVEIL_OK\n");
+                    frame.rax = 0;
+                }
+                None => {
+                    serial::write_str("WUXIA_UNVEIL_DENIED\n");
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
+        Ok(wuxia_core::syscall::PosixRequest::UnveilLock) => {
+            if crate::sched::unveil_lock() {
+                serial::write_str("WUXIA_UNVEIL_OK\n");
+                frame.rax = 0;
+            } else {
+                serial::write_str("WUXIA_UNVEIL_DENIED\n");
+                frame.rax = u64::MAX;
+            }
         }
         Ok(wuxia_core::syscall::PosixRequest::Pledge { promises }) => {
             if crate::sched::restrict_promises(promises) {

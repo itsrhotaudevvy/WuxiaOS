@@ -110,8 +110,10 @@ pub const fn required(call: PosixCall) -> Promises {
         PosixCall::Map | PosixCall::Unmap => Promises::VM,
         // Exiting must always succeed so a restricted process can still end.
         PosixCall::Exit => Promises::NONE,
-        // A pledge can only remove promises, so it needs no promise itself.
-        PosixCall::Pledge => Promises::NONE,
+        // Pledge and unveil only narrow what the process may do, so they need
+        // no promise of their own; `unveil` also follows the process-wide
+        // `wuxia_core::unveil` table rather than this vocabulary.
+        PosixCall::Pledge | PosixCall::Unveil => Promises::NONE,
     }
 }
 
@@ -162,7 +164,7 @@ impl Pledge {
 mod tests {
     use super::*;
 
-    const CALLS: [PosixCall; 13] = [
+    const CALLS: [PosixCall; 14] = [
         PosixCall::Read,
         PosixCall::Write,
         PosixCall::Open,
@@ -176,6 +178,7 @@ mod tests {
         PosixCall::GetPid,
         PosixCall::Exit,
         PosixCall::Pledge,
+        PosixCall::Unveil,
     ];
 
     #[test]
@@ -251,7 +254,10 @@ mod tests {
         for call in CALLS {
             let need = required(call);
             if need == Promises::NONE {
-                assert!(matches!(call, PosixCall::Exit | PosixCall::Pledge));
+                assert!(matches!(
+                    call,
+                    PosixCall::Exit | PosixCall::Pledge | PosixCall::Unveil
+                ));
                 assert!(Pledge::new().permits(call));
                 continue;
             }

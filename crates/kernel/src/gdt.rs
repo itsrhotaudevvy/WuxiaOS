@@ -130,11 +130,30 @@ struct DescriptorTablePointer {
 static mut GDT: Gdt = Gdt::new();
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+/// Size of the per-CPU stack used while a trap runs in the kernel.
+///
+/// A `Thread` is several KiB because it owns the process address space model
+/// and the unveil table, so scheduler helpers that touch whole threads need
+/// more headroom than the minimum a trap frame requires.
+const TRAP_STACK_SIZE: usize = 64 * 1024;
+
+/// Value kept at the bottom of the trap stack to catch an overflow.
+const TRAP_STACK_GUARD: u64 = 0xfeed_face_cafe_d00d;
+
 /// A dedicated kernel stack for traps taken from CPL3.
 #[repr(align(16))]
-struct TrapStack(#[allow(dead_code)] [u8; 16 * 1024]);
+struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
 
-static mut TRAP_STACK: TrapStack = TrapStack([0; 16 * 1024]);
+static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+
+/// Whether the guard word at the bottom of the trap stack is intact.
+pub fn trap_stack_guard_ok() -> bool {
+    // SAFETY: the guard occupies the first word of a kernel-owned static.
+    unsafe {
+        let guard = core::ptr::addr_of!(TRAP_STACK).cast::<u64>();
+        core::ptr::read_volatile(guard) == TRAP_STACK_GUARD
+    }
+}
 
 /// Load the GDT, reload the segment registers and install the TSS.
 ///
@@ -144,6 +163,8 @@ pub fn init() {
     // SAFETY: bootstrap is single-threaded and no other code reads or writes
     // these statics. The addresses are stable for the whole kernel lifetime.
     unsafe {
+        let guard = addr_of!(TRAP_STACK).cast::<u64>();
+        core::ptr::write_volatile(guard.cast_mut(), TRAP_STACK_GUARD);
         let tss = &mut *addr_of_mut!(TSS);
         tss.rsp0 = addr_of!(TRAP_STACK) as u64 + size_of::<TrapStack>() as u64;
         let (low, high) =

@@ -51,6 +51,8 @@ pub enum PosixCall {
     FileSize = 61,
     /// Narrow the process's promise set; the number matches OpenBSD `pledge`.
     Pledge = 108,
+    /// Restrict which paths the process can resolve; matches OpenBSD `unveil`.
+    Unveil = 114,
 }
 
 impl PosixCall {
@@ -70,6 +72,7 @@ impl PosixCall {
             60 => Some(Self::Exit),
             61 => Some(Self::FileSize),
             108 => Some(Self::Pledge),
+            114 => Some(Self::Unveil),
             _ => None,
         }
     }
@@ -168,6 +171,15 @@ pub enum PosixRequest {
         /// Requested promises, already checked against the known bits.
         promises: crate::pledge::Promises,
     },
+    /// Reveal one absolute path with the given permissions.
+    Unveil {
+        /// Validated absolute path bytes.
+        path: UserBuffer,
+        /// Permission letters such as `r` or `rw`, at most four bytes.
+        perms: UserBuffer,
+    },
+    /// Freeze the visibility table, the `unveil(NULL, NULL)` form.
+    UnveilLock,
 }
 
 impl PosixRequest {
@@ -218,6 +230,20 @@ impl PosixRequest {
             PosixCall::Pledge => Ok(Self::Pledge {
                 promises: decode_promises(registers.args[0])?,
             }),
+            PosixCall::Unveil => {
+                if registers.args[0] == 0 {
+                    // The null path form freezes the table.
+                    return Ok(Self::UnveilLock);
+                }
+                Ok(Self::Unveil {
+                    path: decode_bounded_buffer(
+                        registers.args[0],
+                        registers.args[1],
+                        MAX_PATH_LENGTH,
+                    )?,
+                    perms: decode_bounded_buffer(registers.args[2], registers.args[3], 4)?,
+                })
+            }
         }
     }
 
@@ -240,6 +266,7 @@ impl PosixRequest {
             Self::GetPid => PosixCall::GetPid,
             Self::Exit { .. } => PosixCall::Exit,
             Self::Pledge { .. } => PosixCall::Pledge,
+            Self::Unveil { .. } | Self::UnveilLock => PosixCall::Unveil,
         }
     }
 }
@@ -543,6 +570,64 @@ mod tests {
     }
 
     #[test]
+    fn unveil_decodes_paths_permissions_and_the_lock_form() {
+        let request = PosixRequest::decode(
+            114,
+            &Registers {
+                args: [0x1000, 6, 0x2000, 1, 0, 0],
+            },
+        );
+        assert_eq!(
+            request,
+            Ok(PosixRequest::Unveil {
+                path: UserBuffer {
+                    address: 0x1000,
+                    length: 6,
+                },
+                perms: UserBuffer {
+                    address: 0x2000,
+                    length: 1,
+                },
+            })
+        );
+
+        // A null path freezes the table, like OpenBSD unveil(NULL, NULL).
+        assert_eq!(
+            PosixRequest::decode(114, &Registers::default()),
+            Ok(PosixRequest::UnveilLock)
+        );
+
+        // Empty, oversized and unbacked arguments are rejected in decode.
+        assert_eq!(
+            PosixRequest::decode(
+                114,
+                &Registers {
+                    args: [0x1000, 0, 0x2000, 1, 0, 0]
+                }
+            ),
+            Err(Error::BadAddress)
+        );
+        assert_eq!(
+            PosixRequest::decode(
+                114,
+                &Registers {
+                    args: [0x1000, MAX_PATH_LENGTH + 1, 0x2000, 1, 0, 0]
+                }
+            ),
+            Err(Error::BadAddress)
+        );
+        assert_eq!(
+            PosixRequest::decode(
+                114,
+                &Registers {
+                    args: [0x1000, 6, 0x2000, 5, 0, 0]
+                }
+            ),
+            Err(Error::BadAddress)
+        );
+    }
+
+    #[test]
     fn every_request_reports_the_call_it_came_from() {
         let cases = [
             (
@@ -612,6 +697,14 @@ mod tests {
                 PosixCall::FileSize,
             ),
             (108, Registers::default(), PosixCall::Pledge),
+            (114, Registers::default(), PosixCall::Unveil),
+            (
+                114,
+                Registers {
+                    args: [0x1000, 6, 0x2000, 1, 0, 0],
+                },
+                PosixCall::Unveil,
+            ),
         ];
         for (call, registers, expected) in cases {
             let request = PosixRequest::decode(call, &registers).expect("decodes");

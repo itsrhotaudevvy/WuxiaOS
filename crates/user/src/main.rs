@@ -225,6 +225,66 @@ core::arch::global_asm!(
     "lea rsi, [rip + {second}]",
     "mov rdx, 15",
     "int 0x80",
+    // unveil("/hello", "r"): only that path stays visible from here on
+    "sub rsp, 32",
+    "mov rbx, 0x00006f6c6c65682f",
+    "mov qword ptr [rsp], rbx",
+    "mov byte ptr [rsp + 8], 0x72",
+    "mov dword ptr [rsp + 16], 0x64746f6d",
+    "mov dword ptr [rsp + 24], 0x6c6c6568",
+    "mov word ptr [rsp + 28], 0x006f",
+    "mov rax, 114",
+    "mov rdi, rsp",
+    "mov rsi, 6",
+    "lea rdx, [rsp + 8]",
+    "mov r10, 1",
+    "int 0x80",
+    "test rax, rax",
+    "jne 14f",
+    // open("motd") is now hidden
+    "mov rax, 2",
+    "lea rdi, [rsp + 16]",
+    "mov rsi, 4",
+    "int 0x80",
+    "cmp rax, -1",
+    "jne 14f",
+    // open("hello") is still visible, so the open succeeds and closes again
+    "mov rax, 2",
+    "lea rdi, [rsp + 24]",
+    "mov rsi, 5",
+    "int 0x80",
+    "cmp rax, 0",
+    "jle 14f",
+    "mov r12, rax",
+    "mov rax, 3",
+    "mov rdi, r12",
+    "int 0x80",
+    // the veil does not stop stdio
+    "mov rax, 1",
+    "mov rdi, 1",
+    "lea rsi, [rip + {veiled}]",
+    "mov rdx, 7",
+    "int 0x80",
+    // unveil(NULL, NULL) freezes the table
+    "mov rax, 114",
+    "xor rdi, rdi",
+    "int 0x80",
+    "test rax, rax",
+    "jne 14f",
+    // a later unveil is refused once the table is locked
+    "mov rax, 114",
+    "mov rdi, rsp",
+    "mov rsi, 6",
+    "lea rdx, [rsp + 8]",
+    "mov r10, 1",
+    "int 0x80",
+    "cmp rax, -1",
+    "jne 14f",
+    "add rsp, 32",
+    "jmp 15f",
+    "14:",
+    "ud2",
+    "15:",
     // pledge("stdio rpath"): the VM promise is dropped from here on
     "mov rax, 108",
     "mov rdi, 3",
@@ -257,6 +317,7 @@ core::arch::global_asm!(
     message = sym MESSAGE,
     second = sym SECOND,
     pledged = sym PLEDGED,
+    veiled = sym VEILED,
 
 );
 
@@ -271,6 +332,10 @@ static SECOND: [u8; 15] = *b"A SECOND PHASE\n";
 /// Written after `pledge` drops every promise except stdio and rpath.
 #[used]
 static PLEDGED: [u8; 8] = *b"PLEDGED\n";
+
+/// Written after `unveil` hides every path except `/hello`.
+#[used]
+static VEILED: [u8; 7] = *b"VEILED\n";
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
