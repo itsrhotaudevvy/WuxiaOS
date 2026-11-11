@@ -74,6 +74,8 @@ impl NtStatus {
     pub const ACCESS_DENIED: Self = Self(0xc000_0022);
     /// STATUS_INVALID_HANDLE.
     pub const INVALID_HANDLE: Self = Self(0xc000_0008);
+    /// STATUS_OBJECT_NAME_NOT_FOUND.
+    pub const OBJECT_NAME_NOT_FOUND: Self = Self(0xc000_0034);
     /// STATUS_BUFFER_TOO_SMALL.
     pub const BUFFER_TOO_SMALL: Self = Self(0xc000_0023);
 
@@ -95,6 +97,8 @@ pub enum NtCall {
     TerminateProcess = 0x29,
     /// Read from a file handle.
     ReadFile = 0x06,
+    /// Open or create a file and return a handle.
+    CreateFile = 0x34,
     /// Write to a file handle.
     WriteFile = 0x08,
 }
@@ -108,6 +112,7 @@ impl NtCall {
             0x29 => Some(Self::TerminateProcess),
             0x06 => Some(Self::ReadFile),
             0x08 => Some(Self::WriteFile),
+            0x34 => Some(Self::CreateFile),
             _ => None,
         }
     }
@@ -120,6 +125,7 @@ impl NtCall {
             Self::TerminateProcess => NtService::TerminateProcess,
             Self::ReadFile => NtService::ReadFile,
             Self::WriteFile => NtService::WriteFile,
+            Self::CreateFile => NtService::CreateFile,
         }
     }
 }
@@ -155,6 +161,11 @@ pub enum NtRequest {
         handle: u32,
         /// Validated source range.
         buffer: UserBuffer,
+    },
+    /// Open a file by NT name.
+    CreateFile {
+        /// The 16-byte `UNICODE_STRING` naming the object.
+        name: UserBuffer,
     },
 }
 
@@ -204,6 +215,9 @@ impl NtRequest {
                 handle: decode_handle(registers.args[0])?,
                 buffer: decode_buffer(registers.args[1], registers.args[2], MAX_WRITE_LENGTH)?,
             }),
+            NtService::CreateFile => Ok(Self::CreateFile {
+                name: decode_struct(registers.args[0], crate::nt_string::UNICODE_STRING_SIZE)?,
+            }),
             _ => Err(Error::Unsupported),
         }
     }
@@ -215,6 +229,19 @@ fn decode_handle(raw: u64) -> Result<u32> {
         return Err(Error::InvalidHandle);
     }
     Ok(handle)
+}
+
+/// Decode a pointer to a fixed-size structure the caller must copy in.
+fn decode_struct(address: u64, size: usize) -> Result<UserBuffer> {
+    if address == 0 {
+        return Err(Error::BadAddress);
+    }
+    let length = u64::try_from(size).map_err(|_| Error::OutOfRange)?;
+    let end = address.checked_add(length).ok_or(Error::OutOfRange)?;
+    if end > crate::paging::USER_ADDRESS_LIMIT {
+        return Err(Error::BadAddress);
+    }
+    Ok(UserBuffer { address, length })
 }
 
 fn decode_buffer(address: u64, length: u64, bound: u64) -> Result<UserBuffer> {
@@ -327,9 +354,19 @@ mod tests {
             NtRequest::decode_with_table(win10, 0x2c, &registers),
             Ok(NtRequest::TerminateProcess { status: 3 })
         );
-        // Listed in the table but not yet decodable.
+        // NtCreateFile takes the address of a 16-byte UNICODE_STRING.
         assert_eq!(
             NtRequest::decode_with_table(win10, 0x55, &registers),
+            Ok(NtRequest::CreateFile {
+                name: UserBuffer {
+                    address: 3,
+                    length: 16,
+                },
+            })
+        );
+        // Listed in the table but not yet decodable.
+        assert_eq!(
+            NtRequest::decode_with_table(win10, 0x28, &registers),
             Err(Error::Unsupported)
         );
         // Not listed at all.

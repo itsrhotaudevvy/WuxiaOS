@@ -156,9 +156,10 @@ pub trait Utf16Ascii {
 
     /// Convert an all-ASCII name into `out` and return it as `&str`.
     ///
-    /// Fails with [`Error::InvalidName`] for any code unit above `0x7f`. Surrogates
-    /// are above that range, so unpaired surrogates are rejected as well. Fails with
-    /// [`Error::OutOfRange`] when `out` is shorter than the name.
+    /// Fails with [`Error::InvalidName`] for any code unit above `0x7f`, which
+    /// includes a NUL code unit. Surrogates are above that range, so unpaired
+    /// surrogates are rejected as well. Fails with [`Error::OutOfRange`] when
+    /// `out` is shorter than the name.
     fn to_ascii<'a>(&self, out: &'a mut [u8]) -> Result<&'a str>;
 }
 
@@ -176,7 +177,7 @@ impl Utf16Ascii for [u16] {
         for (dst, &unit) in out.iter_mut().zip(self) {
             *dst = u8::try_from(unit)
                 .ok()
-                .filter(u8::is_ascii)
+                .filter(|value| value.is_ascii() && *value != 0)
                 .ok_or(Error::InvalidName)?;
         }
         core::str::from_utf8(out).map_err(|_| Error::InvalidName)

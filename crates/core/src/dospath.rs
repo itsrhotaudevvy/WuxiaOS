@@ -182,6 +182,37 @@ pub fn to_posix<'a>(path: &str, map: &DriveMap, buf: &'a mut [u8]) -> Result<&'a
     out.finish()
 }
 
+/// Extract the final component of a Win32, NT or device path.
+///
+/// The bootstrap store is flat, so `\??\C:\hello`, `C:\hello` and `hello`
+/// all name the same entry. Trailing separators are ignored. A path whose last
+/// component is `.` or `..`, or that has no component at all, is rejected: the
+/// caller must not be able to turn a name into a directory jump.
+///
+/// Errors:
+/// - [`Error::InvalidName`]: `path` contains a NUL.
+/// - [`Error::InvalidInput`]: `path` has no component at all.
+/// - [`Error::InvalidState`]: the final component is `..`.
+pub fn store_name(path: &str) -> Result<&str> {
+    reject_nul(path)?;
+    let mut name = None;
+    for component in path.split(is_separator) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            name = Some(component);
+            continue;
+        }
+        name = Some(component);
+    }
+    match name {
+        Some("..") => Err(Error::InvalidState),
+        Some(component) => Ok(component),
+        None => Err(Error::InvalidInput),
+    }
+}
+
 /// Map from drive letters to POSIX root prefixes, with room for all 26 drives.
 ///
 /// Letters are case-insensitive. A prefix is an absolute POSIX path with no
@@ -661,6 +692,23 @@ mod tests {
         assert_eq!(map.set(b'C', exact), Ok(()));
         assert_eq!(map.get(b'C'), Some(exact));
         assert_eq!(map.set(b'C', over), Err(Error::InvalidName));
+    }
+
+    #[test]
+    fn store_name_uses_the_final_component() {
+        assert_eq!(store_name("hello"), Ok("hello"));
+        assert_eq!(store_name("\\??\\C:\\hello"), Ok("hello"));
+        assert_eq!(store_name("C:\\Users\\x\\motd.txt"), Ok("motd.txt"));
+        assert_eq!(store_name("a/b//c/"), Ok("c"));
+        assert_eq!(store_name("C:\\a\\..\\b"), Ok("b"));
+    }
+
+    #[test]
+    fn store_name_rejects_jumps_and_empty_paths() {
+        assert_eq!(store_name(""), Err(Error::InvalidInput));
+        assert_eq!(store_name("\\\\"), Err(Error::InvalidInput));
+        assert_eq!(store_name("C:\\a\\.."), Err(Error::InvalidState));
+        assert_eq!(store_name("a\0b"), Err(Error::InvalidName));
     }
 
     #[test]

@@ -633,13 +633,73 @@ fn service_nt_syscall(frame: &mut InterruptFrame) {
         Ok(NtRequest::TerminateProcess { status }) => {
             terminate(frame, u64::from(status), "WUXIA_NT_EXIT\n");
         }
-        Ok(NtRequest::ReadFile { .. }) => {
-            frame.rax = u64::from(NtStatus::NOT_IMPLEMENTED.0);
+        Ok(NtRequest::ReadFile { handle, buffer }) => {
+            let length = buffer.length as usize;
+            let mut scratch = [0u8; wuxia_core::syscall::MAX_READ_LENGTH as usize];
+            let read = crate::sched::descriptor_file(handle).and_then(|(file, offset)| {
+                let count = crate::vfs::read(file, offset, &mut scratch[..length])?;
+                copy_user_from(buffer.address, &scratch[..count]).ok()?;
+                crate::sched::advance_descriptor(handle, count as u64).then_some(count)
+            });
+            match read {
+                Some(count) => {
+                    serial::write_str("WUXIA_NT_READ_OK\n");
+                    frame.rax = count as u64;
+                }
+                None => frame.rax = u64::from(NtStatus::INVALID_HANDLE.0),
+            }
+        }
+        Ok(NtRequest::CreateFile { name }) => {
+            let mut raw = [0u8; wuxia_core::nt_string::UNICODE_STRING_SIZE];
+            let opened = copy_user_bytes(name.address, name.length, &mut raw)
+                .ok()
+                .and_then(|_| open_nt_name(&raw));
+            match opened {
+                Some(handle) => {
+                    serial::write_str("WUXIA_NT_CREATE_OK\n");
+                    frame.rax = u64::from(handle);
+                }
+                None => {
+                    serial::write_str("WUXIA_NT_CREATE_DENIED\n");
+                    frame.rax = u64::from(NtStatus::OBJECT_NAME_NOT_FOUND.0);
+                }
+            }
         }
         Err(_) => {
             frame.rax = u64::from(NtStatus::INVALID_PARAMETER.0);
         }
     }
+}
+
+/// Resolve an NT `UNICODE_STRING` to an open store handle.
+///
+/// The caller has already copied the 16-byte descriptor out of user memory.
+/// The name bytes are copied next, decoded as ASCII, and reduced to the final
+/// path component, because the bootstrap store is flat. Anything the store
+/// cannot serve — a wide name, a directory jump, a missing entry, or an entry
+/// the process has not unveiled — closes as "not found" rather than leaking
+/// which rule rejected it.
+fn open_nt_name(descriptor: &[u8; wuxia_core::nt_string::UNICODE_STRING_SIZE]) -> Option<u32> {
+    use wuxia_core::nt_string::Utf16Ascii;
+
+    let name = wuxia_core::nt_string::UnicodeString::parse(descriptor).ok()?;
+    if name.length == 0 {
+        return None;
+    }
+    let mut units = [0u8; 256];
+    let length = usize::from(name.length);
+    if length > units.len() {
+        return None;
+    }
+    copy_user_bytes(name.buffer, u64::from(name.length), &mut units[..length]).ok()?;
+    let mut wide = [0u16; 128];
+    for (index, pair) in units[..length].chunks_exact(2).enumerate() {
+        wide[index] = u16::from_le_bytes([pair[0], pair[1]]);
+    }
+    let mut ascii = [0u8; 128];
+    let text = wide[..length / 2].to_ascii(&mut ascii).ok()?;
+    let store_name = wuxia_core::dospath::store_name(text).ok()?;
+    crate::sched::open_path(store_name)
 }
 
 /// Copy a bounded user range into `out` through the HHDM.
