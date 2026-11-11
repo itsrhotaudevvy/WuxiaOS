@@ -15,6 +15,7 @@ use limine::request::{
 
 mod gdt;
 mod idt;
+mod interrupts;
 mod memory;
 mod paging;
 mod user;
@@ -60,6 +61,10 @@ pub extern "C" fn _start() -> ! {
     gdt::init();
     serial::write_str("WUXIA_GDT_OK\n");
     idt::self_test();
+    interrupts::init(100);
+    serial::write_str("WUXIA_TIMER_STARTED\n");
+    interrupts::wait_for_ticks(5);
+    serial::write_str("WUXIA_TIMER_OK\n");
     let response = MEMORY_MAP_REQUEST
         .get_response()
         .expect("Limine did not provide a memory map");

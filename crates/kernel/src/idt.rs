@@ -151,6 +151,7 @@ pub fn init() {
         idt.set_handler(6, invalid_opcode as usize, 0);
         idt.set_handler(13, general_protection as usize, 0);
         idt.set_handler(14, page_fault as usize, 0);
+        idt.set_handler(0x20, timer as usize, 0);
         idt.set_handler(0x80, syscall_gate as usize, 3);
         idt.load();
     }
@@ -191,6 +192,7 @@ isr!(breakpoint, 3);
 isr!(invalid_opcode, 6);
 isr_error!(general_protection, 13);
 isr_error!(page_fault, 14);
+isr!(timer, 0x20);
 isr!(syscall_gate, 0x80);
 
 #[unsafe(naked)]
@@ -276,6 +278,7 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
             serial::debug_exit(1);
             halt();
         }
+        0x20 => crate::interrupts::tick(),
         0x80 => service_syscall(frame),
         _ => {
             serial::write_str("WUXIA_UNEXPECTED_VECTOR\n");
