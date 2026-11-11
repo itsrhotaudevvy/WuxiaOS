@@ -24,8 +24,11 @@ pub const TLS_DIRECTORY: usize = 9;
 /// Size in bytes of `IMAGE_TLS_DIRECTORY64`.
 pub const TLS_DIRECTORY64_SIZE: usize = 40;
 
-/// Largest accepted raw template, `EndAddressOfRawData - StartAddressOfRawData`.
-pub const MAX_TLS_RAW_SIZE: u64 = 1 << 20;
+/// Largest accepted template: the raw data plus its zero fill, in bytes.
+///
+/// The loader gives every thread a block of this size. The zero fill is a
+/// 32-bit field, so without a cap an image could request almost 4 GiB.
+pub const MAX_TLS_TEMPLATE_SIZE: u64 = 1 << 20;
 
 /// Maximum number of callbacks accepted before the NULL terminator.
 pub const MAX_TLS_CALLBACKS: usize = 64;
@@ -89,9 +92,9 @@ impl<'a> TlsDirectory<'a> {
     ///
     /// Errors: `Unsupported` for a PE32 image; `InvalidImage` when the directory
     /// is shorter than 40 bytes or lies outside section raw data, when
-    /// `StartAddressOfRawData` exceeds `EndAddressOfRawData`, when the template
-    /// is larger than `MAX_TLS_RAW_SIZE`, when an address lies outside the image,
-    /// or when the alignment code is undefined.
+    /// `StartAddressOfRawData` exceeds `EndAddressOfRawData`, when an address lies
+    /// outside the image, or when the alignment code is undefined; `OutOfRange`
+    /// when the raw template plus its zero fill exceeds `MAX_TLS_TEMPLATE_SIZE`.
     pub fn parse(image: &'a [u8], sections: &'a [SectionRange]) -> Result<Option<Self>> {
         let slot = match data_directory(image, TLS_DIRECTORY) {
             Ok(slot) => slot,
@@ -118,8 +121,14 @@ impl<'a> TlsDirectory<'a> {
             return Err(Error::InvalidImage);
         }
         let raw_size = end - start;
-        if raw_size > MAX_TLS_RAW_SIZE {
-            return Err(Error::InvalidImage);
+        // The loader allocates the raw data and the zero fill together, so the
+        // cap applies to their sum. The add is checked, so an overflowing sum is
+        // refused rather than wrapped.
+        let template_size = raw_size
+            .checked_add(u64::from(size_of_zero_fill))
+            .ok_or(Error::OutOfRange)?;
+        if template_size > MAX_TLS_TEMPLATE_SIZE {
+            return Err(Error::OutOfRange);
         }
         // The raw range is half-open, so its end may name the image end. Every
         // other address names a byte the loader reads or writes.
@@ -357,16 +366,19 @@ mod tests {
     }
 
     #[test]
-    fn template_size_is_raw_plus_checked_zero_fill() {
+    fn zero_fill_counts_against_the_template_cap() {
         let sections = [SECTION];
+        // Nearly 4 GiB of zero fill is refused before any block could be sized.
         let big_fill = tls_image(
             IMAGE_SIZE,
             [BASE + 0x1300, BASE + 0x1320, BASE + 0x1200, 0],
             u32::MAX,
             0,
         );
-        let tls = TlsDirectory::parse(&big_fill, &sections).unwrap().unwrap();
-        assert_eq!(tls.template_size(), Ok(0x20 + u64::from(u32::MAX)));
+        assert_eq!(
+            TlsDirectory::parse(&big_fill, &sections),
+            Err(Error::OutOfRange)
+        );
     }
 
     #[test]
@@ -392,7 +404,7 @@ mod tests {
             0x20_0000,
             [
                 BASE + 0x1000,
-                BASE + 0x1000 + MAX_TLS_RAW_SIZE,
+                BASE + 0x1000 + MAX_TLS_TEMPLATE_SIZE,
                 BASE + 0x1200,
                 0,
             ],
@@ -400,13 +412,13 @@ mod tests {
             0,
         );
         let tls = TlsDirectory::parse(&at_cap, &sections).unwrap().unwrap();
-        assert_eq!(tls.raw_size(), MAX_TLS_RAW_SIZE);
+        assert_eq!(tls.raw_size(), MAX_TLS_TEMPLATE_SIZE);
 
         let over_cap = tls_image(
             0x20_0000,
             [
                 BASE + 0x1000,
-                BASE + 0x1000 + MAX_TLS_RAW_SIZE + 1,
+                BASE + 0x1000 + MAX_TLS_TEMPLATE_SIZE + 1,
                 BASE + 0x1200,
                 0,
             ],
@@ -415,7 +427,50 @@ mod tests {
         );
         assert_eq!(
             TlsDirectory::parse(&over_cap, &sections),
-            Err(Error::InvalidImage)
+            Err(Error::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn template_cap_includes_zero_fill() {
+        let sections = [SECTION];
+        // A 0x20-byte template, so the zero fill alone decides the total.
+        let with_fill = |fill: u32| {
+            tls_image(
+                IMAGE_SIZE,
+                [BASE + 0x1300, BASE + 0x1320, BASE + 0x1200, 0],
+                fill,
+                0,
+            )
+        };
+
+        // Exactly at the cap is accepted.
+        let at_cap = with_fill((MAX_TLS_TEMPLATE_SIZE - 0x20) as u32);
+        let tls = TlsDirectory::parse(&at_cap, &sections).unwrap().unwrap();
+        assert_eq!(tls.template_size(), Ok(MAX_TLS_TEMPLATE_SIZE));
+
+        // One byte over the cap is rejected.
+        let one_over = with_fill((MAX_TLS_TEMPLATE_SIZE - 0x20 + 1) as u32);
+        assert_eq!(
+            TlsDirectory::parse(&one_over, &sections),
+            Err(Error::OutOfRange)
+        );
+
+        // A raw template exactly at the cap leaves no room for any zero fill.
+        let raw_at_cap = tls_image(
+            0x20_0000,
+            [
+                BASE + 0x1000,
+                BASE + 0x1000 + MAX_TLS_TEMPLATE_SIZE,
+                BASE + 0x1200,
+                0,
+            ],
+            1,
+            0,
+        );
+        assert_eq!(
+            TlsDirectory::parse(&raw_at_cap, &sections),
+            Err(Error::OutOfRange)
         );
     }
 
