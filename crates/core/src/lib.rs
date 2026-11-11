@@ -45,6 +45,7 @@ pub mod process;
 pub mod proctree;
 pub mod random;
 pub mod region;
+pub mod registry;
 pub mod rlimit;
 pub mod schedule;
 pub mod sid;
