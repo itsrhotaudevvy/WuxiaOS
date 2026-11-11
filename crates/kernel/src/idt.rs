@@ -291,11 +291,27 @@ fn service_syscall(frame: &mut InterruptFrame) {
             serial::debug_exit(0x10);
             halt();
         }
-        Ok(request) => {
+        Ok(wuxia_core::syscall::PosixRequest::Write { descriptor, buffer }) => {
+            if descriptor != 1 || !crate::user::region_contains(buffer.address, buffer.length) {
+                serial::write_str("WUXIA_SYSCALL_REJECTED\n");
+                frame.rax = u64::MAX;
+                return;
+            }
+            match copy_user_to_serial(buffer.address, buffer.length) {
+                Ok(()) => {
+                    serial::write_str("WUXIA_SYSCALL_WRITE_OK\n");
+                    frame.rax = buffer.length;
+                }
+                Err(_) => {
+                    serial::write_str("WUXIA_SYSCALL_FAULT\n");
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
+        Ok(_) => {
             serial::write_str("WUXIA_SYSCALL_OK\n");
             serial::write_hex(frame.rax);
             // Unimplemented requests report a successful no-op result.
-            let _ = request;
             frame.rax = 0;
         }
         Err(_) => {
@@ -313,6 +329,31 @@ fn read_cr2() -> u64 {
         asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+/// Forward a validated user buffer to the serial console through the HHDM.
+///
+/// Reading through the direct map avoids relying on supervisor access to the
+/// active user mapping and refuses any leaf that is not CPL3-accessible.
+fn copy_user_to_serial(address: u64, length: u64) -> Result<(), wuxia_core::Error> {
+    let map = crate::paging::current_direct_map().ok_or(wuxia_core::Error::InvalidState)?;
+    let entry = crate::paging::resolve(map, address)?;
+    if !wuxia_core::paging::is_user(entry) {
+        return Err(wuxia_core::Error::PermissionDenied);
+    }
+    let frame = wuxia_core::paging::physical_address(entry);
+    let offset = address % wuxia_core::paging::PAGE_SIZE;
+    if offset + length > wuxia_core::paging::PAGE_SIZE {
+        return Err(wuxia_core::Error::InvalidInput);
+    }
+    let source = map.physical_to_virtual(frame + offset)? as *const u8;
+    for index in 0..length as usize {
+        // SAFETY: the leaf is present and user-accessible, and the bounded
+        // range stays inside one 4 KiB frame.
+        let byte = unsafe { source.add(index).read_volatile() };
+        serial::write_byte(byte);
+    }
+    Ok(())
 }
 
 fn halt() -> ! {

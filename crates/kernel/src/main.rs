@@ -81,24 +81,24 @@ pub extern "C" fn _start() -> ! {
     serial::write_str("WUXIA_HHDM_OK\n");
     serial::write_hex(direct_map.offset());
 
-    // mov rax, 39; int 0x80; mov rax, 60; xor rdi, rdi; int 0x80
-    // getpid returns to CPL3, then exit(0) ends the self-test.
-    const USER_CODE: [u8; 21] = [
-        0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00,
-        0x00, 0x48, 0x31, 0xff, 0xcd, 0x80,
-    ];
-    paging::write_frame(direct_map, first, &USER_CODE).expect("cannot write the user code page");
+    const MESSAGE: &[u8] = b"HELLO FROM USER\n";
     let stack = allocator
         .allocate_frame()
         .expect("a user stack frame is required");
+    let data = allocator
+        .allocate_frame()
+        .expect("a user data frame is required");
+    paging::write_frame(direct_map, data, MESSAGE).expect("cannot write the user data page");
+    paging::record_direct_map(direct_map);
 
-    let image = paging::install_user_image(&mut allocator, direct_map, first, stack)
+    let image = paging::install_user_image(&mut allocator, direct_map, first, stack, data)
         .expect("cannot install the isolated user image");
     serial::write_str("WUXIA_USER_IMAGE_OK\n");
     serial::write_hex(image.old_pml4);
     serial::write_hex(image.new_pml4);
     serial::write_hex(image.code_address);
     serial::write_hex(image.stack_address);
+    serial::write_hex(image.data_address);
 
     paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");
@@ -116,10 +116,40 @@ pub extern "C" fn _start() -> ! {
         stack_leaf, image.stack_entry,
         "the stack leaf changed after activation"
     );
+    let data_leaf = paging::resolve(direct_map, image.data_address)
+        .expect("the new root does not resolve the user data page");
+    assert_eq!(
+        data_leaf, image.data_entry,
+        "the data leaf changed after activation"
+    );
     serial::write_str("WUXIA_POST_SWITCH_PASS\n");
     serial::write_hex(code);
     serial::write_hex(stack_leaf);
+    serial::write_hex(data_leaf);
 
+    // write(1, 0x1000, 8) is rejected because the address is outside the
+    // mapped image, then write(1, MESSAGE, len) succeeds, then exit(0).
+    let mut program = [0u8; 73];
+    program.copy_from_slice(&[
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
+        0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 0x1000 (outside the image)
+        0x48, 0xc7, 0xc2, 0x08, 0x00, 0x00, 0x00, // mov rdx, 8
+        0xcd, 0x80, // int 0x80
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
+        0x48, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rsi, data
+        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // mov rdx, length
+        0xcd, 0x80, // int 0x80
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
+        0x48, 0x31, 0xff, // xor rdi, rdi
+        0xcd, 0x80, // int 0x80
+    ]);
+    program[44..52].copy_from_slice(&image.data_address.to_le_bytes());
+    program[55..59].copy_from_slice(&(MESSAGE.len() as u32).to_le_bytes());
+    paging::write_frame(direct_map, first, &program).expect("cannot write the user code page");
+
+    user::set_region(image.code_address, image.data_address + 0x1000);
     serial::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.code_address, image.stack_address + 0x1000 - 16);
 }
@@ -185,6 +215,11 @@ mod serial {
             }
             put_byte(byte);
         }
+    }
+
+    /// Write one raw byte, used when forwarding an untrusted user buffer.
+    pub fn write_byte(byte: u8) {
+        put_byte(byte);
     }
 
     fn put_byte(byte: u8) {

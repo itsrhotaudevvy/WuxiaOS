@@ -34,18 +34,23 @@ pub struct UserImage {
     pub code_address: u64,
     /// Virtual address of the writable stack page.
     pub stack_address: u64,
+    /// Virtual address of the read-only data page.
+    pub data_address: u64,
     /// Encoded leaf entry for the code page.
     pub code_entry: u64,
     /// Encoded leaf entry for the stack page.
     pub stack_entry: u64,
+    /// Encoded leaf entry for the data page.
+    pub data_entry: u64,
 }
 
-/// Build a two-page user subtree, clone the active root and load it into CR3.
+/// Build a three-page user subtree, clone the active root and load it into CR3.
 pub fn install_user_image<const N: usize>(
     allocator: &mut BumpAllocator<N>,
     direct_map: DirectMap,
     code_physical: u64,
     stack_physical: u64,
+    data_physical: u64,
 ) -> Result<UserImage, Error> {
     let old_pml4 = read_cr3();
     let old_root = frame_pointer(direct_map, old_pml4)?;
@@ -54,14 +59,17 @@ pub fn install_user_image<const N: usize>(
         .ok_or(Error::TableFull)?;
     let code_address = (slot as u64) << 39;
     let stack_address = code_address + PAGE_SIZE;
+    let data_address = stack_address + PAGE_SIZE;
 
-    let (pdpt, code_entry, stack_entry) = link_pages(
+    let (pdpt, code_entry, stack_entry, data_entry) = link_pages(
         allocator,
         direct_map,
         code_address,
         code_physical,
         stack_address,
         stack_physical,
+        data_address,
+        data_physical,
     )?;
 
     let new_pml4 = allocator.allocate_frame().ok_or(Error::TableFull)?;
@@ -81,8 +89,10 @@ pub fn install_user_image<const N: usize>(
         new_pml4,
         code_address,
         stack_address,
+        data_address,
         code_entry,
         stack_entry,
+        data_entry,
     })
 }
 
@@ -105,6 +115,27 @@ pub fn read_cr3() -> u64 {
     }
     value & !0xfff
 }
+
+/// Record the bootloader direct-map offset for later syscall paths.
+pub fn record_direct_map(map: DirectMap) {
+    // SAFETY: written once during bootstrap before ring 3 starts.
+    unsafe {
+        *core::ptr::addr_of_mut!(DIRECT_MAP_OFFSET) = map.offset();
+    }
+}
+
+/// Return the recorded direct map, if bootstrap recorded one.
+pub fn current_direct_map() -> Option<DirectMap> {
+    // SAFETY: the offset is written once before ring 3 starts.
+    let offset = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(DIRECT_MAP_OFFSET)) };
+    if offset == 0 {
+        None
+    } else {
+        DirectMap::new(offset).ok()
+    }
+}
+
+static mut DIRECT_MAP_OFFSET: u64 = 0;
 
 /// Resolve a user address through the currently active root.
 pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error> {
@@ -135,7 +166,9 @@ fn link_pages<const N: usize>(
     code_physical: u64,
     stack_address: u64,
     stack_physical: u64,
-) -> Result<(u64, u64, u64), Error> {
+    data_address: u64,
+    data_physical: u64,
+) -> Result<(u64, u64, u64, u64), Error> {
     let pdpt = allocator.allocate_frame().ok_or(Error::TableFull)?;
     let pd = allocator.allocate_frame().ok_or(Error::TableFull)?;
     let pt = allocator.allocate_frame().ok_or(Error::TableFull)?;
@@ -158,10 +191,12 @@ fn link_pages<const N: usize>(
         stack_physical,
         PagePermissions::USER_READ_WRITE,
     )?;
+    let data_entry = leaf(data_address, data_physical, PagePermissions::USER_READ_ONLY)?;
     let pointer = frame_pointer(direct_map, pt)?;
     write_entry(pointer, table_index(code_address, 3)?, code_entry);
     write_entry(pointer, table_index(stack_address, 3)?, stack_entry);
-    Ok((pdpt, code_entry, stack_entry))
+    write_entry(pointer, table_index(data_address, 3)?, data_entry);
+    Ok((pdpt, code_entry, stack_entry, data_entry))
 }
 
 fn zero_frame(direct_map: DirectMap, frame: u64) -> Result<(), Error> {
