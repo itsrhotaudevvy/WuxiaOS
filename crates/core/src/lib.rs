@@ -8,6 +8,7 @@
 
 pub mod acl;
 pub mod address_space;
+pub mod buddy;
 pub mod capability;
 pub mod cow;
 pub mod credentials;
