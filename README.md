@@ -16,8 +16,8 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 - A Limine ISO boots in QEMU and reaches the high-half kernel at `0xffffffff80000000`.
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
-- The kernel validates Limine's HHDM offset and builds a four-level page-table chain for one user page, then walks it back to confirm every entry resolves.
-- `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X; CR3 is not yet loaded.
+- The kernel validates Limine's HHDM offset, builds a four-level page-table chain for one user page, clones the active PML4 into a fresh root, loads that root into CR3 and re-resolves the page through the active tables.
+- `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X.
 - 34 `wuxia-core` host tests pass.
 - PE parsing validates container metadata only. No Windows program or driver is executed yet.
 - IDT/GDT definitions are scaffolding; CPU interrupt installation and userspace transitions are not complete.
@@ -54,7 +54,9 @@ WUXIA_BOOT_OK: Limine entered the high-half kernel
 WUXIA_MEMORY_MAP_READY
 WUXIA_FRAME_ALLOC_OK
 WUXIA_HHDM_OK
-WUXIA_PAGE_TABLE_OK
+WUXIA_MAPPING_INSTALLED
+WUXIA_CR3_OK
+WUXIA_POST_SWITCH_PASS
 WUXIA_TEST_PASS
 ```
 

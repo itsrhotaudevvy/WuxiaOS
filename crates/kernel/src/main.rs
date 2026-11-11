@@ -77,17 +77,25 @@ pub extern "C" fn _start() -> ! {
     serial::write_str("WUXIA_HHDM_OK\n");
     serial::write_hex(direct_map.offset());
 
-    let tables = paging::build(
-        &mut allocator,
-        direct_map,
-        paging::TEST_VIRTUAL_ADDRESS,
-        first,
-    )
-    .expect("cannot build and verify the bootstrap page tables");
-    serial::write_str("WUXIA_PAGE_TABLE_OK\n");
-    serial::write_hex(tables.pml4);
-    serial::write_hex(tables.page_table);
-    serial::write_hex(tables.leaf_entry);
+    let mapping = paging::install_user_mapping(&mut allocator, direct_map, first)
+        .expect("cannot install the isolated user mapping");
+    serial::write_str("WUXIA_MAPPING_INSTALLED\n");
+    serial::write_hex(mapping.old_pml4);
+    serial::write_hex(mapping.new_pml4);
+    serial::write_hex(mapping.virtual_address);
+
+    paging::activate(mapping.new_pml4);
+    serial::write_str("WUXIA_CR3_OK\n");
+    serial::write_hex(paging::read_cr3());
+
+    let resolved = paging::resolve(direct_map, mapping.virtual_address)
+        .expect("the new root does not resolve the installed user page");
+    assert_eq!(
+        resolved, mapping.leaf_entry,
+        "the activated root resolved a different leaf"
+    );
+    serial::write_str("WUXIA_POST_SWITCH_PASS\n");
+    serial::write_hex(resolved);
 
     serial::write_str("WUXIA_TEST_PASS\n");
     serial::debug_exit(0x10);
