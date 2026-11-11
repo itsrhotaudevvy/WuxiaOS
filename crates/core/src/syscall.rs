@@ -39,6 +39,8 @@ pub enum PosixCall {
     Unmap = 11,
     /// Yield the processor to another runnable thread.
     Yield = 24,
+    /// Sleep for a bounded number of milliseconds.
+    Sleep = 35,
     /// Return the process identifier.
     GetPid = 39,
     /// Terminate the calling thread or process.
@@ -56,6 +58,7 @@ impl PosixCall {
             9 => Some(Self::Map),
             11 => Some(Self::Unmap),
             24 => Some(Self::Yield),
+            35 => Some(Self::Sleep),
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
             _ => None,
@@ -77,6 +80,9 @@ pub const MAX_MAP_LENGTH: u64 = 64 * 1024;
 
 /// Longest file path accepted by the open call.
 pub const MAX_PATH_LENGTH: u64 = crate::vfs::MAX_NAME_LENGTH as u64;
+
+/// Longest sleep a single call may request.
+pub const MAX_SLEEP_MILLIS: u64 = 5000;
 
 /// Largest buffer a single POSIX read may fill.
 pub const MAX_READ_LENGTH: u64 = 256;
@@ -122,6 +128,11 @@ pub enum PosixRequest {
     },
     /// Yield the processor to another runnable thread.
     Yield,
+    /// Sleep for a bounded number of milliseconds.
+    Sleep {
+        /// Requested duration, at most [`MAX_SLEEP_MILLIS`].
+        millis: u64,
+    },
     /// Return the process identifier.
     GetPid,
     /// Terminate the calling process with a status code.
@@ -161,12 +172,22 @@ impl PosixRequest {
                 descriptor: decode_descriptor(registers.args[0])?,
             }),
             PosixCall::Yield => Ok(Self::Yield),
+            PosixCall::Sleep => Ok(Self::Sleep {
+                millis: decode_sleep_millis(registers.args[0])?,
+            }),
             PosixCall::GetPid => Ok(Self::GetPid),
             PosixCall::Exit => Ok(Self::Exit {
                 code: registers.args[0],
             }),
         }
     }
+}
+
+fn decode_sleep_millis(raw: u64) -> Result<u64> {
+    if raw > MAX_SLEEP_MILLIS {
+        return Err(Error::InvalidInput);
+    }
+    Ok(raw)
 }
 
 fn decode_unmap_address(raw: u64) -> Result<u64> {
@@ -247,6 +268,22 @@ mod tests {
         registers.args[0] = MAX_MAP_LENGTH + 1;
         assert_eq!(
             PosixRequest::decode(9, &registers),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sleep_durations_are_bounded() {
+        let mut registers = Registers {
+            args: [100, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(35, &registers),
+            Ok(PosixRequest::Sleep { millis: 100 })
+        );
+        registers.args[0] = MAX_SLEEP_MILLIS + 1;
+        assert_eq!(
+            PosixRequest::decode(35, &registers),
             Err(Error::InvalidInput)
         );
     }

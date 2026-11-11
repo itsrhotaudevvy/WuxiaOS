@@ -20,6 +20,9 @@ const PIT_CHANNEL0: u16 = 0x40;
 const PIT_COMMAND: u16 = 0x43;
 const PIT_FREQUENCY: u32 = 1_193_182;
 
+/// Tick rate programmed into the PIT.
+pub const TIMER_HZ: u64 = 100;
+
 /// Timer ticks since the PIT was started.
 static mut TICKS: u64 = 0;
 
@@ -53,6 +56,28 @@ pub fn wait_for_ticks(count: u64) {
 }
 
 /// Record one tick and acknowledge the master PIC.
+/// Wait until `millis` have elapsed on the timer.
+///
+/// The CPU halts between ticks instead of spinning, but the calling thread
+/// keeps the processor: this is not yet a blocking sleep.
+pub fn sleep_millis(millis: u64) {
+    let Some(target) = wuxia_core::schedule::deadline(ticks(), millis, TIMER_HZ) else {
+        return;
+    };
+    while ticks() < target {
+        // SAFETY: enabling interrupts inside the handler lets the PIT arrive,
+        // and halting wakes on that interrupt.
+        unsafe {
+            asm!(
+                "sti",
+                "hlt",
+                "cli",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+}
+
 pub fn tick() {
     // SAFETY: bootstrap is single-threaded; the handler runs with interrupts
     // disabled and is the only writer while ring 3 is active.

@@ -14,6 +14,26 @@ pub fn next_runnable(current: usize, runnable: &[bool]) -> Option<usize> {
         .find(|index| runnable[*index])
 }
 
+/// Convert a millisecond duration to timer ticks, rounding up.
+///
+/// A non-zero duration always waits at least one tick, and `hz` of zero
+/// reports an invalid configuration rather than dividing by zero.
+pub fn ticks_for_millis(millis: u64, hz: u64) -> Option<u64> {
+    if hz == 0 {
+        return None;
+    }
+    if millis == 0 {
+        return Some(0);
+    }
+    let scaled = millis.checked_mul(hz)?;
+    Some(scaled.div_ceil(1000))
+}
+
+/// Deadline tick for a sleep of `millis` starting at `now`.
+pub fn deadline(now: u64, millis: u64, hz: u64) -> Option<u64> {
+    Some(now.saturating_add(ticks_for_millis(millis, hz)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,6 +56,18 @@ mod tests {
         assert_eq!(next_runnable(0, &[true]), None);
         assert_eq!(next_runnable(1, &[false, true]), None);
         assert_eq!(next_runnable(0, &[false, false]), None);
+    }
+
+    #[test]
+    fn millisecond_sleeps_convert_to_whole_ticks() {
+        assert_eq!(ticks_for_millis(0, 100), Some(0));
+        assert_eq!(ticks_for_millis(1000, 100), Some(100));
+        assert_eq!(ticks_for_millis(10, 100), Some(1));
+        assert_eq!(ticks_for_millis(1, 100), Some(1));
+        assert_eq!(ticks_for_millis(5, 0), None);
+        assert_eq!(deadline(70, 100, 100), Some(80));
+        assert_eq!(deadline(0, 0, 100), Some(0));
+        assert_eq!(deadline(u64::MAX - 1, 100, 100), Some(u64::MAX));
     }
 
     #[test]

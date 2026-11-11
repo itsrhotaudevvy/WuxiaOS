@@ -98,6 +98,15 @@ core::arch::global_asm!(
     "lea rsi, [rip + {second}]",
     "mov rdx, 15",
     "int 0x80",
+    // sleep(100) on the timer, then report that it returned
+    "mov rax, 35",
+    "mov rdi, 100",
+    "int 0x80",
+    "mov rax, 1",
+    "mov rdi, 1",
+    "lea rsi, [rip + {slept}]",
+    "mov rdx, 6",
+    "int 0x80",
     // exit(0)
     "mov rax, 60",
     "xor rdi, rdi",
@@ -105,11 +114,16 @@ core::arch::global_asm!(
     "ud2",
     message = sym MESSAGE,
     second = sym SECOND,
+    slept = sym SLEPT,
 );
 
 /// Greeting written to the serial console through `write(1, …)`.
 #[used]
 static MESSAGE: [u8; 16] = *b"HELLO FROM USER\n";
+
+/// Written after the timer sleep returns.
+#[used]
+static SLEPT: [u8; 6] = *b"SLEPT\n";
 
 /// Written after the yield resumes, proving the saved frame was restored.
 #[used]
