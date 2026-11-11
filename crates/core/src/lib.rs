@@ -29,6 +29,7 @@ pub mod pipe;
 pub mod pledge;
 pub mod priority;
 pub mod process;
+pub mod proctree;
 pub mod region;
 pub mod schedule;
 pub mod signal;
