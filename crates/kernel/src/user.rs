@@ -1,34 +1,18 @@
-//! Ring-3 entry and the image started after the bootstrap process ends.
+//! Ring-3 entry.
 
 use core::arch::asm;
-use core::ptr::{addr_of, addr_of_mut, read_volatile};
 
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
-use crate::paging::UserImage;
 
-const INTERRUPTS_ENABLED: u64 = 1 << 1;
-
-/// The image started after the bootstrap process exits.
-static mut NEXT_IMAGE: Option<UserImage> = None;
-
-/// Store the image started after the bootstrap process exits.
-pub fn set_next_image(image: UserImage) {
-    // SAFETY: written once before ring 3 starts.
-    unsafe {
-        *addr_of_mut!(NEXT_IMAGE) = Some(image);
-    }
-}
-
-/// Return the image started after the bootstrap process exits.
-pub fn next_image() -> Option<UserImage> {
-    // SAFETY: the image is written once before ring 3 starts.
-    unsafe { read_volatile(addr_of!(NEXT_IMAGE)) }
-}
+/// RFLAGS for the first ring-3 entry: IF (bit 9) set plus the reserved bit 1.
+const INTERRUPTS_ENABLED: u64 = (1 << 9) | (1 << 1);
 
 /// Enter CPL3 at `entry` with `stack_pointer` and never return.
 pub fn enter(entry: u64, stack_pointer: u64) -> ! {
     // SAFETY: both virtual addresses are mapped for user access by the active
-    // page tables, and the user descriptors are present in the loaded GDT.
+    // page tables, the user descriptors are present in the loaded GDT, and the
+    // IDT gates and TSS trap stack are installed. The PIC is already remapped
+    // and IRQ0 unmasked, so a timer interrupt taken in ring 3 is serviced.
     unsafe {
         asm!(
             "push {ss}",

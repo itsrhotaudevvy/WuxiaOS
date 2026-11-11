@@ -265,15 +265,14 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
         14 => {
             let address = read_cr2();
             if frame.cs & 3 == 3 {
-                // A fault raised by ring 3 terminates the process; the kernel
-                // keeps running and reports the fault instead of dying with it.
+                // A fault raised by ring 3 terminates only the faulting process;
+                // the kernel reports it and resumes the next runnable thread.
                 serial::write_str("WUXIA_USER_PAGE_FAULT\n");
                 serial::write_hex(frame.error);
                 serial::write_hex(address);
                 serial::write_hex(frame.rip);
-                serial::write_str("WUXIA_TEST_PASS\n");
-                serial::debug_exit(0x10);
-                halt();
+                terminate_faulting(frame);
+                return;
             }
             serial::write_str("WUXIA_PAGE_FAULT\n");
             serial::write_hex(frame.error);
@@ -478,7 +477,11 @@ fn read_cr2() -> u64 {
     value
 }
 
-/// Terminate the calling process, resuming another thread or the next image.
+/// Status recorded for a process killed by a CPL3 page fault: 128 plus
+/// SIGSEGV (11), the value a shell reports for such a process.
+const FAULT_EXIT_STATUS: u64 = 128 + 11;
+
+/// Terminate the calling process, resuming another thread or ending the run.
 fn terminate(frame: &mut InterruptFrame, code: u64, label: &str) {
     if !crate::sched::exit_process(code) {
         serial::write_str("WUXIA_SYSCALL_INVALID\n");
@@ -490,19 +493,34 @@ fn terminate(frame: &mut InterruptFrame, code: u64, label: &str) {
     if crate::sched::exit_current(frame) {
         return;
     }
+    finish();
+}
+
+/// Terminate the process that raised a CPL3 page fault.
+///
+/// The process leaves through the same path as `exit`, so its frames are
+/// reclaimed and the next runnable thread resumes. The fault cannot be
+/// retried, so an impossible state is a test failure rather than a return.
+fn terminate_faulting(frame: &mut InterruptFrame) {
+    if !crate::sched::exit_process(FAULT_EXIT_STATUS) {
+        serial::write_str("WUXIA_TEST_FAIL: faulting process cannot be terminated\n");
+        serial::debug_exit(1);
+        halt();
+    }
+    serial::write_str("WUXIA_USER_FAULT_KILLED\n");
+    serial::write_hex(FAULT_EXIT_STATUS);
+    if !crate::sched::exit_current(frame) {
+        finish();
+    }
+}
+
+/// End the test run once no user thread is left, as the normal end of boot.
+fn finish() -> ! {
     serial::write_str("WUXIA_TEARDOWN_OK\n");
     if let Some(frame) = crate::memory::allocate_frame() {
         serial::write_str("WUXIA_TEARDOWN_REUSE_OK\n");
         serial::write_hex(frame);
         let _ = crate::memory::free_frame(frame);
-    }
-    if let Some(image) = crate::user::next_image() {
-        serial::write_str("WUXIA_FAULT_TEST\n");
-        crate::paging::activate(image.new_pml4);
-        crate::user::enter(
-            image.entry,
-            image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16,
-        );
     }
     serial::write_str("WUXIA_TEST_PASS\n");
     serial::debug_exit(0x10);

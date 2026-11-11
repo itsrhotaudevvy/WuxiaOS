@@ -34,6 +34,8 @@ pub struct Thread {
     pub resume_tick: u64,
     /// Whether the thread waits for an explicit start after boot.
     pub deferred: bool,
+    /// Line written to the serial console when a deferred thread starts.
+    pub start_label: &'static str,
     /// Process identity, address space and descriptors for this thread.
     pub process: Process<8>,
     /// Frames owned by the thread's image.
@@ -94,6 +96,7 @@ pub fn register(
             wake_at: 0,
             resume_tick: 0,
             deferred: false,
+            start_label: "",
             process,
             frames,
         });
@@ -102,13 +105,15 @@ pub fn register(
     }
 }
 
-/// Register a thread that starts only after every boot thread has exited.
+/// Register a thread that starts, printing `start_label`, only after every
+/// earlier thread has exited. Deferred threads start in registration order.
 pub fn register_deferred(
     root: u64,
     entry: u64,
     stack_top: u64,
     process: Process<8>,
     frames: crate::paging::FrameTracker,
+    start_label: &'static str,
 ) -> Option<usize> {
     let index = register(root, entry, stack_top, process, frames)?;
     // SAFETY: registration happens once, before ring 3 starts.
@@ -117,6 +122,7 @@ pub fn register_deferred(
         threads[index] = threads[index].map(|thread| Thread {
             runnable: false,
             deferred: true,
+            start_label,
             ..thread
         });
     }
@@ -536,7 +542,7 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
                     thread.deferred = false;
                     thread.resume_tick = crate::interrupts::ticks().saturating_add(1);
                 }
-                serial::write_str("WUXIA_NT_ENTER\n");
+                serial::write_str(thread.start_label);
                 serial::write_hex(index as u64);
                 return true;
             }

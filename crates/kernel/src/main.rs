@@ -195,7 +195,6 @@ pub extern "C" fn _start() -> ! {
             wuxia_core::PagePermissions::USER_READ_WRITE,
         )
         .expect("the user stack cannot be modeled");
-    user::set_next_image(fault);
 
     let mut second_process = wuxia_core::Process::<8>::new(2, wuxia_core::Personality::Posix)
         .expect("the second process cannot be created");
@@ -233,7 +232,25 @@ pub extern "C" fn _start() -> ! {
 
     let stack_top = image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     let second_stack_top = second.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
+    let mut fault_process = wuxia_core::Process::<8>::new(4, wuxia_core::Personality::Posix)
+        .expect("the fault process cannot be created");
+    for segment in fault.segments() {
+        fault_process
+            .space_mut()
+            .map(segment.address, segment.length, segment.permissions)
+            .expect("a fault-process segment cannot be modeled");
+    }
+    fault_process
+        .space_mut()
+        .map(
+            fault.stack_address,
+            u64::from(wuxia_core::paging::PAGE_SIZE),
+            wuxia_core::PagePermissions::USER_READ_WRITE,
+        )
+        .expect("the fault-process stack cannot be modeled");
+
     let pe_stack_top = pe.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
+    let fault_stack_top = fault.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     assert_eq!(
         sched::register(
             image.new_pml4,
@@ -257,9 +274,30 @@ pub extern "C" fn _start() -> ! {
         "the second thread cannot be registered"
     );
     assert!(
-        sched::register_deferred(pe.new_pml4, pe.entry, pe_stack_top, pe_process, pe.frames)
-            .is_some(),
+        sched::register_deferred(
+            pe.new_pml4,
+            pe.entry,
+            pe_stack_top,
+            pe_process,
+            pe.frames,
+            "WUXIA_NT_ENTER\n"
+        )
+        .is_some(),
         "the PE thread cannot be registered"
+    );
+    // Registered last so it starts only after the PE thread has exited, and
+    // a CPL3 fault in it terminates only this process.
+    assert!(
+        sched::register_deferred(
+            fault.new_pml4,
+            fault.entry,
+            fault_stack_top,
+            fault_process,
+            fault.frames,
+            "WUXIA_FAULT_TEST\n"
+        )
+        .is_some(),
+        "the fault thread cannot be registered"
     );
     serial::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.entry, stack_top);

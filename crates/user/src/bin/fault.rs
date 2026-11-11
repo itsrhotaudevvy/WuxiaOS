@@ -1,6 +1,6 @@
 //! Fault self-test: the first instruction store must raise a page fault at
-//! CPL3. The kernel reports the fault and ends the run through the debug-exit
-//! device; it does not return control to this process.
+//! CPL3. The kernel reports the fault, terminates only this process, reclaims
+//! its frames and resumes scheduling; it never returns control to this process.
 
 #![no_std]
 #![no_main]
