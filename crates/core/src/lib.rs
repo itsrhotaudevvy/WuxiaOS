@@ -18,11 +18,13 @@ pub mod load;
 pub mod memory;
 pub mod nt;
 pub mod paging;
+pub mod path;
 pub mod personality;
 pub mod process;
 pub mod region;
 pub mod schedule;
 pub mod syscall;
+pub mod unveil;
 pub mod vfs;
 
 pub use address_space::AddressSpace;
