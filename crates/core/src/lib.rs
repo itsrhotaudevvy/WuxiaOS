@@ -9,6 +9,7 @@
 pub mod address_space;
 pub mod capability;
 pub mod descriptor;
+pub mod dirtree;
 pub mod dispatcher;
 pub mod elf;
 pub mod errno;
