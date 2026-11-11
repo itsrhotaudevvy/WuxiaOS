@@ -19,6 +19,7 @@ pub mod memory;
 pub mod nt;
 pub mod paging;
 pub mod personality;
+pub mod priority;
 pub mod process;
 pub mod region;
 pub mod schedule;
