@@ -28,6 +28,16 @@ impl IdtEntry {
     }
 }
 
+/// The IDT pointer consumed by `lidt`.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed)]
+pub struct IdtPointer {
+    /// One less than the size of the IDT in bytes.
+    pub limit: u16,
+    /// Linear address of the table.
+    pub base: u64,
+}
+
 /// A small IDT that can be initialized once the handler path exists.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, align(16))]
@@ -39,5 +49,12 @@ impl Idt {
     /// Construct an empty IDT with all descriptors marked not-present.
     pub const fn new() -> Self {
         Self { entries: [IdtEntry::default(); 256] }
+    }
+
+    /// Install the IDT pointer after all required exception stubs are present.
+    pub fn load(&self) {
+        // SAFETY: This routine is called only after the caller has populated a
+        // complete static IDT and validated its handler addresses.
+        unsafe { core::arch::asm!("lidt [{0}]", in(reg) &self, options(readonly, nostack, preserves_flags)) };
     }
 }
