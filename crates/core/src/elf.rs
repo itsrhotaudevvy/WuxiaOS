@@ -139,7 +139,11 @@ impl<'a> Elf64Image<'a> {
             program_count,
         };
         for index in 0..program_count as usize {
-            image.segment(index)?;
+            // Non-loadable program headers are legal and simply skipped.
+            match image.segment(index) {
+                Ok(_) | Err(Error::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
         image.check_overlaps()?;
         Ok(image)
@@ -165,6 +169,9 @@ impl<'a> Elf64Image<'a> {
     }
 
     /// Return one validated `PT_LOAD` segment.
+    ///
+    /// Non-loadable program headers (for example `PT_PHDR` or `PT_INTERP`)
+    /// return [`Error::NotFound`] rather than failing the whole image.
     pub fn segment(&self, index: usize) -> Result<ProgramSegment> {
         if index >= self.program_count as usize {
             return Err(Error::NotFound);
@@ -370,6 +377,19 @@ mod tests {
             Elf64Image::parse(&image),
             Err(Error::InvalidImage)
         ));
+    }
+
+    #[test]
+    fn non_loadable_program_headers_are_skipped() {
+        let mut image = minimal_elf();
+        image[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let second = 0x40 + 56;
+        // PT_NOTE carries no PT_LOAD segment and must not fail the parse.
+        image[second..second + 4].copy_from_slice(&4u32.to_le_bytes());
+        let elf = Elf64Image::parse(&image).unwrap();
+        assert_eq!(elf.program_header_count(), 2);
+        assert_eq!(elf.segment(0).unwrap().virtual_address, 0x400000);
+        assert!(matches!(elf.segment(1), Err(Error::NotFound)));
     }
 
     #[test]
