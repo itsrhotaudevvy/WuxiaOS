@@ -82,6 +82,19 @@ impl UnicodeString {
         }
         Ok(Self { buffer, length })
     }
+
+    /// Encode the 16-byte x64 `UNICODE_STRING` layout with the given `MaximumLength`.
+    ///
+    /// Applies the same rules as [`UnicodeString::parse`], so every encoded
+    /// value decodes back to `self`.
+    pub fn encode(&self, maximum_length: u16) -> Result<[u8; UNICODE_STRING_SIZE]> {
+        let mut bytes = [0u8; UNICODE_STRING_SIZE];
+        bytes[0..2].copy_from_slice(&self.length.to_le_bytes());
+        bytes[2..4].copy_from_slice(&maximum_length.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.buffer.to_le_bytes());
+        Self::parse(&bytes)?;
+        Ok(bytes)
+    }
 }
 
 /// A decoded x64 `OBJECT_ATTRIBUTES` with a validated attribute mask.
@@ -292,6 +305,23 @@ mod tests {
             UnicodeString::parse(&unicode_bytes(4, 4, u64::MAX - 1)),
             Err(Error::OutOfRange)
         );
+    }
+
+    #[test]
+    fn unicode_string_encode_round_trips_and_validates() {
+        let name = UnicodeString {
+            buffer: 0x2000,
+            length: 6,
+        };
+        let bytes = name.encode(8).unwrap();
+        assert_eq!(bytes, unicode_bytes(6, 8, 0x2000));
+        assert_eq!(UnicodeString::parse(&bytes), Ok(name));
+        assert_eq!(name.encode(4), Err(Error::InvalidInput));
+        let unbacked = UnicodeString {
+            buffer: 0,
+            length: 2,
+        };
+        assert_eq!(unbacked.encode(2), Err(Error::BadAddress));
     }
 
     #[test]
