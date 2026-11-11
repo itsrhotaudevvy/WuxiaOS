@@ -7,7 +7,10 @@
 //! buffer, and only after every entry has been validated.
 
 use crate::error::{Error, Result};
-use crate::pe_common::{optional_header, read_u16, read_u32};
+use crate::image::PeImage;
+use crate::pe_common::{
+    LFANEW_OFFSET, SectionRange, optional_header, read_u16, read_u32, table_bytes,
+};
 
 /// Number of data directory slots the PE format can describe.
 pub const DIRECTORY_ENTRY_COUNT: usize = 16;
@@ -22,6 +25,13 @@ pub const REL_BASED_ABSOLUTE: u8 = 0;
 /// (`IMAGE_REL_BASED_DIR64`).
 pub const REL_BASED_DIR64: u8 = 10;
 
+/// COFF `Characteristics` bit of an image whose base relocations were
+/// removed, so it can only load at its preferred base
+/// (`IMAGE_FILE_RELOCS_STRIPPED`).
+pub const FILE_RELOCS_STRIPPED: u16 = 0x0001;
+
+/// Offset of the COFF `Characteristics` field from the `PE\0\0` signature.
+const FILE_CHARACTERISTICS_OFFSET: usize = 22;
 const PE32_MAGIC: u16 = 0x10b;
 const PE32_PLUS_MAGIC: u16 = 0x20b;
 const NUMBER_OF_RVA_AND_SIZES_OFFSET: usize = 108;
@@ -65,6 +75,20 @@ pub struct RelocationEntry {
 pub struct BaseRelocations<'a> {
     bytes: &'a [u8],
     offset: usize,
+}
+
+/// Iterator over the RVA of every `REL_BASED_DIR64` slot in a `.reloc`
+/// directory, in directory order.
+///
+/// `REL_BASED_ABSOLUTE` padding is skipped. A malformed block, or a page RVA
+/// plus offset that overflows, yields `InvalidImage`; any other relocation
+/// type yields `Unsupported`. After the first error the iterator ends.
+#[derive(Clone, Copy, Debug)]
+pub struct Dir64Slots<'a> {
+    blocks: BaseRelocations<'a>,
+    page_rva: u32,
+    entries: RelocationEntries<'a>,
+    done: bool,
 }
 
 /// Iterator over the entries of one [`RelocationBlock`].
@@ -163,6 +187,111 @@ impl Iterator for RelocationEntries<'_> {
     }
 }
 
+/// Return the `.reloc` directory bytes of a PE32+ image.
+///
+/// An image that declares no base relocation slot, or an empty one, yields an
+/// empty slice. Otherwise the whole directory must lie inside the raw data of
+/// a single section; a directory that starts in one section and runs past its
+/// raw data is `InvalidImage`. Header errors are those of [`data_directory`]
+/// and [`PeImage::parse`].
+pub fn relocation_directory(image: &[u8]) -> Result<&[u8]> {
+    let directory = match data_directory(image, BASE_RELOCATION_DIRECTORY) {
+        Ok(directory) => directory,
+        Err(Error::NotFound) => return Ok(&[]),
+        Err(error) => return Err(error),
+    };
+    if directory.size == 0 {
+        return Ok(&[]);
+    }
+    let pe = PeImage::parse(image)?;
+    let size = usize::try_from(directory.size).map_err(|_| Error::InvalidImage)?;
+    for index in 0..usize::from(pe.section_count()) {
+        let section = pe.section(index)?;
+        let range = SectionRange {
+            virtual_address: section.virtual_address,
+            raw_offset: section.raw_offset,
+            raw_size: section.raw_size,
+        };
+        if let Ok(bytes) = table_bytes(image, &[range], directory.rva, size) {
+            return Ok(bytes);
+        }
+    }
+    Err(Error::InvalidImage)
+}
+
+/// Whether the COFF header marks the image's relocations as stripped.
+///
+/// Errors: `InvalidImage` for a malformed DOS or PE header.
+pub fn relocations_stripped(image: &[u8]) -> Result<bool> {
+    // Validates MZ, e_lfanew and the PE signature before the field is read.
+    optional_header(image)?;
+    let pe = read_u32(image, LFANEW_OFFSET)? as usize;
+    let at = pe
+        .checked_add(FILE_CHARACTERISTICS_OFFSET)
+        .ok_or(Error::InvalidImage)?;
+    Ok(read_u16(image, at)? & FILE_RELOCS_STRIPPED != 0)
+}
+
+/// Iterate over the DIR64 slot RVAs of a `.reloc` directory slice.
+pub const fn dir64_slots(relocs: &[u8]) -> Dir64Slots<'_> {
+    Dir64Slots {
+        blocks: BaseRelocations::new(relocs),
+        page_rva: 0,
+        entries: RelocationEntries { bytes: &[] },
+        done: false,
+    }
+}
+
+impl Iterator for Dir64Slots<'_> {
+    type Item = Result<u32>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if let Some(entry) = self.entries.next() {
+                match entry.kind {
+                    REL_BASED_ABSOLUTE => continue,
+                    REL_BASED_DIR64 => {
+                        if let Some(rva) = self.page_rva.checked_add(u32::from(entry.offset)) {
+                            return Some(Ok(rva));
+                        }
+                        self.done = true;
+                        return Some(Err(Error::InvalidImage));
+                    }
+                    _ => {
+                        self.done = true;
+                        return Some(Err(Error::Unsupported));
+                    }
+                }
+            }
+            match self.blocks.next() {
+                None => {
+                    self.done = true;
+                    return None;
+                }
+                Some(Ok(block)) => {
+                    self.page_rva = block.page_rva;
+                    self.entries = block.entries();
+                }
+                Some(Err(error)) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+}
+
+/// Add a load delta to one little-endian DIR64 slot, wrapping as the NT
+/// loader does.
+pub const fn relocate_dir64(raw: [u8; 8], delta: i64) -> [u8; 8] {
+    u64::from_le_bytes(raw)
+        .wrapping_add_signed(delta)
+        .to_le_bytes()
+}
+
 /// Apply base relocations to `image` for a load delta of `delta`.
 ///
 /// `image` is laid out by RVA, so an RVA is an index into the slice and
@@ -205,8 +334,7 @@ pub fn apply(image: &mut [u8], relocs: &[u8], delta: i64) -> Result<usize> {
             let slot = image.get_mut(start..end).ok_or(Error::InvalidImage)?;
             let mut raw = [0u8; 8];
             raw.copy_from_slice(slot);
-            let value = u64::from_le_bytes(raw).wrapping_add_signed(delta);
-            slot.copy_from_slice(&value.to_le_bytes());
+            slot.copy_from_slice(&relocate_dir64(raw, delta));
             applied = applied.checked_add(1).ok_or(Error::OutOfRange)?;
         }
     }
@@ -552,6 +680,107 @@ mod tests {
             Err(Error::InvalidImage)
         );
         assert_eq!(image, original);
+    }
+
+    #[test]
+    fn dir64_slots_skip_padding_and_stop_after_errors() {
+        let mut relocs = [0u8; 48];
+        let mid = write_block(
+            &mut relocs,
+            0,
+            0x1000,
+            &[entry(10, 0x10), entry(0, 0), entry(10, 0xff8)],
+        );
+        let end = write_block(&mut relocs, mid, 0x3000, &[entry(10, 0)]);
+        let mut slots = dir64_slots(&relocs[..end]);
+        assert_eq!(slots.next(), Some(Ok(0x1010)));
+        assert_eq!(slots.next(), Some(Ok(0x1ff8)));
+        assert_eq!(slots.next(), Some(Ok(0x3000)));
+        assert_eq!(slots.next(), None);
+        assert_eq!(slots.next(), None);
+        assert_eq!(dir64_slots(&[]).next(), None);
+
+        let end = write_block(&mut relocs, 0, 0, &[entry(3, 0), entry(10, 0)]);
+        let mut slots = dir64_slots(&relocs[..end]);
+        assert_eq!(slots.next(), Some(Err(Error::Unsupported)));
+        assert_eq!(slots.next(), None);
+
+        let end = write_block(&mut relocs, 0, u32::MAX, &[entry(10, 1)]);
+        let mut slots = dir64_slots(&relocs[..end]);
+        assert_eq!(slots.next(), Some(Err(Error::InvalidImage)));
+        assert_eq!(slots.next(), None);
+
+        let mut slots = dir64_slots(&relocs[..5]);
+        assert_eq!(slots.next(), Some(Err(Error::InvalidImage)));
+        assert_eq!(slots.next(), None);
+    }
+
+    #[test]
+    fn relocate_dir64_wraps_in_both_directions() {
+        assert_eq!(
+            relocate_dir64(0x1_4000_2000u64.to_le_bytes(), 0x1_0000),
+            0x1_4001_2000u64.to_le_bytes()
+        );
+        assert_eq!(relocate_dir64(u64::MAX.to_le_bytes(), 1), [0; 8]);
+        assert_eq!(relocate_dir64([0; 8], -1), u64::MAX.to_le_bytes());
+    }
+
+    /// A PE32+ image with one `.reloc` section at RVA 0x1000, raw 0x200..0x400.
+    fn pe_with_reloc_section(directory_rva: u32, directory_size: u32) -> [u8; 0x400] {
+        let mut image = [0u8; 0x400];
+        image[..0x200].copy_from_slice(&pe64(240, 16)[..0x200]);
+        // SectionAlignment and SizeOfImage, required by PeImage::parse.
+        image[OPTIONAL + 32..OPTIONAL + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[OPTIONAL + 56..OPTIONAL + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        set_directory(
+            &mut image,
+            BASE_RELOCATION_DIRECTORY,
+            directory_rva,
+            directory_size,
+        );
+        let section = OPTIONAL + 240;
+        image[section..section + 6].copy_from_slice(b".reloc");
+        image[section + 8..section + 12].copy_from_slice(&0x20u32.to_le_bytes());
+        image[section + 12..section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[section + 16..section + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        image[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        image[section + 36..section + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
+        image[0x200..0x204].copy_from_slice(&0x1000u32.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn relocation_directory_resolves_inside_one_section() {
+        let image = pe_with_reloc_section(0x1000, 0x20);
+        let relocs = relocation_directory(&image).unwrap();
+        assert_eq!(relocs.len(), 0x20);
+        assert_eq!(relocs[..4], 0x1000u32.to_le_bytes());
+
+        // Empty and undeclared directories are not errors.
+        let empty = pe_with_reloc_section(0, 0);
+        assert_eq!(relocation_directory(&empty), Ok(&[][..]));
+        let mut undeclared = pe_with_reloc_section(0x1000, 0x20);
+        let count_at = OPTIONAL + NUMBER_OF_RVA_AND_SIZES_OFFSET;
+        undeclared[count_at..count_at + 4].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(relocation_directory(&undeclared), Ok(&[][..]));
+
+        // A directory outside every section, or past the raw data, is refused.
+        let outside = pe_with_reloc_section(0x5000, 0x20);
+        assert_eq!(relocation_directory(&outside), Err(Error::InvalidImage));
+        let overrun = pe_with_reloc_section(0x1100, 0x200);
+        assert_eq!(relocation_directory(&overrun), Err(Error::InvalidImage));
+        let wrapping = pe_with_reloc_section(u32::MAX, u32::MAX);
+        assert_eq!(relocation_directory(&wrapping), Err(Error::InvalidImage));
+    }
+
+    #[test]
+    fn stripped_flag_is_read_from_the_coff_header() {
+        let mut image = pe_with_reloc_section(0x1000, 0x20);
+        assert_eq!(relocations_stripped(&image), Ok(false));
+        let at = PE_OFFSET + FILE_CHARACTERISTICS_OFFSET;
+        image[at..at + 2].copy_from_slice(&0x0023u16.to_le_bytes());
+        assert_eq!(relocations_stripped(&image), Ok(true));
+        assert_eq!(relocations_stripped(&image[..0x30]), Err(Error::InvalidImage));
     }
 
     #[test]
