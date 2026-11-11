@@ -39,6 +39,7 @@ pub mod process;
 pub mod region;
 pub mod rlimit;
 pub mod schedule;
+pub mod sid;
 pub mod signal;
 pub mod syscall;
 pub mod timer;
