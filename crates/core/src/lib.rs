@@ -8,6 +8,7 @@
 
 pub mod capability;
 pub mod error;
+pub mod hhdm;
 pub mod image;
 pub mod memory;
 pub mod nt;
@@ -18,6 +19,7 @@ pub mod syscall;
 
 pub use capability::{Handle, HandleTable, Rights};
 pub use error::{Error, Result};
+pub use hhdm::DirectMap;
 pub use nt::ObjectType;
 pub use paging::PagePermissions;
 pub use personality::{ImageFormat, Personality};

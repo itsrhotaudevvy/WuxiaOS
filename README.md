@@ -6,8 +6,8 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 ## Repository layout
 
-- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE metadata parsing, physical frames, x86_64 paging encoding and syscall vocabulary.
-- `crates/kernel`: the real `no_std` x86_64 Limine kernel, bootstrap serial console, descriptor tables and physical-memory allocator.
+- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE metadata parsing, physical frames, HHDM translation, x86_64 paging encoding and syscall vocabulary.
+- `crates/kernel`: the real `no_std` x86_64 Limine kernel, bootstrap serial console, descriptor tables, physical-memory allocator and bootstrap page-table construction.
 - `crates/xtask`: host-side build, test, ISO and QEMU orchestration.
 - `docs`: architecture, security, compatibility and research decisions.
 - `limine.conf`: bootloader configuration.
@@ -16,8 +16,9 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 - A Limine ISO boots in QEMU and reaches the high-half kernel at `0xffffffff80000000`.
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
-- `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X; no page table is installed yet.
-- 28 `wuxia-core` host tests pass.
+- The kernel validates Limine's HHDM offset and builds a four-level page-table chain for one user page, then walks it back to confirm every entry resolves.
+- `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X; CR3 is not yet loaded.
+- 32 `wuxia-core` host tests pass.
 - PE parsing validates container metadata only. No Windows program or driver is executed yet.
 - IDT/GDT definitions are scaffolding; CPU interrupt installation and userspace transitions are not complete.
 - No POSIX userspace, filesystem, scheduler, network stack, Windows application or Windows driver support exists yet.
@@ -52,6 +53,9 @@ The bootstrap kernel deliberately halts, so an interactive QEMU session does not
 WUXIA_BOOT_OK: Limine entered the high-half kernel
 WUXIA_MEMORY_MAP_READY
 WUXIA_FRAME_ALLOC_OK
+WUXIA_HHDM_OK
+WUXIA_PAGE_TABLE_OK
+WUXIA_TEST_PASS
 ```
 
 On Apple Silicon Homebrew, `xtask` selects `rustup which rustc` and Homebrew LLD if present because Homebrew's compiler does not share rustup's target sysroot. Set `WUXIA_LLD` to override the linker. The build currently assumes a standard Limine installation under `/opt/homebrew/share/limine`; a portable Limine-data discovery mechanism is planned.

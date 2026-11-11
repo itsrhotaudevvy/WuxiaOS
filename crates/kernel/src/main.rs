@@ -9,11 +9,14 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::BaseRevision;
-use limine::request::{MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest};
+use limine::request::{
+    HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
+};
 
 mod gdt;
 mod idt;
 mod memory;
+mod paging;
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -30,6 +33,10 @@ static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(
 #[used]
 #[unsafe(link_section = ".requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
@@ -61,6 +68,27 @@ pub extern "C" fn _start() -> ! {
     serial::write_str("WUXIA_FRAME_ALLOC_OK\n");
     serial::write_hex(first);
     serial::write_hex(second);
+
+    let hhdm = HHDM_REQUEST
+        .get_response()
+        .expect("Limine did not provide a direct map");
+    let direct_map = wuxia_core::DirectMap::new(hhdm.offset())
+        .expect("the direct-map offset is not aligned higher-half memory");
+    serial::write_str("WUXIA_HHDM_OK\n");
+    serial::write_hex(direct_map.offset());
+
+    let tables = paging::build(
+        &mut allocator,
+        direct_map,
+        paging::TEST_VIRTUAL_ADDRESS,
+        first,
+    )
+    .expect("cannot build and verify the bootstrap page tables");
+    serial::write_str("WUXIA_PAGE_TABLE_OK\n");
+    serial::write_hex(tables.pml4);
+    serial::write_hex(tables.page_table);
+    serial::write_hex(tables.leaf_entry);
+
     serial::write_str("WUXIA_TEST_PASS\n");
     serial::debug_exit(0x10);
     halt_forever()
