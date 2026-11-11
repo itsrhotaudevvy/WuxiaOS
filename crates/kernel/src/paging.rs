@@ -271,6 +271,94 @@ pub fn current_direct_map() -> Option<DirectMap> {
 
 static mut DIRECT_MAP_OFFSET: u64 = 0;
 
+/// Base of the supervisor-only device window.
+///
+/// It sits in PML4 slot 300, above the direct map (slot 256) and below the
+/// kernel image (slot 511), so a device mapping cannot alias either and the
+/// window stays out of reach of CPL3.
+pub const MMIO_BASE: u64 = 0xffff_9600_0000_0000;
+
+/// Base of the linked kernel image, which the device window must not cover.
+const KERNEL_VIRTUAL_START: u64 = 0xffff_ffff_8000_0000;
+
+/// Size of one device window, which is also the span of one page table.
+pub const MMIO_WINDOW_SIZE: u64 = 0x20_0000;
+
+/// Map `pages` device pages into a fixed supervisor window.
+///
+/// `window` selects a 2 MiB-aligned slot below [`MMIO_BASE`] and `physical`
+/// must be a page-aligned device base such as a PCI BAR. Leaves are writable,
+/// non-executable and cache-disabled so register accesses reach the device in
+/// program order. Missing intermediate tables are allocated from `allocator`
+/// and zeroed through the direct map.
+///
+/// The mapping is installed in the active (boot) root. User roots created
+/// afterwards copy the top-level entries, so the window is shared rather than
+/// duplicated; a window mapped after a root was built is invisible to it.
+///
+/// Errors: `InvalidInput` for a zero or oversized request, `BadAddress` for an
+/// unaligned base, `AlreadyExists` when the chosen slot is already mapped, and
+/// `OutOfRange`/`TableFull` when a table cannot be allocated.
+pub fn map_mmio<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    window: u64,
+    physical: u64,
+    pages: u64,
+) -> Result<u64, Error> {
+    let window_pages = MMIO_WINDOW_SIZE / PAGE_SIZE;
+    if pages == 0 || pages > window_pages {
+        return Err(Error::InvalidInput);
+    }
+    if !physical.is_multiple_of(PAGE_SIZE) {
+        return Err(Error::BadAddress);
+    }
+    let base = MMIO_BASE
+        .checked_add(
+            window
+                .checked_mul(MMIO_WINDOW_SIZE)
+                .ok_or(Error::OutOfRange)?,
+        )
+        .ok_or(Error::OutOfRange)?;
+    if base >= KERNEL_VIRTUAL_START {
+        return Err(Error::OutOfRange);
+    }
+    let mut table = read_cr3();
+    for level in 0..3usize {
+        let slot = wuxia_core::paging::kernel_table_index(base, level)?;
+        let pointer = frame_pointer(direct_map, table)?;
+        let entry = read_entry(pointer, slot);
+        if is_present(entry) {
+            if is_huge(entry) {
+                return Err(Error::AlreadyExists);
+            }
+            table = physical_address(entry);
+            continue;
+        }
+        let frame = allocator.allocate().ok_or(Error::OutOfRange)?;
+        zero_frame(direct_map, frame)?;
+        write_entry(pointer, slot, table_entry(frame, false)?);
+        table = frame;
+    }
+    let leaves = frame_pointer(direct_map, table)?;
+    for page in 0..pages {
+        let address = base + page * PAGE_SIZE;
+        let frame = physical + page * PAGE_SIZE;
+        let slot = wuxia_core::paging::kernel_table_index(address, 3)?;
+        if is_present(read_entry(leaves, slot)) {
+            return Err(Error::AlreadyExists);
+        }
+        let entry = wuxia_core::paging::kernel_leaf(
+            address,
+            frame,
+            wuxia_core::paging::PagePermissions::KERNEL_MMIO,
+        )?;
+        write_entry(leaves, slot, entry);
+    }
+    invalidate(base);
+    Ok(base)
+}
+
 /// Apply the image's base relocations to already mapped pages.
 ///
 /// The image was mapped at `preferred_base + delta`, so every DIR64 slot the

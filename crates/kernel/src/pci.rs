@@ -40,6 +40,18 @@ fn probe(bus: u8, device: u8, function: u8) -> Option<Function> {
     })
 }
 
+/// Class code of a network controller, as used by the bootstrap.
+pub const CLASS_NETWORK: u8 = 0x02;
+
+/// The first memory BAR of a function, which is where its registers live.
+pub fn mmio_base(function: &Function) -> Option<u64> {
+    bars(function)
+        .into_iter()
+        .flatten()
+        .find(|bar| !bar.is_io)
+        .map(|bar| bar.base)
+}
+
 /// Walk the scanned buses and report what was found through `report`.
 ///
 /// Returns the number of functions present. Function 0 of a device must exist

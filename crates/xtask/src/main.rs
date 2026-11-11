@@ -34,6 +34,8 @@ const BOOT_MARKERS: &[&str] = &[
     "WUXIA_PCI_OK",
     "WUXIA_PCI_DEVICE",
     "WUXIA_PCI_BAR",
+    "WUXIA_MMIO_OK",
+    "WUXIA_MMIO_CTRL",
     "WUXIA_PE_IMAGE_OK",
     "WUXIA_PE_RELOCATED",
     "WUXIA_USER_IMAGE_OK",

@@ -25,7 +25,11 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
+const CACHE_DISABLE: u64 = 1 << 4;
 const NO_EXECUTE: u64 = 1 << 63;
+
+/// The first canonical higher-half address, where supervisor mappings start.
+pub const KERNEL_ADDRESS_START: u64 = 0xffff_8000_0000_0000;
 
 /// Permissions for a four-kibibyte leaf mapping.
 ///
@@ -39,6 +43,11 @@ pub struct PagePermissions {
     pub user: bool,
     /// Whether instruction fetches are permitted.
     pub executable: bool,
+    /// Whether the page must bypass the caches.
+    ///
+    /// Set for device registers, whose reads and writes have side effects that
+    /// caching would reorder or suppress. It is orthogonal to W^X.
+    pub cache_disable: bool,
 }
 
 impl PagePermissions {
@@ -47,6 +56,7 @@ impl PagePermissions {
         writable: false,
         user: true,
         executable: false,
+        cache_disable: false,
     };
 
     /// A user-accessible, writable, non-executable data page.
@@ -54,6 +64,7 @@ impl PagePermissions {
         writable: true,
         user: true,
         executable: false,
+        cache_disable: false,
     };
 
     /// A user-accessible, read-only, executable code page.
@@ -61,6 +72,7 @@ impl PagePermissions {
         writable: false,
         user: true,
         executable: true,
+        cache_disable: false,
     };
 
     /// A supervisor-only, read-only, non-executable page.
@@ -68,6 +80,15 @@ impl PagePermissions {
         writable: false,
         user: false,
         executable: false,
+        cache_disable: false,
+    };
+
+    /// A supervisor-only, writable, non-executable, uncached device window.
+    pub const KERNEL_MMIO: Self = Self {
+        writable: true,
+        user: false,
+        executable: false,
+        cache_disable: true,
     };
 
     /// Encode the raw flag bits of this permission set.
@@ -76,6 +97,7 @@ impl PagePermissions {
             | if self.writable { WRITABLE } else { 0 }
             | if self.user { USER } else { 0 }
             | if self.executable { 0 } else { NO_EXECUTE }
+            | if self.cache_disable { CACHE_DISABLE } else { 0 }
     }
 
     /// Whether this permission set violates W^X.
@@ -113,6 +135,33 @@ pub const fn leaf(
     Ok(physical_address | permissions.bits())
 }
 
+/// Encode a 4 KiB supervisor leaf mapping in the higher half.
+///
+/// The user leaf encoder refuses higher-half addresses, so device and other
+/// kernel mappings use this one. The checks are the same shape: the virtual
+/// address must be page-aligned and canonical, the frame page-aligned and
+/// physically addressable, and the permissions must not break W^X. A mapping
+/// that asks for CPL3 access is refused: kernel ranges are not user-visible.
+pub const fn kernel_leaf(
+    virtual_address: u64,
+    physical_address: u64,
+    permissions: PagePermissions,
+) -> Result<u64> {
+    if virtual_address < KERNEL_ADDRESS_START || !virtual_address.is_multiple_of(PAGE_SIZE) {
+        return Err(Error::BadAddress);
+    }
+    if !is_physical_page(physical_address) {
+        return Err(Error::BadAddress);
+    }
+    if permissions.user {
+        return Err(Error::BadAddress);
+    }
+    if permissions.is_writable_and_executable() {
+        return Err(Error::PermissionDenied);
+    }
+    Ok(physical_address | permissions.bits())
+}
+
 /// Encode an intermediate entry pointing at a zeroed next-level table.
 ///
 /// The zero frame is rejected because the null page is never valid storage for
@@ -130,6 +179,18 @@ pub const fn table_entry(frame: u64, user: bool) -> Result<u64> {
 /// page base. Callers that map memory still validate alignment separately.
 pub const fn table_index(virtual_address: u64, level: usize) -> Result<usize> {
     if virtual_address == 0 || virtual_address >= USER_ADDRESS_LIMIT || level >= LEVELS {
+        return Err(Error::BadAddress);
+    }
+    Ok(((virtual_address >> (39 - level * 9)) & 0x1ff) as usize)
+}
+
+/// Return the table index of a higher-half address.
+///
+/// [`table_index`] refuses every supervisor address, so device and other kernel
+/// mappings use this variant. The arithmetic is identical; only the accepted
+/// range differs.
+pub const fn kernel_table_index(virtual_address: u64, level: usize) -> Result<usize> {
+    if virtual_address < KERNEL_ADDRESS_START || level >= LEVELS {
         return Err(Error::BadAddress);
     }
     Ok(((virtual_address >> (39 - level * 9)) & 0x1ff) as usize)
@@ -254,9 +315,50 @@ mod tests {
             writable: true,
             user: true,
             executable: true,
+            cache_disable: false,
         };
         assert!(flags.is_writable_and_executable());
         assert_eq!(leaf(0x400000, 0x3000, flags), Err(Error::PermissionDenied));
+    }
+
+    #[test]
+    fn kernel_leaves_map_higher_half_windows_without_caching() {
+        let window = 0xffff_9600_0000_0000;
+        let entry = kernel_leaf(window, 0xfeb8_0000, PagePermissions::KERNEL_MMIO).unwrap();
+        assert_eq!(entry & WRITABLE, WRITABLE);
+        assert_eq!(entry & USER, 0);
+        assert_eq!(entry & NO_EXECUTE, NO_EXECUTE);
+        assert_eq!(entry & CACHE_DISABLE, CACHE_DISABLE);
+        assert_eq!(entry & ADDRESS_MASK, 0xfeb8_0000);
+        assert_eq!(kernel_table_index(window, 0), Ok(300));
+        assert_eq!(kernel_table_index(0x400000, 0), Err(Error::BadAddress));
+
+        assert_eq!(
+            kernel_leaf(0x400000, 0x1000, PagePermissions::KERNEL_MMIO),
+            Err(Error::BadAddress)
+        );
+        assert_eq!(
+            kernel_leaf(window + 1, 0x1000, PagePermissions::KERNEL_MMIO),
+            Err(Error::BadAddress)
+        );
+        assert_eq!(
+            kernel_leaf(window, 0x1234, PagePermissions::KERNEL_MMIO),
+            Err(Error::BadAddress)
+        );
+        assert_eq!(
+            kernel_leaf(window, 0x1000, PagePermissions::USER_READ_WRITE),
+            Err(Error::BadAddress)
+        );
+        let writable_executable = PagePermissions {
+            writable: true,
+            user: false,
+            executable: true,
+            cache_disable: false,
+        };
+        assert_eq!(
+            kernel_leaf(window, 0x1000, writable_executable),
+            Err(Error::PermissionDenied)
+        );
     }
 
     #[test]

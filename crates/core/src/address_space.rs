@@ -213,6 +213,7 @@ mod tests {
             writable: true,
             user: true,
             executable: true,
+            cache_disable: false,
         };
         assert_eq!(space.map(BASE, PAGE_SIZE, flags), Err(Error::InvalidInput));
     }

@@ -128,6 +128,41 @@ pub extern "C" fn _start() -> ! {
     log::write_hex(direct_map.offset());
     paging::record_direct_map(direct_map);
 
+    let mut network = None;
+    let devices = pci::enumerate(|function| {
+        log::write_str("WUXIA_PCI_DEVICE\n");
+        log::write_hex(u64::from(function.vendor));
+        log::write_hex(u64::from(function.device_id));
+        log::write_hex(u64::from(function.class));
+        for bar in pci::bars(function).into_iter().flatten() {
+            log::write_str("WUXIA_PCI_BAR\n");
+            log::write_hex(u64::from(bar.is_io));
+            log::write_hex(bar.base);
+        }
+        if network.is_none() && function.class == pci::CLASS_NETWORK {
+            network = pci::mmio_base(function);
+        }
+    });
+    log::write_str("WUXIA_PCI_OK\n");
+    log::write_hex(devices as u64);
+    if let Some(physical) = network {
+        let window = paging::map_mmio(&mut allocator, direct_map, 0, physical, 1)
+            .expect("the network device window cannot be mapped");
+        log::write_str("WUXIA_MMIO_OK\n");
+        log::write_hex(window);
+        // SAFETY: the window names one mapped, uncached device page. The
+        // registers are read-only here and a slave device cannot fault the CPU.
+        let (control, status) = unsafe {
+            (
+                core::ptr::read_volatile(window as *const u32),
+                core::ptr::read_volatile((window + 8) as *const u32),
+            )
+        };
+        log::write_str("WUXIA_MMIO_CTRL\n");
+        log::write_hex(u64::from(control));
+        log::write_hex(u64::from(status));
+    }
+
     let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)
         .expect("cannot load the user ELF image");
     log::write_str("WUXIA_ELF_OK\n");
@@ -186,20 +221,6 @@ pub extern "C" fn _start() -> ! {
         "the bootstrap file cannot be read back"
     );
     log::write_str("WUXIA_FS_OK\n");
-
-    let devices = pci::enumerate(|function| {
-        log::write_str("WUXIA_PCI_DEVICE\n");
-        log::write_hex(u64::from(function.vendor));
-        log::write_hex(u64::from(function.device_id));
-        log::write_hex(u64::from(function.class));
-        for bar in pci::bars(function).into_iter().flatten() {
-            log::write_str("WUXIA_PCI_BAR\n");
-            log::write_hex(u64::from(bar.is_io));
-            log::write_hex(bar.base);
-        }
-    });
-    log::write_str("WUXIA_PCI_OK\n");
-    log::write_hex(devices as u64);
 
     paging::activate(image.new_pml4);
     log::write_str("WUXIA_CR3_OK\n");
