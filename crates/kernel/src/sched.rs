@@ -10,7 +10,7 @@ use wuxia_core::process::Process;
 
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::idt::InterruptFrame;
-use crate::serial;
+use crate::log::console as serial;
 
 /// Maximum number of registered threads.
 pub const MAX_THREADS: usize = 4;
