@@ -8,6 +8,7 @@
 
 pub mod acl;
 pub mod address_space;
+pub mod apic;
 pub mod buddy;
 pub mod capability;
 pub mod cow;
@@ -29,6 +30,7 @@ pub mod initstack;
 pub mod klog;
 pub mod load;
 pub mod memory;
+pub mod msi;
 pub mod net;
 pub mod nt;
 pub mod nt_service;

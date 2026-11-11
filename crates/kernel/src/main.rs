@@ -13,11 +13,13 @@ use limine::request::{
     HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
 };
 
+mod apic;
 mod cpu;
 mod gdt;
 mod idt;
 mod imports;
 mod interrupts;
+mod irq;
 mod log;
 mod memory;
 mod net;
@@ -131,6 +133,7 @@ pub extern "C" fn _start() -> ! {
     paging::record_direct_map(direct_map);
 
     let mut network = None;
+    let mut network_function = None;
     let devices = pci::enumerate(|function| {
         log::write_str("WUXIA_PCI_DEVICE\n");
         log::write_hex(u64::from(function.vendor));
@@ -150,6 +153,7 @@ pub extern "C" fn _start() -> ! {
         }
         if network.is_none() && function.class == pci::CLASS_NETWORK {
             network = pci::mmio_base(function);
+            network_function = Some(*function);
             if let Some((before, after)) = pci::enable(function) {
                 log::write_str("WUXIA_PCI_COMMAND\n");
                 log::write_hex(u64::from(before));
@@ -168,6 +172,7 @@ pub extern "C" fn _start() -> ! {
         log::write_str("WUXIA_MMIO_OK\n");
         log::write_hex(window);
         let device = net::Device::new(window);
+        net::publish(device);
         log::write_str("WUXIA_MMIO_CTRL\n");
         log::write_hex(u64::from(
             device.control().expect("the controller has no CTRL"),
@@ -221,6 +226,108 @@ pub extern "C" fn _start() -> ! {
             .transmit(&mut allocator, direct_map, &padded)
             .expect("the address-resolution request cannot be sent");
         let mut received = [0u8; wuxia_core::net::MAX_FRAME];
+        // Interrupts: the local APIC receives the message the controller sends,
+        // and the handler acknowledges both of them.
+        let local = apic::Local::map(&mut allocator, direct_map, apic::LOCAL_APIC_PHYSICAL)
+            .expect("the local APIC cannot be mapped");
+        log::write_str("WUXIA_APIC_LOCAL\n");
+        log::write_hex(u64::from(local.id));
+        log::write_hex(u64::from(local.version));
+        local.enable().expect("the local APIC cannot be enabled");
+        log::write_str("WUXIA_APIC_SVR\n");
+        log::write_hex(u64::from(local.control().unwrap_or(0)));
+        irq::install(local);
+        local
+            .interrupt_self(apic::DEVICE_VECTOR)
+            .expect("the local APIC cannot send an interrupt to itself");
+        while irq::count() == 0 {
+            // SAFETY: interrupts are enabled, so the next interrupt ends the wait.
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            }
+        }
+        log::write_str("WUXIA_APIC_SELF_IPI\n");
+        log::write_hex(irq::count());
+
+        // The I/O APIC owns the legacy PCI interrupt lines. Its redirection
+        // entries stay masked: the controller uses a message, and an unmasked
+        // entry for a line no handler owns would deliver an unknown vector.
+        let io = apic::Io::map(&mut allocator, direct_map, apic::IO_APIC_PHYSICAL)
+            .expect("the I/O APIC cannot be mapped");
+        log::write_str("WUXIA_APIC_IOAPIC\n");
+        log::write_hex(u64::from(io.id));
+        log::write_hex(u64::from(io.version));
+        log::write_hex(u64::from(io.max_redirection()));
+        let mut masked = 0u64;
+        for line in 16..=23 {
+            if io.mask(line).is_ok() {
+                masked += 1;
+            }
+        }
+        log::write_str("WUXIA_IOAPIC_MASKED\n");
+        log::write_hex(masked);
+
+        let function = network_function.expect("the network function was not recorded");
+        let (line, pin) = pci::interrupt_line(&function);
+        log::write_str("WUXIA_PCI_INTERRUPT\n");
+        log::write_hex(u64::from(line));
+        log::write_hex(u64::from(pin));
+        if let Some(msi) = pci::enable_msi(&function, local.id, apic::DEVICE_VECTOR) {
+            log::write_str("WUXIA_MSI_OK\n");
+            log::write_hex(u64::from(msi.offset));
+            log::write_hex(msi.address);
+            log::write_hex(u64::from(msi.data));
+            log::write_hex(u64::from(msi.is_enabled()));
+        }
+        // A function without a message capability still has its legacy line, and
+        // the I/O APIC is what makes that line reach the local APIC. QEMU's q35
+        // routes the first four PCI interrupt pins to lines 16 to 19 on the
+        // function's own slot, and PCI lines are level triggered and active low.
+        if pci::msi_capability(&function).is_none() && pin != 0 && pin <= 4 {
+            // The firmware's line number is not the line the I/O APIC sees: the
+            // machine swizzles a function's interrupt pin onto one of the four
+            // PCI lines, and which one depends on the slot. Routing all four to
+            // the same vector keeps the outcome observable instead of guessed.
+            // The firmware already points this function's interrupt line at one
+            // of the 8259 lines and reports which in configuration space. Unmask
+            // the reported line plus the two the chipset commonly uses, so the
+            // swizzled line is covered whichever it turns out to be.
+            // Point the chipset's four PCI lines at legacy interrupt numbers and
+            // take the line from the I/O APIC instead of the 8259: each legacy
+            // line reaches both controllers, and the I/O APIC is the one that can
+            // be told which vector to raise.
+            if let Some(lpc) = pci::function(0, 0x1f, 0) {
+                let before = pci::pci_line_routing(&lpc);
+                log::write_str("WUXIA_PIRQ_BEFORE\n");
+                for value in before {
+                    log::write_hex(u64::from(value));
+                }
+                if let Some(after) = pci::route_pci_lines(&lpc, [9, 10, 11, 12]) {
+                    log::write_str("WUXIA_PIRQ_AFTER\n");
+                    for value in after {
+                        log::write_hex(u64::from(value));
+                    }
+                }
+            }
+            let mut routed = 0u64;
+            for line in 9..=12u32 {
+                if io
+                    .route(line, apic::DEVICE_VECTOR, local.id, false, false)
+                    .is_ok()
+                {
+                    routed += 1;
+                }
+            }
+            log::write_str("WUXIA_IRQ_LINES\n");
+            log::write_hex(routed);
+            log::write_hex(u64::from(pin));
+        }
+        let unmasked = device
+            .enable_interrupts(wuxia_core::net::interrupt_mask())
+            .expect("the controller does not take an interrupt mask");
+        log::write_str("WUXIA_NET_IRQ_MASK\n");
+        log::write_hex(u64::from(unmasked));
+
         match device.receive(&mut allocator, direct_map, &mut received) {
             Ok(length) => {
                 log::write_str("WUXIA_NET_RX_OK\n");
@@ -248,6 +355,35 @@ pub extern "C" fn _start() -> ! {
                 log::write_hex(error as u64);
             }
         }
+
+        // A frame sent after the interrupt mask opens is what raises the first
+        // interrupt: a cause that was already pending when the mask was written
+        // was acknowledged and will not fire again.
+        let mut trigger = [0u8; wuxia_core::net::MIN_FRAME];
+        trigger[..6].fill(0xff);
+        trigger[6..12].copy_from_slice(&mac);
+        trigger[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
+        trigger[14..19].copy_from_slice(b"irq!!");
+        device
+            .transmit(&mut allocator, direct_map, &trigger)
+            .expect("the interrupt trigger frame cannot be sent");
+
+        // The controller signals transmit completion with the message programmed
+        // above. Waiting a bounded number of timer ticks proves the whole chain:
+        // the device asserted its line, the I/O APIC raised the vector, and the
+        // handler acknowledged the device and both controllers.
+        let deadline = interrupts::ticks() + 100;
+        let before = irq::count();
+        while irq::count() == before && interrupts::ticks() < deadline {
+            // SAFETY: interrupts are enabled, so the next interrupt ends the wait.
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            }
+        }
+        let interrupts_taken = irq::count();
+        log::write_str("WUXIA_IRQ_OK\n");
+        log::write_hex(interrupts_taken);
+        log::write_hex(deadline);
     }
 
     let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)

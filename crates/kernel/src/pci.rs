@@ -1,9 +1,10 @@
 //! PCI configuration-space access through the legacy 0xCF8/0xCFC pair.
 //!
-//! The bootstrap only needs to know what is on the bus, so this module reads
-//! function headers and stops there: no BAR assignment, no Command register
-//! writes and no interrupt routing. Everything it learns is validated by
-//! `wuxia_core::pci`, which cannot see a device that reads as absent.
+//! The bootstrap reads function headers, measures BARs, enables decoding and, for
+//! a function that offers it, turns on message-signalled interrupts. BAR
+//! *assignment* is not implemented: the firmware's addresses are used as found.
+//! Everything it learns is validated by `wuxia_core::pci` and
+//! `wuxia_core::msi`, which cannot see a device that reads as absent.
 
 use core::arch::asm;
 
@@ -142,6 +143,17 @@ fn read_command(function: &Function) -> Option<u16> {
     read_config(function.bus, function.device, function.function, COMMAND).map(|value| value as u16)
 }
 
+/// Write a 32-bit configuration register.
+fn write_config(bus: u8, device: u8, function: u8, offset: u8, value: u32) -> Option<()> {
+    let address = ConfigAddress::new(bus, device, function, offset).ok()?;
+    // SAFETY: as for `read_config`; the address was validated above.
+    unsafe {
+        outl(CONFIG_ADDRESS, address.raw());
+        outl(CONFIG_DATA, value);
+    }
+    Some(())
+}
+
 /// Write the Command register of a function.
 fn write_command(function: &Function, value: u16) -> Option<()> {
     let address =
@@ -251,6 +263,120 @@ pub fn size_bar(function: &Function, index: u8) -> Option<u64> {
     };
     let mask = (low_mask | (u64::from(mask_high) << 32)) & address_mask;
     wuxia_core::pci::bar_size(mask, is_io, width_bits).ok()
+}
+
+/// Whether a function advertises the MSI capability, and where it starts.
+pub fn msi_capability(function: &Function) -> Option<wuxia_core::msi::Msi> {
+    let captured = |offset: u8| {
+        read_config(function.bus, function.device, function.function, offset).unwrap_or(u32::MAX)
+    };
+    let capability = wuxia_core::msi::find_capability(captured, wuxia_core::msi::CAP_ID_MSI)?;
+    wuxia_core::msi::Msi::decode(captured, capability.offset).ok()
+}
+
+/// Write one byte of configuration space.
+fn write_config_byte(bus: u8, device: u8, function: u8, offset: u8, value: u8) -> Option<()> {
+    // Configuration transfers are dword-wide, so the address names the register
+    // containing the byte and the byte position selects within it.
+    let address = ConfigAddress::new(bus, device, function, offset & !3).ok()?;
+    let current = read_config(bus, device, function, offset & !3)?;
+    let shift = u32::from(offset % 4) * 8;
+    let merged = (current & !(0xff << shift)) | (u32::from(value) << shift);
+    // SAFETY: the configuration ports are fixed legacy ports and the address was
+    // validated above.
+    unsafe {
+        outl(CONFIG_ADDRESS, address.raw());
+        outl(CONFIG_DATA, merged);
+    }
+    Some(())
+}
+
+/// Probe one function without enumerating the bus.
+pub fn function(bus: u8, device: u8, function: u8) -> Option<Function> {
+    probe(bus, device, function)
+}
+
+/// Point a chipset's four PCI interrupt lines at the given interrupt controller
+/// lines.
+///
+/// On this chipset each of the four lines is described by one byte in the LPC
+/// bridge's configuration space: bit 7 selects the advanced interrupt controller
+/// instead of the legacy 8259, and the low four bits carry the line number. Writing
+/// these is what makes a PCI function's interrupt reach the I/O APIC at all; the
+/// firmware normally leaves them pointing at the 8259. Returns the four bytes that
+/// were written, in line order.
+pub fn route_pci_lines(lpc: &Function, lines: [u8; 4]) -> Option<[u8; 4]> {
+    let mut written = [0u8; 4];
+    for (index, line) in lines.iter().enumerate() {
+        // The high bit selects the advanced controller with a numbered line above
+        // the legacy range; a plain line number keeps the line on the 8259.
+        let value = *line;
+        write_config_byte(lpc.bus, lpc.device, lpc.function, 0x60 + index as u8, value)?;
+        written[index] = value;
+    }
+    Some(written)
+}
+
+/// Read the four PCI interrupt line routing bytes.
+pub fn pci_line_routing(lpc: &Function) -> [u8; 4] {
+    let register = read_config(lpc.bus, lpc.device, lpc.function, 0x60).unwrap_or(0);
+    register.to_le_bytes()
+}
+
+/// Read the interrupt line and pin a function reports.
+///
+/// Returns `(line, pin)`. A pin of zero means the function raises no interrupt;
+/// a non-zero pin is 1 for INTA through 4 for INTD. The line is the firmware's
+/// suggestion and is not authoritative on a machine that routes PCI lines through
+/// an I/O APIC, which is why the caller logs it rather than trusting it.
+pub fn interrupt_line(function: &Function) -> (u8, u8) {
+    let register = read_config(function.bus, function.device, function.function, 0x3c).unwrap_or(0);
+    (register as u8, (register >> 8) as u8)
+}
+
+/// Enable message-signalled interrupts on a function.
+///
+/// The message names the destination APIC and the vector the local APIC should
+/// raise. The address and data words are written before the enable bit, so a
+/// half-configured message can never be delivered. Returns the decoded capability
+/// after the writes, so the caller logs what the function actually accepted
+/// rather than what was requested.
+pub fn enable_msi(function: &Function, apic: u8, vector: u8) -> Option<wuxia_core::msi::Msi> {
+    let msi = msi_capability(function)?;
+    let (address, data) = wuxia_core::msi::msi_message(apic, vector);
+    let bus = function.bus;
+    let device = function.device;
+    let function_number = function.function;
+    let offset = msi.offset;
+    write_config(bus, device, function_number, offset + 4, address as u32)?;
+    if msi.control & wuxia_core::msi::MSI_ADDRESS_64 != 0 {
+        write_config(
+            bus,
+            device,
+            function_number,
+            offset + 8,
+            (address >> 32) as u32,
+        )?;
+        let high = offset + 12;
+        let current = read_config(bus, device, function_number, high & !3)?;
+        let shift = u32::from(high % 4) * 8;
+        let merged = (current & !(0xffff << shift)) | (u32::from(data) << shift);
+        write_config(bus, device, function_number, high & !3, merged)?;
+    } else {
+        let data_offset = offset + 8;
+        let current = read_config(bus, device, function_number, data_offset & !3)?;
+        let shift = u32::from(data_offset % 4) * 8;
+        let merged = (current & !(0xffff << shift)) | (u32::from(data) << shift);
+        write_config(bus, device, function_number, data_offset & !3, merged)?;
+    }
+    // Read-modify-write the control word so the multiple-message bits the firmware
+    // set are preserved, then set the enable bit last.
+    let header = read_config(bus, device, function_number, offset & !3)?;
+    let shift = u32::from(offset % 4) * 8;
+    let control = (header >> (shift + 16)) as u16 | wuxia_core::msi::MSI_ENABLE;
+    let merged = (header & !(0xffff << (shift + 16))) | (u32::from(control) << (shift + 16));
+    write_config(bus, device, function_number, offset & !3, merged)?;
+    msi_capability(function)
 }
 
 /// Write `value` to a 32-bit port.

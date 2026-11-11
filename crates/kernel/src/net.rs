@@ -26,6 +26,35 @@ use wuxia_core::net::{
     receive_control, register, transmit_control,
 };
 
+/// Register window of the controller the interrupt handler services.
+///
+/// Published once, before any interrupt is unmasked. The handler cannot take a
+/// lock or allocate, so it reads this window directly.
+static mut SERVICED: Option<u64> = None;
+
+/// Publish the controller whose interrupts the handler acknowledges.
+pub fn publish(device: Device) {
+    // SAFETY: the bootstrap is single-threaded and this runs before the device is
+    // allowed to raise an interrupt.
+    unsafe {
+        SERVICED = Some(device.base);
+    }
+}
+
+/// Acknowledge the controller's pending interrupt causes.
+///
+/// Returns zero when no controller has been published, which is also what a
+/// spurious delivery looks like.
+pub fn acknowledge_interrupt() -> u32 {
+    // SAFETY: the window was mapped before it was published.
+    match unsafe { SERVICED } {
+        Some(base) => unsafe {
+            core::ptr::read_volatile((base + u64::from(wuxia_core::net::ICU_READ)) as *const u32)
+        },
+        None => 0,
+    }
+}
+
 /// Highest number of polls spent waiting for the controller.
 const POLL_LIMIT: usize = 1 << 20;
 
@@ -138,6 +167,22 @@ impl Device {
         Ok(mac_from_eeprom(words))
     }
 
+    /// Ask the controller to raise an interrupt for `mask`.
+    pub fn enable_interrupts(&self, mask: u32) -> Result<u32> {
+        // Acknowledge anything already pending, then unmask and read back.
+        let _ = self.read(wuxia_core::net::ICU_READ)?;
+        self.write(wuxia_core::net::ICU_MASK_SET, mask)?;
+        self.read(wuxia_core::net::ICU_MASK_SET)
+    }
+
+    /// Acknowledge the pending interrupt causes and return them.
+    ///
+    /// Reading the cause register clears it on this family, so the value is also
+    /// the only record of what happened.
+    pub fn acknowledge(&self) -> Result<u32> {
+        self.read(wuxia_core::net::ICU_READ)
+    }
+
     /// Set up a receive ring and wait for one frame.
     ///
     /// The ring and every buffer it points at are freshly allocated frames that
@@ -185,6 +230,9 @@ impl Device {
             }
         }
 
+        // The 82574 keeps a per-queue enable bit that has to be set before the
+        // queue fetches anything; the older controllers ignore the register.
+        self.write(wuxia_core::net::RXDCTL, wuxia_core::net::QUEUE_ENABLE)?;
         self.write(RDBAL, (ring & 0xffff_ffff) as u32)?;
         self.write(RDBAH, (ring >> 32) as u32)?;
         self.write(RDLEN, RING_BYTES)?;

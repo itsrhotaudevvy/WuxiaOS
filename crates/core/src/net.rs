@@ -59,6 +59,20 @@ pub const TDLEN: u32 = 0x3808;
 pub const TDH: u32 = 0x3810;
 /// Transmit descriptor tail.
 pub const TDT: u32 = 0x3818;
+/// Interrupt cause register, read to acknowledge.
+pub const ICU_READ: u32 = 0x00c0;
+/// Interrupt cause set register.
+pub const ICU_SET: u32 = 0x00c8;
+/// Interrupt mask set register.
+pub const ICU_MASK_SET: u32 = 0x00d0;
+/// Interrupt mask clear register.
+pub const ICU_MASK_CLEAR: u32 = 0x00d8;
+/// Receive descriptor queue control, queue 0.
+pub const RXDCTL: u32 = 0x2828;
+/// Transmit descriptor queue control, queue 0.
+pub const TXDCTL: u32 = 0x3828;
+/// `RXDCTL.ENABLE` / `TXDCTL.ENABLE`: the queue may fetch descriptors.
+pub const QUEUE_ENABLE: u32 = 1 << 25;
 /// Receive address low: bytes 0-3 of the MAC address.
 pub const RAL: u32 = 0x5400;
 /// Receive address high: bytes 4-5 of the MAC address.
@@ -73,6 +87,20 @@ pub const CTRL_ASDE: u32 = 1 << 5;
 
 /// `STATUS.LU`: link is up.
 pub const STATUS_LU: u32 = 1 << 1;
+
+/// `ICU.TXDW`: a transmit descriptor was written back.
+pub const ICU_TXDW: u32 = 1 << 0;
+/// `ICU.LSC`: the link state changed.
+pub const ICU_LSC: u32 = 1 << 2;
+/// `ICU.RXDMT0`: the receive ring dropped below its low threshold.
+pub const ICU_RXDMT0: u32 = 1 << 4;
+/// `ICU.RXT0`: the receive timer expired with a frame waiting.
+pub const ICU_RXT0: u32 = 1 << 7;
+
+/// Interrupts the bootstrap asks for: transmit completion and received frames.
+pub const fn interrupt_mask() -> u32 {
+    ICU_TXDW | ICU_RXDMT0 | ICU_RXT0
+}
 
 /// `RCTL.EN`: enable the receive path.
 pub const RCTL_EN: u32 = 1 << 1;

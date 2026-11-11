@@ -157,6 +157,29 @@ pub fn init() {
         idt.set_handler(14, page_fault as usize, 0);
         idt.set_handler(0x20, timer as usize, 0);
         idt.set_handler(0x80, syscall_gate as usize, 3);
+        idt.set_handler(crate::apic::DEVICE_VECTOR, device_interrupt as usize, 0);
+        for (offset, handler) in [
+            line1 as usize,
+            line2 as usize,
+            line3 as usize,
+            line4 as usize,
+            line5 as usize,
+            line6 as usize,
+            line7 as usize,
+            line8 as usize,
+            line9 as usize,
+            line10 as usize,
+            line11 as usize,
+            line12 as usize,
+            line13 as usize,
+            line14 as usize,
+            line15 as usize,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            idt.set_handler(0x21 + offset as u8, handler, 0);
+        }
         idt.load();
     }
 }
@@ -198,6 +221,36 @@ isr_error!(general_protection, 13);
 isr_error!(page_fault, 14);
 isr!(timer, 0x20);
 isr!(syscall_gate, 0x80);
+isr!(device_interrupt, 0x40);
+
+/// Handlers for the legacy interrupt lines below the device vector.
+///
+/// The 8259 raises one vector per line, so a line-based device interrupt arrives
+/// on whichever vector its line was remapped to. Each handler differs only in the
+/// vector it pushes, which is what lets the common stub report it.
+macro_rules! isr_lines {
+    ($($name:ident => $vector:expr),* $(,)?) => {
+        $(isr!($name, $vector);)*
+    };
+}
+
+isr_lines! {
+    line1 => 0x21,
+    line2 => 0x22,
+    line3 => 0x23,
+    line4 => 0x24,
+    line5 => 0x25,
+    line6 => 0x26,
+    line7 => 0x27,
+    line8 => 0x28,
+    line9 => 0x29,
+    line10 => 0x2a,
+    line11 => 0x2b,
+    line12 => 0x2c,
+    line13 => 0x2d,
+    line14 => 0x2e,
+    line15 => 0x2f,
+}
 
 #[unsafe(naked)]
 unsafe extern "C" fn common_stub() {
@@ -294,6 +347,26 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
             }
         }
         0x80 => service_syscall(frame),
+        vector if (0x21..=0x2f).contains(&vector) => {
+            // A line the 8259 owns: acknowledge the line, the device and the APIC.
+            let line = (vector - 0x21) as u8 + 1;
+            if crate::irq::service_line(line).is_err() {
+                serial::write_str("WUXIA_IRQ_ACK_FAILED\n");
+                unsafe {
+                    core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+                }
+            }
+        }
+        vector if vector == u64::from(crate::apic::DEVICE_VECTOR) => {
+            if crate::irq::service().is_err() {
+                // A handler that cannot acknowledge the APIC would be re-entered
+                // forever, so a failure here is reported and interrupts stop.
+                serial::write_str("WUXIA_IRQ_ACK_FAILED\n");
+                unsafe {
+                    core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+                }
+            }
+        }
         _ => {
             serial::write_str("WUXIA_UNEXPECTED_VECTOR\n");
             serial::write_hex(frame.vector);

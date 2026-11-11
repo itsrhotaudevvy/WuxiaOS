@@ -64,6 +64,9 @@ pub fn tick() {
         write_volatile(ticks, read_volatile(ticks).wrapping_add(1));
     }
     end_of_interrupt(0);
+    // Once the local APIC is enabled the 8259 vectors arrive through it, so the
+    // in-service bit has to be cleared there as well.
+    crate::irq::end_of_interrupt();
 }
 
 fn remap_pic() {
@@ -108,6 +111,31 @@ fn unmask_timer() {
         let mask = inb(PIC1_DATA);
         outb(PIC1_DATA, mask & !1);
     }
+}
+
+/// Unmask one interrupt line on the 8259 pair.
+///
+/// Errors: [`wuxia_core::Error::OutOfRange`] for a line the pair does not have,
+/// and [`wuxia_core::Error::Unsupported`] for the cascade line, which the pair
+/// owns itself.
+pub fn unmask(irq: u8) -> Result<(), wuxia_core::Error> {
+    if irq > 15 {
+        return Err(wuxia_core::Error::OutOfRange);
+    }
+    if irq == 2 {
+        return Err(wuxia_core::Error::Unsupported);
+    }
+    let (port, bit) = if irq < 8 {
+        (PIC1_DATA, irq)
+    } else {
+        (PIC2_DATA, irq - 8)
+    };
+    // SAFETY: the mask registers of the remapped pair are owned by this module.
+    unsafe {
+        let mask = inb(port);
+        outb(port, mask & !(1 << bit));
+    }
+    Ok(())
 }
 
 /// Send an end-of-interrupt for `irq` to the master or slave PIC.
