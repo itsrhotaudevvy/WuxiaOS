@@ -12,6 +12,7 @@ pub mod capability;
 pub mod cow;
 pub mod credentials;
 pub mod descriptor;
+pub mod dirtree;
 pub mod dispatcher;
 pub mod dospath;
 pub mod elf;
