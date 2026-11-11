@@ -40,6 +40,7 @@ pub mod rlimit;
 pub mod schedule;
 pub mod signal;
 pub mod syscall;
+pub mod timer;
 pub mod unveil;
 pub mod vfs;
 
