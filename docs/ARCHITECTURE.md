@@ -14,6 +14,8 @@ NT support requires per-build syscall tables, NT object namespaces, handles, acc
 
 `crates/core` is `no_std` and `forbid(unsafe_code)`. It contains host-testable contracts, not an executing compatibility layer. `crates/kernel` is a real `no_std` x86_64 kernel with a Limine high-half entry, COM1 serial output, memory-map ingestion and a bootstrap bump allocator.
 
+Paging contracts in `crates/core/src/paging.rs` validate lower-half, page-aligned user addresses and encode PML4-through-PT entries. Leaves reject the null frame, addresses beyond 52-bit physical addressing, and any writable-executable combination. These functions only produce `u64` entries; the kernel does not yet allocate table frames, build a hierarchy or load CR3.
+
 The bootstrap bump allocator owns a bounded normalized map and never returns a frame twice. It does not free frames; early page tables are permanent for the lifetime of bootstrap. General reclaim requires ownership and reference tracking, not simply changing the cursor backward.
 
 ## Memory and isolation roadmap

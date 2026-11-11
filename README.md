@@ -6,7 +6,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 ## Repository layout
 
-- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE metadata parsing, physical frames and syscall vocabulary.
+- `crates/core`: `no_std`, allocator-independent contracts and host tests: capabilities, PE metadata parsing, physical frames, x86_64 paging encoding and syscall vocabulary.
 - `crates/kernel`: the real `no_std` x86_64 Limine kernel, bootstrap serial console, descriptor tables and physical-memory allocator.
 - `crates/xtask`: host-side build, test, ISO and QEMU orchestration.
 - `docs`: architecture, security, compatibility and research decisions.
@@ -16,7 +16,8 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 
 - A Limine ISO boots in QEMU and reaches the high-half kernel at `0xffffffff80000000`.
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
-- 14 `wuxia-core` host tests pass.
+- `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X; no page table is installed yet.
+- 28 `wuxia-core` host tests pass.
 - PE parsing validates container metadata only. No Windows program or driver is executed yet.
 - IDT/GDT definitions are scaffolding; CPU interrupt installation and userspace transitions are not complete.
 - No POSIX userspace, filesystem, scheduler, network stack, Windows application or Windows driver support exists yet.
