@@ -151,7 +151,8 @@ pub fn init() {
     unsafe {
         let tss = &mut *addr_of_mut!(TSS);
         tss.rsp0 = addr_of!(TRAP_STACK) as u64 + size_of::<TrapStack>() as u64;
-        let (low, high) = SegmentDescriptor::tss(addr_of!(TSS) as u64, size_of::<TaskStateSegment>() as u32);
+        let (low, high) =
+            SegmentDescriptor::tss(addr_of!(TSS) as u64, size_of::<TaskStateSegment>() as u32);
         let gdt = &mut *addr_of_mut!(GDT);
         gdt.entries[5] = low;
         gdt.entries[6] = high;

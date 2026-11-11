@@ -87,8 +87,7 @@ pub extern "C" fn _start() -> ! {
         0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00,
         0x00, 0x48, 0x31, 0xff, 0xcd, 0x80,
     ];
-    paging::write_frame(direct_map, first, &USER_CODE)
-        .expect("cannot write the user code page");
+    paging::write_frame(direct_map, first, &USER_CODE).expect("cannot write the user code page");
     let stack = allocator
         .allocate_frame()
         .expect("a user stack frame is required");
@@ -107,7 +106,10 @@ pub extern "C" fn _start() -> ! {
 
     let code = paging::resolve(direct_map, image.code_address)
         .expect("the new root does not resolve the user code page");
-    assert_eq!(code, image.code_entry, "the code leaf changed after activation");
+    assert_eq!(
+        code, image.code_entry,
+        "the code leaf changed after activation"
+    );
     let stack_leaf = paging::resolve(direct_map, image.stack_address)
         .expect("the new root does not resolve the user stack page");
     assert_eq!(

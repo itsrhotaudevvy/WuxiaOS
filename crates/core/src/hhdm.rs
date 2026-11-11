@@ -70,7 +70,10 @@ mod tests {
         assert_eq!(DirectMap::new(0), Err(Error::InvalidInput));
         assert_eq!(DirectMap::new(0x1000), Err(Error::InvalidInput));
         assert_eq!(DirectMap::new(OFFSET + 1), Err(Error::InvalidInput));
-        assert_eq!(DirectMap::new(HIGHER_HALF_BASE - PAGE_SIZE), Err(Error::InvalidInput));
+        assert_eq!(
+            DirectMap::new(HIGHER_HALF_BASE - PAGE_SIZE),
+            Err(Error::InvalidInput)
+        );
     }
 
     #[test]

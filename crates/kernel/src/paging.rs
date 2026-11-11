@@ -113,11 +113,7 @@ pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error
 }
 
 /// Copy a byte slice into a physical frame through the direct map.
-pub fn write_frame(
-    direct_map: DirectMap,
-    frame: u64,
-    bytes: &[u8],
-) -> Result<(), Error> {
+pub fn write_frame(direct_map: DirectMap, frame: u64, bytes: &[u8]) -> Result<(), Error> {
     if bytes.len() > PAGE_SIZE as usize {
         return Err(Error::InvalidInput);
     }
@@ -156,11 +152,7 @@ fn link_pages<const N: usize>(
         table_index(code_address, 2)?,
         table_entry(pt, true)?,
     );
-    let code_entry = leaf(
-        code_address,
-        code_physical,
-        PagePermissions::USER_CODE,
-    )?;
+    let code_entry = leaf(code_address, code_physical, PagePermissions::USER_CODE)?;
     let stack_entry = leaf(
         stack_address,
         stack_physical,

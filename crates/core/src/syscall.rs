@@ -167,11 +167,21 @@ mod tests {
         let getpid = Registers::default();
         assert_eq!(PosixRequest::decode(39, &getpid), Ok(PosixRequest::GetPid));
         assert_eq!(
-            PosixRequest::decode(60, &Registers { args: [7, 0, 0, 0, 0, 0] }),
+            PosixRequest::decode(
+                60,
+                &Registers {
+                    args: [7, 0, 0, 0, 0, 0]
+                }
+            ),
             Ok(PosixRequest::Exit { code: 7 })
         );
         assert_eq!(
-            PosixRequest::decode(3, &Registers { args: [2, 0, 0, 0, 0, 0] }),
+            PosixRequest::decode(
+                3,
+                &Registers {
+                    args: [2, 0, 0, 0, 0, 0]
+                }
+            ),
             Ok(PosixRequest::Close { descriptor: 2 })
         );
         assert_eq!(

@@ -166,11 +166,7 @@ pub trait PageTableReader {
 /// Huge intermediate entries and 2 MiB leaves are rejected with
 /// [`Error::Unsupported`] because the bootstrap map is 4 KiB only. Absent
 /// entries return [`Error::NotFound`].
-pub fn walk<R: PageTableReader>(
-    reader: &R,
-    root: u64,
-    virtual_address: u64,
-) -> Result<u64> {
+pub fn walk<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> Result<u64> {
     if !is_user_address(virtual_address) {
         return Err(Error::BadAddress);
     }
@@ -255,11 +251,19 @@ mod tests {
             Err(Error::BadAddress)
         );
         assert_eq!(
-            leaf(USER_ADDRESS_LIMIT, 0x2000, PagePermissions::KERNEL_READ_ONLY),
+            leaf(
+                USER_ADDRESS_LIMIT,
+                0x2000,
+                PagePermissions::KERNEL_READ_ONLY
+            ),
             Err(Error::BadAddress)
         );
         assert_eq!(
-            leaf(0xffff_ffff_8000_0000, 0x2000, PagePermissions::KERNEL_READ_ONLY),
+            leaf(
+                0xffff_ffff_8000_0000,
+                0x2000,
+                PagePermissions::KERNEL_READ_ONLY
+            ),
             Err(Error::BadAddress)
         );
         assert_eq!(
@@ -271,7 +275,11 @@ mod tests {
             Err(Error::BadAddress)
         );
         assert_eq!(
-            leaf(0x400000, 0x0010_0000_0000_0000, PagePermissions::USER_READ_ONLY),
+            leaf(
+                0x400000,
+                0x0010_0000_0000_0000,
+                PagePermissions::USER_READ_ONLY
+            ),
             Err(Error::BadAddress)
         );
     }
@@ -372,14 +380,12 @@ mod tests {
         assert_eq!(walk(&huge, 0x1000, 0x400000), Err(Error::Unsupported));
 
         let null_table = Sparse {
-            entries: [
-                (0x1000, 0, PRESENT | 0),
-                (0, 0, 0),
-                (0, 0, 0),
-                (0, 0, 0),
-            ],
+            entries: [(0x1000, 0, PRESENT | 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)],
         };
-        assert_eq!(walk(&null_table, 0x1000, 0x400000), Err(Error::InvalidState));
+        assert_eq!(
+            walk(&null_table, 0x1000, 0x400000),
+            Err(Error::InvalidState)
+        );
         assert_eq!(walk(&null_table, 0x1000, 0x1001), Err(Error::BadAddress));
     }
 }

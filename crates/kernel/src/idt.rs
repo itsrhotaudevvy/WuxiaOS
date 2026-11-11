@@ -78,7 +78,8 @@ impl Idt {
 
     /// Set one vector's descriptor.
     pub fn set_handler(&mut self, vector: u8, handler: usize, privilege: u8) {
-        self.entries[vector as usize] = IdtEntry::interrupt(handler, KERNEL_CODE_SELECTOR, privilege);
+        self.entries[vector as usize] =
+            IdtEntry::interrupt(handler, KERNEL_CODE_SELECTOR, privilege);
     }
 
     /// Load the table with `lidt`.
