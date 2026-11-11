@@ -161,9 +161,10 @@ impl<'a> PeImage<'a> {
         }
         for first in 0..self.section_count as usize {
             let a = self.section(first)?;
+            let a_virtual_len = a.virtual_size.max(a.raw_size);
             let a_virtual_end = a
                 .virtual_address
-                .checked_add(a.virtual_size.max(a.raw_size))
+                .checked_add(a_virtual_len)
                 .ok_or(Error::InvalidImage)?;
             let a_raw_end = a
                 .raw_offset
@@ -171,11 +172,17 @@ impl<'a> PeImage<'a> {
                 .ok_or(Error::InvalidImage)?;
             for other_index in (first + 1)..self.section_count as usize {
                 let b = self.section(other_index)?;
+                let b_virtual_len = b.virtual_size.max(b.raw_size);
                 let b_end = b
                     .virtual_address
-                    .checked_add(b.virtual_size.max(b.raw_size))
+                    .checked_add(b_virtual_len)
                     .ok_or(Error::InvalidImage)?;
-                if a.virtual_address < b_end && b.virtual_address < a_virtual_end {
+                // An empty range covers no bytes, so it overlaps nothing.
+                if a_virtual_len != 0
+                    && b_virtual_len != 0
+                    && a.virtual_address < b_end
+                    && b.virtual_address < a_virtual_end
+                {
                     return Err(Error::InvalidImage);
                 }
                 let b_raw_end = b
@@ -586,6 +593,102 @@ mod tests {
         set_u32(&mut image, second + 8, 0x100);
         set_u32(&mut image, second + 12, 0x1800);
         assert!(PeImage::parse(&image).unwrap().info().is_ok());
+    }
+
+    /// `.text` from `minimal_pe64`, as a whole section header.
+    fn text_header() -> [u8; 40] {
+        let image = minimal_pe64();
+        image[SECTION_HEADER..SECTION_HEADER + 40]
+            .try_into()
+            .unwrap()
+    }
+
+    /// A section header with the given sizes and addresses.
+    fn section_header(
+        virtual_size: u32,
+        virtual_address: u32,
+        raw_size: u32,
+        raw_offset: u32,
+    ) -> [u8; 40] {
+        let mut header = [0u8; 40];
+        header[..5].copy_from_slice(b".test");
+        set_u32(&mut header, 8, virtual_size);
+        set_u32(&mut header, 12, virtual_address);
+        set_u32(&mut header, 16, raw_size);
+        set_u32(&mut header, 20, raw_offset);
+        header
+    }
+
+    /// `minimal_pe64` with its section table replaced by the two headers.
+    fn two_section_image(first: [u8; 40], second: [u8; 40]) -> [u8; 0x400] {
+        let mut image = minimal_pe64();
+        image[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+        image[SECTION_HEADER..SECTION_HEADER + 40].copy_from_slice(&first);
+        image[SECTION_HEADER + 40..SECTION_HEADER + 80].copy_from_slice(&second);
+        image
+    }
+
+    fn info_is_accepted(image: &[u8]) -> bool {
+        PeImage::parse(image).and_then(|pe| pe.info()).is_ok()
+    }
+
+    #[test]
+    fn empty_sections_nested_inside_another_are_accepted() {
+        // Zero VirtualSize and zero SizeOfRawData cover no bytes, so an empty
+        // section inside .text's virtual or raw range is not an overlap.
+        let empty = [
+            section_header(0, 0x1050, 0, 0x250),
+            section_header(0, 0x1000, 0, 0),
+            section_header(0, 0x1199, 0, 0x3ff),
+        ];
+        for header in empty {
+            assert!(info_is_accepted(&two_section_image(text_header(), header)));
+            assert!(info_is_accepted(&two_section_image(header, text_header())));
+        }
+
+        // A zero raw range inside .text's raw bytes, with its virtual range
+        // disjoint from .text, is accepted.
+        let raw_empty = section_header(0x100, 0x1800, 0, 0x250);
+        assert!(info_is_accepted(&two_section_image(
+            text_header(),
+            raw_empty
+        )));
+        assert!(info_is_accepted(&two_section_image(
+            raw_empty,
+            text_header()
+        )));
+    }
+
+    #[test]
+    fn one_byte_sections_inside_another_are_rejected() {
+        let inside = [
+            // One virtual byte inside .text's virtual range.
+            section_header(1, 0x1050, 0, 0),
+            // One raw byte and one virtual byte inside .text's ranges.
+            section_header(0, 0x1050, 1, 0x250),
+            // One raw byte inside .text's raw range, virtually disjoint.
+            section_header(0, 0x1800, 1, 0x250),
+        ];
+        for header in inside {
+            assert!(!info_is_accepted(&two_section_image(text_header(), header)));
+            assert!(!info_is_accepted(&two_section_image(header, text_header())));
+        }
+    }
+
+    #[test]
+    fn adjacent_sections_are_accepted_and_one_byte_of_overlap_is_not() {
+        // .text shrinks to virtual [0x1000, 0x1100) and raw [0x200, 0x300), so
+        // the next section starts exactly where .text ends in both spaces.
+        let mut text = text_header();
+        set_u32(&mut text, 16, 0x100);
+        let next = section_header(0x100, 0x1100, 0x100, 0x300);
+        assert!(info_is_accepted(&two_section_image(text, next)));
+        assert!(info_is_accepted(&two_section_image(next, text)));
+
+        // Starting one virtual byte early overlaps .text by exactly one byte.
+        let overlapping = section_header(0x100, 0x10ff, 0x100, 0x300);
+        assert!(!info_is_accepted(&two_section_image(text, overlapping)));
+        assert!(!info_is_accepted(&two_section_image(overlapping, text)));
     }
 
     #[test]
