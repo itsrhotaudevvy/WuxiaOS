@@ -112,6 +112,15 @@ core::arch::global_asm!(
     "6:",
     "ud2",
     "7:",
+    // close the file, then prove a read on the closed descriptor fails
+    "mov rax, 3",
+    "mov rdi, r12",
+    "int 0x80",
+    "xor eax, eax",
+    "mov rdi, r12",
+    "lea rsi, [rsp + 16]",
+    "mov rdx, 16",
+    "int 0x80",
     "add rsp, 96",
     // yield: the scheduler runs the second process, then resumes here
     "mov rax, 24",
