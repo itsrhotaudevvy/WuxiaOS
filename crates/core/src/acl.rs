@@ -116,28 +116,72 @@ pub struct Acl<'a> {
 impl<'a> Acl<'a> {
     /// Parse and validate an ACL from the start of `bytes`.
     ///
-    /// Bytes beyond `AclSize` are ignored. Every ACE's size is checked, and
-    /// every allowed or denied ACE is fully decoded. Inherit-only ACEs are
-    /// skipped without decoding their SIDs, since they never apply here. An
-    /// accepted ACL therefore never fails during evaluation.
+    /// The header is checked first: revision, both reserved bytes (`Sbz1` and
+    /// `Sbz2`) must be zero, and `AclSize` must be at least the header length,
+    /// a multiple of four, and no larger than `bytes`. Only the first
+    /// `AclSize` bytes belong to the ACL. Bytes after them are never read, so
+    /// callers may pass a larger buffer.
+    ///
+    /// `AceCount` must be able to fit: each ACE is at least eight bytes, so a
+    /// count whose minimum size exceeds the body is rejected before any ACE is
+    /// walked. Every ACE must lie entirely inside `AclSize`, and its SID must
+    /// lie entirely inside its own `AceSize`. Padding after the SID is allowed.
+    /// Slack after the last ACE but inside `AclSize` is also allowed, because
+    /// Windows permits it; it is ignored.
+    ///
+    /// Every allowed or denied ACE is fully decoded. Inherit-only ACEs have
+    /// their framing and SID checked but are then skipped, since they never
+    /// apply here. An accepted ACL therefore never fails during evaluation.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        let [revision] = read_array::<1>(bytes, 0)?;
-        let acl_size = usize::from(u16::from_le_bytes(read_array(bytes, 2)?));
-        let ace_count = u16::from_le_bytes(read_array(bytes, 4)?);
-        if !matches!(revision, ACL_REVISION | ACL_REVISION_DS) || acl_size < ACL_HEADER_LEN {
+        let [
+            revision,
+            sbz1,
+            size_lo,
+            size_hi,
+            count_lo,
+            count_hi,
+            sbz2_lo,
+            sbz2_hi,
+        ] = read_array::<ACL_HEADER_LEN>(bytes, 0)?;
+        let acl_size = usize::from(u16::from_le_bytes([size_lo, size_hi]));
+        let ace_count = u16::from_le_bytes([count_lo, count_hi]);
+        if !matches!(revision, ACL_REVISION | ACL_REVISION_DS)
+            || sbz1 != 0
+            || [sbz2_lo, sbz2_hi] != [0, 0]
+            || acl_size < ACL_HEADER_LEN
+            || !acl_size.is_multiple_of(4)
+        {
             return Err(Error::InvalidInput);
         }
         let region = bytes.get(..acl_size).ok_or(Error::InvalidInput)?;
         let body = region.get(ACL_HEADER_LEN..).ok_or(Error::InvalidInput)?;
-        let acl = Self {
+
+        let min_ace_bytes = usize::from(ace_count)
+            .checked_mul(ACE_HEADER_LEN)
+            .ok_or(Error::InvalidInput)?;
+        if min_ace_bytes > body.len() {
+            return Err(Error::InvalidInput);
+        }
+
+        let mut walk = Aces {
+            rest: body,
+            remaining: ace_count,
+        };
+        for ace in walk.by_ref() {
+            ace?;
+        }
+        // The walk only advances through `body`, so the bytes it consumed
+        // cannot run past the end of AclSize. Input cannot trigger this
+        // check; it documents and guards that invariant.
+        body.len()
+            .checked_sub(walk.rest.len())
+            .filter(|consumed| *consumed <= body.len())
+            .ok_or(Error::InvalidInput)?;
+        Ok(Self {
             revision,
             ace_count,
             body,
-        };
-        for ace in acl.aces() {
-            ace?;
-        }
-        Ok(acl)
+        })
     }
 
     /// Return the ACL revision byte.
@@ -207,8 +251,12 @@ fn split_ace(rest: &[u8]) -> Result<(&[u8], &[u8])> {
 }
 
 /// Decode one complete ACE. Returns `None` for inherit-only entries.
+///
+/// `ace` is exactly `AceSize` bytes, so the SID check bounds the SID by its
+/// own ACE. The SID is checked for every ACE, including inherit-only ones.
 fn decode_ace(ace: &[u8]) -> Result<Option<Ace<'_>>> {
     let [kind, flags, _, _] = read_array::<4>(ace, 0)?;
+    let sid = parse_sid(ace.get(ACE_HEADER_LEN..).ok_or(Error::InvalidInput)?)?;
     if flags & INHERIT_ONLY_ACE != 0 {
         return Ok(None);
     }
@@ -218,7 +266,6 @@ fn decode_ace(ace: &[u8]) -> Result<Option<Ace<'_>>> {
         _ => return Err(Error::Unsupported),
     };
     let mask = u32::from_le_bytes(read_array(ace, 4)?);
-    let sid = parse_sid(ace.get(ACE_HEADER_LEN..).ok_or(Error::InvalidInput)?)?;
     Ok(Some(Ace {
         kind,
         flags,
@@ -228,6 +275,9 @@ fn decode_ace(ace: &[u8]) -> Result<Option<Ace<'_>>> {
 }
 
 /// Check the SID framing and return exactly its bytes.
+///
+/// `bytes` is the ACE body after its eight-byte header. The SID must fit
+/// inside it; any bytes after the SID are padding and are not returned.
 fn parse_sid(bytes: &[u8]) -> Result<&[u8]> {
     let [revision, count] = read_array::<2>(bytes, 0)?;
     if revision != SID_REVISION || count > SID_MAX_SUBAUTHORITIES {
@@ -453,6 +503,177 @@ mod tests {
         let buf = dacl(&[inherited]);
         let acl = Acl::parse(&buf).unwrap();
         assert_eq!(acl.aces().count(), 0);
+    }
+
+    /// The `AclSize` field of a serialized ACL.
+    fn acl_size_of(buf: &[u8]) -> usize {
+        usize::from(u16::from_le_bytes([buf[2], buf[3]]))
+    }
+
+    #[test]
+    fn parse_rejects_nonzero_reserved_header_bytes() {
+        // Sbz1 is byte 1.
+        let mut buf = dacl(&[]);
+        buf[1] = 1;
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+
+        // Sbz2 is bytes 6 and 7.
+        let mut buf = dacl(&[]);
+        buf[6] = 1;
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+
+        let mut buf = dacl(&[]);
+        buf[7] = 0x80;
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn parse_rejects_truncated_header() {
+        let buf = dacl(&[]);
+        for len in 0..ACL_HEADER_LEN {
+            assert_eq!(
+                Acl::parse(&buf[..len]).map(|_| ()),
+                Err(Error::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_requires_acl_size_to_be_dword_aligned() {
+        let mut buf = dacl(&[]);
+        buf[2..4].copy_from_slice(&10u16.to_le_bytes());
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+
+        let mut buf = dacl(&[]);
+        buf[2..4].copy_from_slice(&12u16.to_le_bytes());
+        assert!(Acl::parse(&buf).is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_acl_size_beyond_input() {
+        // One WORLD ACE makes AclSize 28.
+        let buf = dacl(&[ace(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &WORLD)]);
+        assert_eq!(acl_size_of(&buf), 28);
+        assert_eq!(Acl::parse(&buf[..27]).map(|_| ()), Err(Error::InvalidInput));
+        assert!(Acl::parse(&buf[..28]).is_ok());
+    }
+
+    #[test]
+    fn parse_never_reads_past_acl_size() {
+        // A valid ACE exists only beyond AclSize, and AceCount claims it.
+        // It must not be read, so the ACL is rejected.
+        let mut buf = dacl(&[]);
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let beyond = ace(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &WORLD);
+        buf[8..8 + 20].copy_from_slice(&beyond[..20]);
+        assert_eq!(acl_size_of(&buf), 8);
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn parse_ignores_bytes_after_acl_size() {
+        let mut buf = dacl(&[ace(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &ALICE)]);
+        let size = acl_size_of(&buf);
+        // Fill the tail with bytes that would be an invalid ACE if read.
+        buf[size..].fill(0xff);
+        let acl = Acl::parse(&buf).unwrap();
+        assert_eq!(acl.aces().count(), 1);
+        assert_eq!(Acl::parse(&buf[..size]).unwrap(), acl);
+    }
+
+    #[test]
+    fn parse_allows_slack_inside_acl_size() {
+        // Grow AclSize by 8 zero bytes after the last ACE.
+        let mut buf = dacl(&[ace(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &WORLD)]);
+        buf[2..4].copy_from_slice(&36u16.to_le_bytes());
+        let acl = Acl::parse(&buf).unwrap();
+        assert_eq!(acl.aces().count(), 1);
+
+        let mut buf = dacl(&[]);
+        buf[2..4].copy_from_slice(&16u16.to_le_bytes());
+        assert_eq!(Acl::parse(&buf).unwrap().aces().count(), 0);
+    }
+
+    #[test]
+    fn parse_rejects_ace_count_that_cannot_fit() {
+        // Three ACEs need at least 24 body bytes, but AclSize leaves 16.
+        let mut buf = dacl(&[]);
+        buf[2..4].copy_from_slice(&24u16.to_le_bytes());
+        buf[4..6].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+
+        // The largest count with the smallest AclSize.
+        let mut buf = dacl(&[]);
+        buf[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn parse_rejects_sid_that_overruns_its_ace() {
+        // The ACE is 16 bytes, but its 12-byte SID needs 20. The SID still
+        // lies inside AclSize, so only the per-ACE check catches it.
+        let mut buf = [0u8; 32];
+        buf[0] = ACL_REVISION;
+        buf[2..4].copy_from_slice(&32u16.to_le_bytes());
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[8] = ACCESS_ALLOWED_ACE_TYPE;
+        buf[10..12].copy_from_slice(&16u16.to_le_bytes());
+        buf[12..16].copy_from_slice(&FILE_READ.to_le_bytes());
+        buf[16..28].copy_from_slice(&WORLD);
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn parse_allows_padding_after_sid() {
+        // A 12-byte SID in a 24-byte ACE leaves 4 bytes of padding.
+        let mut buf = [0u8; 32];
+        buf[0] = ACL_REVISION;
+        buf[2..4].copy_from_slice(&32u16.to_le_bytes());
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[8] = ACCESS_ALLOWED_ACE_TYPE;
+        buf[10..12].copy_from_slice(&24u16.to_le_bytes());
+        buf[12..16].copy_from_slice(&FILE_READ.to_le_bytes());
+        buf[16..28].copy_from_slice(&WORLD);
+        let acl = Acl::parse(&buf).unwrap();
+        let ace = acl.aces().next().unwrap().unwrap();
+        assert_eq!(ace.mask, FILE_READ);
+        assert_eq!(ace.sid, &WORLD[..]);
+    }
+
+    #[test]
+    fn parse_checks_sids_of_inherit_only_aces() {
+        let bad_revision = [2u8, 0, 0, 0, 0, 0, 0, 1];
+        let buf = dacl(&[ace(
+            ACCESS_ALLOWED_ACE_TYPE,
+            INHERIT_ONLY_ACE,
+            FILE_READ,
+            &bad_revision,
+        )]);
+        assert_eq!(Acl::parse(&buf).map(|_| ()), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn valid_acl_embedded_in_larger_buffer() {
+        let small = dacl(&[
+            ace(ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ, &ALICE),
+            ace(ACCESS_DENIED_ACE_TYPE, 0, FILE_WRITE, &BOB),
+        ]);
+        let size = acl_size_of(&small);
+        // Surround the ACL with bytes that would be invalid if read.
+        let mut big = [0xa5u8; 512];
+        big[..size].copy_from_slice(&small[..size]);
+
+        let acl = Acl::parse(&big).unwrap();
+        assert_eq!(acl.ace_count(), 2);
+        assert_eq!(acl.aces().count(), 2);
+        assert_eq!(
+            access_check(Some(&acl), &[&ALICE], FILE_READ, &MAPPING),
+            Ok(FILE_READ)
+        );
+        assert_eq!(
+            access_check(Some(&acl), &[&BOB], FILE_WRITE, &MAPPING),
+            Err(Error::PermissionDenied)
+        );
     }
 
     #[test]
