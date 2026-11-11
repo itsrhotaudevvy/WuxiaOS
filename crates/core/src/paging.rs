@@ -31,6 +31,12 @@ const NO_EXECUTE: u64 = 1 << 63;
 /// The first canonical higher-half address, where supervisor mappings start.
 pub const KERNEL_ADDRESS_START: u64 = 0xffff_8000_0000_0000;
 
+/// One past the highest supervisor address an image may be mapped at.
+///
+/// The kernel image itself starts at `0xffff_ffff_8000_0000`, so a load that
+/// reaches this bound would overwrite the running kernel.
+pub const KERNEL_ADDRESS_LIMIT: u64 = 0xffff_ffff_8000_0000;
+
 /// Permissions for a four-kibibyte leaf mapping.
 ///
 /// The kernel enforces W^X: a mapping may be writable or executable, never
@@ -80,6 +86,22 @@ impl PagePermissions {
         writable: false,
         user: false,
         executable: false,
+        cache_disable: false,
+    };
+
+    /// A supervisor-only, writable, non-executable data page.
+    pub const KERNEL_READ_WRITE: Self = Self {
+        writable: true,
+        user: false,
+        executable: false,
+        cache_disable: false,
+    };
+
+    /// A supervisor-only, read-only, executable code page.
+    pub const KERNEL_CODE: Self = Self {
+        writable: false,
+        user: false,
+        executable: true,
         cache_disable: false,
     };
 
@@ -196,6 +218,50 @@ pub const fn kernel_table_index(virtual_address: u64, level: usize) -> Result<us
     Ok(((virtual_address >> (39 - level * 9)) & 0x1ff) as usize)
 }
 
+/// Translate a mapped address to the physical address it names.
+///
+/// Huge leaves are honored: a bootloader that maps the kernel with 2 MiB or 1 GiB
+/// pages is still translated exactly, which is what lets the kernel find the
+/// frames behind its own stack. Four-kibibyte leaves are resolved as usual.
+pub fn translate<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> Result<u64> {
+    if virtual_address == 0 {
+        return Err(Error::BadAddress);
+    }
+    let mut table = root;
+    for level in 0..3 {
+        let entry = reader.read_entry(table, walker_index(virtual_address, level));
+        if !is_present(entry) {
+            return Err(Error::NotFound);
+        }
+        if entry & HUGE != 0 {
+            let size = match level {
+                1 => 1 << 30,
+                2 => 1 << 21,
+                _ => return Err(Error::Unsupported),
+            };
+            let base = physical_address(entry) & !(size - 1);
+            return Ok(base + (virtual_address & (size - 1)));
+        }
+        table = physical_address(entry);
+        if table == 0 {
+            return Err(Error::InvalidState);
+        }
+    }
+    let leaf = reader.read_entry(table, walker_index(virtual_address, 3));
+    if !is_present(leaf) {
+        return Err(Error::NotFound);
+    }
+    if leaf & HUGE != 0 {
+        return Err(Error::Unsupported);
+    }
+    Ok(physical_address(leaf) + (virtual_address & (PAGE_SIZE - 1)))
+}
+
+/// Index of `virtual_address` in the table at `level`, for any address range.
+const fn walker_index(virtual_address: u64, level: usize) -> usize {
+    ((virtual_address >> (39 - level * 9)) & 0x1ff) as usize
+}
+
 /// Decode a present entry's physical address.
 pub const fn physical_address(entry: u64) -> u64 {
     entry & ADDRESS_MASK
@@ -246,9 +312,20 @@ pub fn walk<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> 
     if virtual_address == 0 || virtual_address >= USER_ADDRESS_LIMIT {
         return Err(Error::BadAddress);
     }
+    walk_any(reader, root, virtual_address)
+}
+
+/// Resolve any mapped four-kibibyte page, user or supervisor.
+///
+/// The kernel needs this to find the frames backing its own stack, which live in
+/// the higher half where [`walk`] deliberately refuses to look.
+pub fn walk_any<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> Result<u64> {
+    if virtual_address == 0 {
+        return Err(Error::BadAddress);
+    }
     let mut table = root;
     for level in 0..3 {
-        let entry = reader.read_entry(table, table_index(virtual_address, level)?);
+        let entry = reader.read_entry(table, walker_index(virtual_address, level));
         if !is_present(entry) {
             return Err(Error::NotFound);
         }
@@ -260,7 +337,7 @@ pub fn walk<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> 
             return Err(Error::InvalidState);
         }
     }
-    let leaf_entry = reader.read_entry(table, table_index(virtual_address, 3)?);
+    let leaf_entry = reader.read_entry(table, walker_index(virtual_address, 3));
     if !is_present(leaf_entry) {
         return Err(Error::NotFound);
     }
@@ -479,6 +556,49 @@ mod tests {
                 .find(|(frame, slot, _)| *frame == table_frame && *slot == index)
                 .map_or(0, |(_, _, value)| *value)
         }
+    }
+
+    #[test]
+    fn translate_honors_a_two_mibibyte_leaf() {
+        // 0xffff_ffff_8000_0000 walks PML4[511], PDPT[510], PD[0]; the huge leaf
+        // covers 2 MiB starting at 0x200000.
+        let huge_entry = PRESENT | HUGE | 0x200000;
+        let reader = Sparse {
+            entries: [
+                (0x1000, 511, table_entry(0x2000, true).unwrap()),
+                (0x2000, 510, table_entry(0x3000, true).unwrap()),
+                (0x3000, 0, huge_entry),
+                (0x4000, 0, 0),
+            ],
+        };
+        assert_eq!(
+            translate(&reader, 0x1000, 0xffff_ffff_8000_0000),
+            Ok(0x200000)
+        );
+        assert_eq!(
+            translate(&reader, 0x1000, 0xffff_ffff_800f_1234),
+            Ok(0x2f_1234),
+            "an address inside a huge page keeps its offset"
+        );
+        assert_eq!(
+            translate(&reader, 0x1000, 0x0000_0000_4000_0000),
+            Err(Error::NotFound),
+            "an unmapped chain must not translate"
+        );
+    }
+
+    #[test]
+    fn translate_resolves_a_four_kibibyte_leaf_with_its_offset() {
+        let leaf_entry = leaf(0x400000, 0x9000, PagePermissions::USER_READ_WRITE).unwrap();
+        let reader = Sparse {
+            entries: [
+                (0x1000, 0, table_entry(0x2000, true).unwrap()),
+                (0x2000, 0, table_entry(0x3000, true).unwrap()),
+                (0x3000, 2, table_entry(0x4000, true).unwrap()),
+                (0x4000, 0, leaf_entry),
+            ],
+        };
+        assert_eq!(translate(&reader, 0x1000, 0x400123), Ok(0x9123));
     }
 
     #[test]

@@ -171,3 +171,13 @@ fn write_msr(register: u32, value: u64) {
         );
     }
 }
+
+/// Read the current stack pointer.
+pub fn stack_pointer() -> u64 {
+    let value: u64;
+    // SAFETY: reading the stack pointer has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}

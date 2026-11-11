@@ -15,6 +15,7 @@ use limine::request::{
 
 mod apic;
 mod cpu;
+mod drivers;
 mod gdt;
 mod idt;
 mod imports;
@@ -30,6 +31,9 @@ mod time;
 mod user;
 mod vfs;
 
+/// Size of the bootloader-provided stack, mirrored by `STACK_SIZE_REQUEST`.
+const BOOT_STACK_SIZE: u64 = 0x10_0000;
+
 #[used]
 #[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
@@ -40,7 +44,7 @@ static REQUESTS_START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
-static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(0x100000);
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(BOOT_STACK_SIZE);
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -65,6 +69,8 @@ static SECOND_ELF: &[u8] = include_bytes!(env!("WUXIA_SECOND_ELF_PATH"));
 
 /// Minimal PE32+ program exercised through the NT personality.
 static PE_IMAGE: &[u8] = include_bytes!(env!("WUXIA_PE_IMAGE_PATH"));
+/// A kernel-mode image the loader relocates and enters.
+static DRIVER_IMAGE: &[u8] = include_bytes!(env!("WUXIA_DRIVER_IMAGE_PATH"));
 
 /// Highest displacement the PE self-test image is mapped away from its base.
 const PE_DISPLACEMENT_WINDOW: u64 = 0x40_0000;
@@ -110,8 +116,38 @@ pub extern "C" fn _start() -> ! {
         .expect("Limine did not provide a memory map");
     let map =
         memory::from_limine::<32>(response).expect("invalid or oversized physical memory map");
-    let mut allocator = memory::frame_pool::<65536, 32>(&map)
-        .expect("the usable memory map exceeds the frame pool");
+    let hhdm = HHDM_REQUEST
+        .get_response()
+        .expect("Limine did not provide a direct map");
+    let direct_map = wuxia_core::DirectMap::new(hhdm.offset())
+        .expect("the direct-map offset is not aligned higher-half memory");
+    // The stack this code is running on was allocated by the bootloader out of
+    // usable memory, so its frames appear in the map. Handing them out would zero
+    // them underneath the running kernel, so they are translated and reserved.
+    let stack_pointer = cpu::stack_pointer();
+    let stack_lowest = stack_pointer
+        .checked_sub(BOOT_STACK_SIZE + wuxia_core::paging::PAGE_SIZE)
+        .expect("the boot stack pointer underflows")
+        & !(wuxia_core::paging::PAGE_SIZE - 1);
+    let mut stack_start = u64::MAX;
+    let mut stack_end = 0;
+    let mut address = stack_lowest;
+    while address < stack_pointer {
+        let frame = paging::physical_frame(direct_map, address)
+            .expect("the boot stack is not mapped by the bootloader");
+        stack_start = stack_start.min(frame);
+        stack_end = stack_end.max(frame + wuxia_core::paging::PAGE_SIZE);
+        address += wuxia_core::paging::PAGE_SIZE;
+    }
+    let reserved = [memory::Reserved {
+        start: stack_start,
+        length: stack_end - stack_start,
+    }];
+    let allocator = memory::pool();
+    memory::fill(allocator, &map, &reserved).expect("the usable memory map exceeds the frame pool");
+    log::write_str("WUXIA_STACK_RESERVED\n");
+    log::write_hex(stack_start);
+    log::write_hex(stack_end - stack_start);
     let first = allocator.allocate().expect("no usable physical frame");
     assert_ne!(first, 0, "the bootstrap must not allocate the null page");
     let second = allocator
@@ -123,11 +159,6 @@ pub extern "C" fn _start() -> ! {
     log::write_hex(first);
     log::write_hex(second);
 
-    let hhdm = HHDM_REQUEST
-        .get_response()
-        .expect("Limine did not provide a direct map");
-    let direct_map = wuxia_core::DirectMap::new(hhdm.offset())
-        .expect("the direct-map offset is not aligned higher-half memory");
     log::write_str("WUXIA_HHDM_OK\n");
     log::write_hex(direct_map.offset());
     paging::record_direct_map(direct_map);
@@ -167,7 +198,7 @@ pub extern "C" fn _start() -> ! {
         // The register file spans more than one page: transmit descriptors and
         // the receive address registers are several pages into BAR0.
         let pages = u64::from(wuxia_core::net::BAR_SIZE) / wuxia_core::paging::PAGE_SIZE;
-        let window = paging::map_mmio(&mut allocator, direct_map, 0, physical, pages)
+        let window = paging::map_mmio(allocator, direct_map, 0, physical, pages)
             .expect("the network device window cannot be mapped");
         log::write_str("WUXIA_MMIO_OK\n");
         log::write_hex(window);
@@ -204,7 +235,7 @@ pub extern "C" fn _start() -> ! {
         frame[6..12].copy_from_slice(&mac);
         frame[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
         frame[14..19].copy_from_slice(b"wuxia");
-        match device.transmit(&mut allocator, direct_map, &frame) {
+        match device.transmit(allocator, direct_map, &frame) {
             Ok(descriptor) => {
                 log::write_str("WUXIA_NET_TX_OK\n");
                 log::write_hex(u64::from(descriptor[12]));
@@ -223,12 +254,12 @@ pub extern "C" fn _start() -> ! {
         let mut padded = [0u8; wuxia_core::net::MIN_FRAME];
         padded[..request.len()].copy_from_slice(&request);
         device
-            .transmit(&mut allocator, direct_map, &padded)
+            .transmit(allocator, direct_map, &padded)
             .expect("the address-resolution request cannot be sent");
         let mut received = [0u8; wuxia_core::net::MAX_FRAME];
         // Interrupts: the local APIC receives the message the controller sends,
         // and the handler acknowledges both of them.
-        let local = apic::Local::map(&mut allocator, direct_map, apic::LOCAL_APIC_PHYSICAL)
+        let local = apic::Local::map(allocator, direct_map, apic::LOCAL_APIC_PHYSICAL)
             .expect("the local APIC cannot be mapped");
         log::write_str("WUXIA_APIC_LOCAL\n");
         log::write_hex(u64::from(local.id));
@@ -252,7 +283,7 @@ pub extern "C" fn _start() -> ! {
         // The I/O APIC owns the legacy PCI interrupt lines. Its redirection
         // entries stay masked: the controller uses a message, and an unmasked
         // entry for a line no handler owns would deliver an unknown vector.
-        let io = apic::Io::map(&mut allocator, direct_map, apic::IO_APIC_PHYSICAL)
+        let io = apic::Io::map(allocator, direct_map, apic::IO_APIC_PHYSICAL)
             .expect("the I/O APIC cannot be mapped");
         log::write_str("WUXIA_APIC_IOAPIC\n");
         log::write_hex(u64::from(io.id));
@@ -328,7 +359,7 @@ pub extern "C" fn _start() -> ! {
         log::write_str("WUXIA_NET_IRQ_MASK\n");
         log::write_hex(u64::from(unmasked));
 
-        match device.receive(&mut allocator, direct_map, &mut received) {
+        match device.receive(allocator, direct_map, &mut received) {
             Ok(length) => {
                 log::write_str("WUXIA_NET_RX_OK\n");
                 log::write_hex(length as u64);
@@ -365,7 +396,7 @@ pub extern "C" fn _start() -> ! {
         trigger[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
         trigger[14..19].copy_from_slice(b"irq!!");
         device
-            .transmit(&mut allocator, direct_map, &trigger)
+            .transmit(allocator, direct_map, &trigger)
             .expect("the interrupt trigger frame cannot be sent");
 
         // The controller signals transmit completion with the message programmed
@@ -386,7 +417,24 @@ pub extern "C" fn _start() -> ! {
         log::write_hex(deadline);
     }
 
-    let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)
+    // A kernel-mode image: mapped with per-section permissions into the supervisor
+    // window, relocated for the address it actually landed at, and then entered.
+    let driver = drivers::load(allocator, direct_map, DRIVER_IMAGE)
+        .expect("the driver image cannot be loaded");
+    log::write_str("WUXIA_DRIVER_IMAGE_OK\n");
+    log::write_hex(driver.base);
+    log::write_hex(driver.entry);
+    log::write_hex(driver.relocations as u64);
+    // SAFETY: the entry point is the start of a mapped, executable code page of a
+    // native image, which is the convention a driver entry point uses.
+    let status = unsafe {
+        let entry: extern "sysv64" fn() -> u64 = core::mem::transmute(driver.entry);
+        entry()
+    };
+    log::write_str("WUXIA_DRIVER_ENTRY\n");
+    log::write_hex(status);
+
+    let image = paging::load_user_image(allocator, direct_map, USER_ELF)
         .expect("cannot load the user ELF image");
     log::write_str("WUXIA_ELF_OK\n");
     log::write_str("WUXIA_USER_IMAGE_OK\n");
@@ -398,10 +446,10 @@ pub extern "C" fn _start() -> ! {
         log::write_hex(segment.address);
     }
 
-    let fault = paging::load_user_image(&mut allocator, direct_map, FAULT_ELF)
+    let fault = paging::load_user_image(allocator, direct_map, FAULT_ELF)
         .expect("cannot load the fault self-test image");
 
-    let second = paging::load_user_image(&mut allocator, direct_map, SECOND_ELF)
+    let second = paging::load_user_image(allocator, direct_map, SECOND_ELF)
         .expect("cannot load the second process image");
 
     let reclaimed = allocator.allocate().expect("no frame to reclaim");
@@ -416,18 +464,17 @@ pub extern "C" fn _start() -> ! {
     log::write_str("WUXIA_FRAME_RECLAIM_OK\n");
 
     let pe_delta = pe_displacement();
-    let mut pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE, pe_delta)
+    let mut pe = paging::load_pe_image(allocator, direct_map, PE_IMAGE, pe_delta)
         .expect("the PE self-test image cannot be loaded");
     log::write_str("WUXIA_PE_IMAGE_OK\n");
     log::write_hex(pe.entry);
     log::write_str("WUXIA_PE_RELOCATED\n");
     log::write_hex(pe_delta as u64);
     log::write_hex(pe.entry);
-    let imports = imports::resolve(&mut allocator, direct_map, &mut pe, PE_IMAGE, pe_delta)
+    let imports = imports::resolve(allocator, direct_map, &mut pe, PE_IMAGE, pe_delta)
         .expect("the PE self-test image has an import that cannot be resolved");
     log::write_str("WUXIA_IMPORTS_OK\n");
     log::write_hex(imports as u64);
-    memory::install_pool(allocator);
 
     let mut files = vfs::KernelFs::new();
     assert!(

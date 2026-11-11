@@ -359,6 +359,79 @@ pub fn map_mmio<const N: usize>(
     Ok(base)
 }
 
+/// Map one kernel page at `address`, allocating intermediate tables as needed.
+///
+/// The walk starts at the live root, so the mapping joins the address space the
+/// processor is already using. An existing mapping is refused rather than
+/// replaced: the caller owns the window, and overwriting a live mapping would
+/// change the meaning of addresses already in use.
+fn map_kernel_page<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    address: u64,
+    frame: u64,
+    permissions: wuxia_core::paging::PagePermissions,
+) -> Result<(), Error> {
+    let mut table = read_cr3();
+    for level in 0..3usize {
+        let slot = wuxia_core::paging::kernel_table_index(address, level)?;
+        let pointer = frame_pointer(direct_map, table)?;
+        let entry = read_entry(pointer, slot);
+        if is_present(entry) {
+            if is_huge(entry) {
+                return Err(Error::AlreadyExists);
+            }
+            table = physical_address(entry);
+            continue;
+        }
+        let next = allocator.allocate().ok_or(Error::OutOfRange)?;
+        zero_frame(direct_map, next)?;
+        write_entry(pointer, slot, table_entry(next, false)?);
+        table = next;
+    }
+    let leaves = frame_pointer(direct_map, table)?;
+    let slot = wuxia_core::paging::kernel_table_index(address, 3)?;
+    if is_present(read_entry(leaves, slot)) {
+        return Err(Error::AlreadyExists);
+    }
+    let entry = wuxia_core::paging::kernel_leaf(address, frame, permissions)?;
+    write_entry(leaves, slot, entry);
+    invalidate(address);
+    Ok(())
+}
+
+/// Map a kernel-mode image plan into the live address space.
+///
+/// Each segment page gets its own physical frame, zeroed and filled with the
+/// section's file bytes, then mapped with the segment's permissions: code
+/// read-only and executable, data writable and non-executable. The frames are
+/// deliberately not tracked for reuse; a loaded driver stays resident for the rest
+/// of the boot.
+///
+/// Errors: `AlreadyExists` when part of the range is mapped, `TableFull` when the
+/// frame pool is exhausted, `InvalidImage` when a segment's file range does not
+/// match its declared size and `OutOfRange` for an unallocatable table.
+pub fn map_kernel_image<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    plan: &LoaderPlan<MAX_USER_SEGMENTS>,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    for segment in plan.segments() {
+        for page in 0..segment.page_count() {
+            let address = segment
+                .address
+                .checked_add(page * PAGE_SIZE)
+                .ok_or(Error::OutOfRange)?;
+            let frame = allocator.allocate().ok_or(Error::TableFull)?;
+            zero_frame(direct_map, frame)?;
+            copy_segment_bytes(direct_map, frame, address, segment, bytes)?;
+            map_kernel_page(allocator, direct_map, address, frame, segment.permissions)?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply the image's base relocations to already mapped pages.
 ///
 /// The image was mapped at `preferred_base + delta`, so every DIR64 slot the
@@ -370,24 +443,51 @@ pub fn map_mmio<const N: usize>(
 ///
 /// Errors: `InvalidImage` for a malformed directory or a slot that straddles a
 /// page, and `NotFound` for a slot outside the mapped image.
+pub fn apply_pe_relocations_at(
+    direct_map: DirectMap,
+    root: u64,
+    bytes: &[u8],
+    base: u64,
+) -> Result<usize, Error> {
+    let (preferred, _) = wuxia_core::pe_common::image_base_and_size(bytes)?;
+    patch_dir64_slots(direct_map, root, bytes, preferred, base)
+}
+
+/// Apply the image's base relocations for a load address given as a delta.
+///
+/// This form is for images loaded near their preferred base, where the
+/// difference fits a signed 64-bit value. A supervisor image is normally loaded
+/// far below its preferred base, where the difference does not fit, so
+/// [`apply_pe_relocations_at`] is the form a driver loader uses.
 pub fn apply_pe_relocations(
     direct_map: DirectMap,
     root: u64,
     bytes: &[u8],
     delta: i64,
 ) -> Result<usize, Error> {
+    let (preferred, _) = wuxia_core::pe_common::image_base_and_size(bytes)?;
+    let base = preferred
+        .checked_add_signed(delta)
+        .ok_or(Error::OutOfRange)?;
+    patch_dir64_slots(direct_map, root, bytes, preferred, base)
+}
+
+/// Patch every DIR64 slot to reflect a move from `preferred` to `base`.
+fn patch_dir64_slots(
+    direct_map: DirectMap,
+    root: u64,
+    bytes: &[u8],
+    preferred: u64,
+    base: u64,
+) -> Result<usize, Error> {
     let relocations = wuxia_core::pe_reloc::relocation_directory(bytes)?;
     if relocations.is_empty() {
         return Ok(0);
     }
-    let (preferred, _) = wuxia_core::pe_common::image_base_and_size(bytes)?;
     let mut patched = 0usize;
     for slot in wuxia_core::pe_reloc::dir64_slots(relocations) {
         let rva = slot?;
-        let address = preferred
-            .checked_add(u64::from(rva))
-            .and_then(|address| address.checked_add_signed(delta))
-            .ok_or(Error::OutOfRange)?;
+        let address = base.checked_add(u64::from(rva)).ok_or(Error::OutOfRange)?;
         if address % PAGE_SIZE > PAGE_SIZE - 8 {
             return Err(Error::InvalidImage);
         }
@@ -403,7 +503,7 @@ pub fn apply_pe_relocations(
         // page tables were just validated, and traps do not nest here.
         unsafe {
             let value = target.read_volatile();
-            target.write_volatile(value.wrapping_add_signed(delta));
+            target.write_volatile(value.wrapping_sub(preferred).wrapping_add(base));
         }
         patched += 1;
     }
@@ -424,7 +524,7 @@ pub fn write_user_u64(
     address: u64,
     value: u64,
 ) -> Result<(), Error> {
-    if address % PAGE_SIZE > PAGE_SIZE - 8 {
+    if address % PAGE_SIZE > PAGE_SIZE - 8 || address >= wuxia_core::paging::USER_ADDRESS_LIMIT {
         return Err(Error::InvalidImage);
     }
     let (table, index) = leaf_slot(direct_map, root, address)?;
@@ -488,20 +588,35 @@ fn invalidate(address: u64) {
     }
 }
 
+/// Table index of `address` at `level`, accepting supervisor addresses.
+///
+/// User and supervisor addresses index the same way; only the range each is
+/// allowed in differs, and a loader may walk either.
+fn any_table_index(address: u64, level: usize) -> Result<usize, Error> {
+    if address >= wuxia_core::paging::KERNEL_ADDRESS_START {
+        wuxia_core::paging::kernel_table_index(address, level)
+    } else {
+        wuxia_core::paging::table_index(address, level)
+    }
+}
+
 /// Resolve the leaf slot for `address` without changing anything.
 fn leaf_slot(direct_map: DirectMap, root: u64, address: u64) -> Result<(*mut u64, usize), Error> {
     let mut table = root;
     for level in 0..3usize {
         let entry = read_entry(
             frame_pointer(direct_map, table)?,
-            table_index(address, level)?,
+            any_table_index(address, level)?,
         );
         if !is_present(entry) || is_huge(entry) {
             return Err(Error::NotFound);
         }
         table = physical_address(entry);
     }
-    Ok((frame_pointer(direct_map, table)?, table_index(address, 3)?))
+    Ok((
+        frame_pointer(direct_map, table)?,
+        any_table_index(address, 3)?,
+    ))
 }
 
 /// Clear `length` mapped pages, releasing each frame through `release`.
@@ -708,6 +823,15 @@ fn read_entry(pointer: *const u64, index: usize) -> u64 {
     // SAFETY: the frame is a 4 KiB direct-mapped table and `index` is bounded
     // by `ENTRIES_PER_TABLE`, so the read stays inside one page.
     unsafe { pointer.add(index).read_volatile() }
+}
+
+/// Translate a mapped virtual address to the frame it names.
+///
+/// Only 4 KiB mappings are resolved; the bootstrap map is built that way.
+pub fn physical_frame(direct_map: DirectMap, address: u64) -> Result<u64, Error> {
+    let reader = DirectMapReader { direct_map };
+    let physical = wuxia_core::paging::translate(&reader, read_cr3(), address)?;
+    Ok(physical & !(wuxia_core::paging::PAGE_SIZE - 1))
 }
 
 /// A [`PageTableReader`] that reads physical frames through the HHDM.

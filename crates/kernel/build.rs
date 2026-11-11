@@ -40,7 +40,12 @@ fn main() {
         &workspace.join("target/user/x86_64-unknown-none/debug/wuxia-second"),
     );
     let pe = write_pe_image(&out);
+    let driver = write_driver_image(&out);
     println!("cargo:rustc-env=WUXIA_PE_IMAGE_PATH={}", pe.display());
+    println!(
+        "cargo:rustc-env=WUXIA_DRIVER_IMAGE_PATH={}",
+        driver.display()
+    );
     println!("cargo:rustc-env=WUXIA_USER_ELF_PATH={}", user.display());
     println!("cargo:rustc-env=WUXIA_FAULT_ELF_PATH={}", fault.display());
     println!("cargo:rustc-env=WUXIA_SECOND_ELF_PATH={}", second.display());
@@ -62,6 +67,97 @@ fn embed(out: &std::path::Path, name: &str, variable: &str, default: &std::path:
             candidate.display()
         );
     }
+    target
+}
+
+/// Write a minimal kernel-mode PE32+ image: an executable `.text`, a writable
+/// `.data` holding one absolute pointer and one constant, and a `.reloc` section
+/// naming that pointer.
+///
+/// The entry point returns the constant it reached through the pointer. That makes
+/// one call prove three things at once: the image was mapped with executable code
+/// and writable data, the relocation was applied for the address it was mapped at,
+/// and the processor actually transferred control into the loaded image. A loader
+/// that skipped the relocation would jump through the image's preferred-base
+/// address, which is not mapped, and fault instead of returning.
+fn write_driver_image(out: &std::path::Path) -> PathBuf {
+    let target = out.join("driver_image.bin");
+    let mut image = vec![0u8; 0x800];
+
+    image[0..2].copy_from_slice(b"MZ");
+    image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    image[0x40..0x44].copy_from_slice(b"PE\0\0");
+    image[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+    image[0x46..0x48].copy_from_slice(&3u16.to_le_bytes());
+    image[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+    image[0x56..0x58].copy_from_slice(&0x22u16.to_le_bytes());
+
+    let optional = 0x58;
+    image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+    image[optional + 4..optional + 8].copy_from_slice(&0x200u32.to_le_bytes());
+    image[optional + 8..optional + 12].copy_from_slice(&0x400u32.to_le_bytes());
+    image[optional + 16..optional + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+    image[optional + 20..optional + 24].copy_from_slice(&0x1000u32.to_le_bytes());
+    // A preferred base the loader will not use, so the relocation is exercised.
+    image[optional + 24..optional + 32].copy_from_slice(&0x1_4002_0000u64.to_le_bytes());
+    image[optional + 32..optional + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+    image[optional + 36..optional + 40].copy_from_slice(&0x200u32.to_le_bytes());
+    // Subsystem 1 is native: a kernel-mode image, not a console program.
+    image[optional + 40..optional + 42].copy_from_slice(&1u16.to_le_bytes());
+    image[optional + 68..optional + 70].copy_from_slice(&1u16.to_le_bytes());
+    image[optional + 72..optional + 80].copy_from_slice(&0x10_0000u64.to_le_bytes());
+    image[optional + 80..optional + 88].copy_from_slice(&0x1000u64.to_le_bytes());
+    image[optional + 88..optional + 96].copy_from_slice(&0x10_0000u64.to_le_bytes());
+    image[optional + 96..optional + 104].copy_from_slice(&0x1000u64.to_le_bytes());
+    image[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
+    // SizeOfImage, then the base-relocation directory at index 5.
+    image[optional + 56..optional + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+    let reloc_directory = optional + 112 + 5 * 8;
+    image[reloc_directory..reloc_directory + 4].copy_from_slice(&0x3000u32.to_le_bytes());
+    image[reloc_directory + 4..reloc_directory + 8].copy_from_slice(&12u32.to_le_bytes());
+
+    let section = optional + 240;
+    image[section..section + 5].copy_from_slice(b".text");
+    image[section + 8..section + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[section + 12..section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    image[section + 16..section + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    image[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+    image[section + 36..section + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+    let data = section + 40;
+    image[data..data + 5].copy_from_slice(b".data");
+    image[data + 8..data + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[data + 12..data + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+    image[data + 16..data + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    image[data + 20..data + 24].copy_from_slice(&0x400u32.to_le_bytes());
+    image[data + 36..data + 40].copy_from_slice(&0xc000_0040u32.to_le_bytes());
+
+    let reloc = data + 40;
+    image[reloc..reloc + 6].copy_from_slice(b".reloc");
+    image[reloc + 8..reloc + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[reloc + 12..reloc + 16].copy_from_slice(&0x3000u32.to_le_bytes());
+    image[reloc + 16..reloc + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    image[reloc + 20..reloc + 24].copy_from_slice(&0x600u32.to_le_bytes());
+    image[reloc + 36..reloc + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
+
+    // The pointer sits at RVA 0x2010 and this instruction ends at RVA 0x1007, so
+    // the displacement is 0x1009.
+    // mov rax, [rip + 0x1009] ; mov rax, [rax] ; ret
+    let code: [u8; 10] = [0x48, 0x8b, 0x05, 0x09, 0x10, 0x00, 0x00, 0x48, 0x8b, 0x00];
+    image[0x200..0x200 + code.len()].copy_from_slice(&code);
+    image[0x200 + code.len()] = 0xc3;
+
+    // The pointer at RVA 0x2010 names the constant at RVA 0x2020; the relocation
+    // block below patches it to the address the image was actually mapped at.
+    image[0x410..0x418].copy_from_slice(&0x1_4002_2020u64.to_le_bytes());
+    image[0x420..0x428].copy_from_slice(&0x1234u64.to_le_bytes());
+
+    // One IMAGE_REL_BASED_DIR64 entry for the pointer at page offset 0x10.
+    image[0x600..0x604].copy_from_slice(&0x2000u32.to_le_bytes());
+    image[0x604..0x608].copy_from_slice(&12u32.to_le_bytes());
+    image[0x608..0x60a].copy_from_slice(&0xa010u16.to_le_bytes());
+
+    fs::write(&target, image).expect("cannot write the driver test image");
     target
 }
 

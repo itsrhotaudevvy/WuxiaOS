@@ -5,7 +5,9 @@
 
 use crate::elf::{Elf64Image, ElfKind};
 use crate::image::PeImage;
-use crate::paging::{PAGE_SIZE, PagePermissions, USER_ADDRESS_LIMIT};
+use crate::paging::{
+    KERNEL_ADDRESS_LIMIT, KERNEL_ADDRESS_START, PAGE_SIZE, PagePermissions, USER_ADDRESS_LIMIT,
+};
 use crate::{Error, Result};
 
 /// One page-aligned range a loader must map.
@@ -189,6 +191,79 @@ impl<const N: usize> LoaderPlan<N> {
     /// The validated segments in image order.
     pub fn segments(&self) -> impl Iterator<Item = &LoadSegment> {
         self.segments.iter().flatten()
+    }
+
+    /// Derive a plan for a kernel-mode image mapped at `base`.
+    ///
+    /// Drivers are loaded where the kernel decides, not where the image asks, so
+    /// every address is `base` plus a section's relative address and the image's
+    /// preferred base never appears. Code is read-only and executable, data is
+    /// writable and non-executable, and a section that asks for both is rejected:
+    /// the loader never creates a writable mapping the processor may execute.
+    ///
+    /// Errors: [`Error::BadAddress`] for a base outside the supervisor window or
+    /// a section that would leave it, [`Error::PermissionDenied`] for a
+    /// writable-executable section, [`Error::OutOfRange`] for an address that
+    /// overflows, and [`Error::InvalidImage`] when the image has no sections or
+    /// the entry point is not inside executable code.
+    pub fn from_kernel_pe(bytes: &[u8], base: u64) -> Result<Self> {
+        if base < KERNEL_ADDRESS_START || !base.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::BadAddress);
+        }
+        let pe = PeImage::parse(bytes)?;
+        let info = pe.info()?;
+        if info.entry_rva == 0 {
+            return Err(Error::InvalidImage);
+        }
+        let entry = base
+            .checked_add(u64::from(info.entry_rva))
+            .ok_or(Error::OutOfRange)?;
+        let mut segments = [None; N];
+        let mut count = 0;
+        for index in 0..pe.section_count() as usize {
+            let section = pe.section(index)?;
+            let memory_size = u64::from(section.virtual_size.max(section.raw_size));
+            if memory_size == 0 {
+                continue;
+            }
+            let address = base
+                .checked_add(u64::from(section.virtual_address))
+                .ok_or(Error::OutOfRange)?;
+            if !address.is_multiple_of(PAGE_SIZE) {
+                return Err(Error::BadAddress);
+            }
+            let writable = section.characteristics & 0x8000_0000 != 0;
+            let executable = section.characteristics & 0x2000_0000 != 0;
+            if writable && executable {
+                return Err(Error::PermissionDenied);
+            }
+            let end = address.checked_add(memory_size).ok_or(Error::OutOfRange)?;
+            if end < KERNEL_ADDRESS_START || end > KERNEL_ADDRESS_LIMIT {
+                return Err(Error::BadAddress);
+            }
+            if count == N {
+                return Err(Error::TableFull);
+            }
+            let permissions = if executable {
+                PagePermissions::KERNEL_CODE
+            } else if writable {
+                PagePermissions::KERNEL_READ_WRITE
+            } else {
+                PagePermissions::KERNEL_READ_ONLY
+            };
+            segments[count] = Some(LoadSegment {
+                address,
+                file_size: u64::from(section.raw_size),
+                memory_size,
+                file_offset: section.raw_offset,
+                permissions,
+            });
+            count += 1;
+        }
+        if count == 0 || !entry_is_executable(&segments, entry) {
+            return Err(Error::InvalidImage);
+        }
+        Ok(Self { entry, segments })
     }
 
     /// Move every address in the plan by `delta`.

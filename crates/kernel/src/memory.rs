@@ -38,54 +38,88 @@ pub fn from_limine<const N: usize>(
 /// A reclaimable pool of physical frames.
 pub use wuxia_core::frames::FramePool;
 
+/// A page-aligned physical range the bootstrap must never hand out.
+#[derive(Clone, Copy, Debug)]
+pub struct Reserved {
+    /// First byte of the range.
+    pub start: u64,
+    /// Length of the range in bytes.
+    pub length: u64,
+}
+
+impl Reserved {
+    /// Whether `frame` falls inside the range.
+    pub fn contains(&self, frame: u64) -> bool {
+        frame >= self.start && frame - self.start < self.length
+    }
+}
+
+/// Fill the process-wide pool from every usable frame that is not reserved.
+///
+/// Memory the boot code is still using, above all its own stack, must never enter
+/// the pool: a frame handed out twice would be zeroed under the running code and
+/// silently corrupt it, which is exactly how a boot dies far from the cause.
+pub fn fill<const R: usize, const S: usize>(
+    pool: &mut KernelFrames,
+    map: &MemoryMap<R>,
+    reserved: &[Reserved; S],
+) -> Result<(), wuxia_core::Error> {
+    let mask = wuxia_core::paging::PAGE_SIZE - 1;
+    for region in map.iter() {
+        let start = region
+            .start
+            .checked_add(mask)
+            .ok_or(wuxia_core::Error::OutOfRange)?
+            & !mask;
+        let end = region
+            .start
+            .checked_add(region.length)
+            .ok_or(wuxia_core::Error::OutOfRange)?
+            & !mask;
+        let mut frame = start;
+        while frame < end {
+            if !reserved.iter().any(|range| range.contains(frame)) {
+                pool.push(frame)?;
+            }
+            frame += wuxia_core::paging::PAGE_SIZE;
+        }
+    }
+    Ok(())
+}
+
 /// The pool capacity used by the bootstrap.
 pub type KernelFrames = FramePool<65536>;
 
-static mut POOL: Option<KernelFrames> = None;
+/// The one pool of free frames, kept in the kernel image rather than on the stack.
+///
+/// A pool this large must not live on the boot stack: its own frames would then be
+/// candidates for allocation, and the first time one was handed out the pool would
+/// be zeroed underneath the running boot code.
+static mut POOL: KernelFrames = KernelFrames::new();
 
-/// Publish the frame pool for post-bootstrap teardown.
-pub fn install_pool(pool: KernelFrames) {
-    // SAFETY: installed once after all bootstrap allocations are finished.
-    unsafe {
-        *core::ptr::addr_of_mut!(POOL) = Some(pool);
-    }
+/// The process-wide frame pool.
+///
+/// # Safety
+///
+/// The returned borrow must not overlap any other use of the pool. The bootstrap
+/// thread fills it and then hands frames to the loaders; from ring 3 onward only
+/// [`allocate_frame`] and [`with_pool`] touch it, one call at a time.
+pub fn pool() -> &'static mut KernelFrames {
+    // SAFETY: the pool is a single static and callers use it sequentially.
+    unsafe { &mut *core::ptr::addr_of_mut!(POOL) }
 }
 
 /// Take a frame from the installed pool.
 pub fn allocate_frame() -> Option<u64> {
-    // SAFETY: the pool is installed before ring 3 starts and traps do not nest.
-    unsafe {
-        match &mut *core::ptr::addr_of_mut!(POOL) {
-            Some(pool) => pool.allocate(),
-            None => None,
-        }
-    }
+    pool().allocate()
 }
 
 /// Run `operation` with exclusive access to the installed pool.
 pub fn with_pool<R>(operation: impl FnOnce(&mut KernelFrames) -> R) -> Option<R> {
-    // SAFETY: the pool is installed before ring 3 starts and traps do not nest.
-    unsafe { (*core::ptr::addr_of_mut!(POOL)).as_mut().map(operation) }
+    Some(operation(pool()))
 }
 
 /// Return a frame to the installed pool.
 pub fn free_frame(frame: u64) -> Result<(), wuxia_core::Error> {
-    // SAFETY: the pool is installed before ring 3 starts and traps do not nest.
-    unsafe {
-        match &mut *core::ptr::addr_of_mut!(POOL) {
-            Some(pool) => pool.free(frame),
-            None => Err(wuxia_core::Error::InvalidState),
-        }
-    }
-}
-
-/// Build a frame pool from every page-aligned frame in the usable map.
-pub fn frame_pool<const N: usize, const R: usize>(
-    map: &MemoryMap<R>,
-) -> Result<FramePool<N>, wuxia_core::Error> {
-    let mut pool = FramePool::<N>::new();
-    for region in map.iter() {
-        pool.add_region(region.start, region.length)?;
-    }
-    Ok(pool)
+    pool().free(frame)
 }
