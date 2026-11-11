@@ -5,16 +5,38 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Limine 12.x release package (prebuilt data files plus the limine.c tool source).
+  # Pinned by tag and SHA-256 so a moved or replaced asset fails the job.
+  LIMINE_VERSION: v12.9.6
+  LIMINE_BINARY_SHA256: b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee
+
 jobs:
   build:
+    name: Lint, test and build the kernel
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install the pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
+          cache: false
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Install LLD
         run: sudo apt-get update && sudo apt-get install -y lld
@@ -22,11 +44,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Lint the core contracts
-        run: cargo clippy -p wuxia-core --all-targets -- -D warnings
+      - name: Lint the host crates
+        run: cargo clippy -p wuxia-core -p wuxia-xtask --all-targets -- -D warnings
 
-      - name: Host tests
+      - name: Host tests (core)
         run: cargo test -p wuxia-core
+
+      - name: Host tests (xtask)
+        run: cargo test -p wuxia-xtask
 
       - name: Build the bare-metal kernel
         run: cargo run -p wuxia-xtask -- build-kernel
@@ -35,3 +60,40 @@ jobs:
 
       - name: Audit the kernel image for W^X
         run: cargo run -p wuxia-xtask -- elf-info
+
+  qemu-boot:
+    name: Boot the ISO under QEMU
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install QEMU, xorriso and LLD
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 xorriso lld
+
+      - name: Fetch and build Limine
+        run: |
+          mkdir -p "$RUNNER_TEMP/limine"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            -o "$RUNNER_TEMP/limine/limine-binary.tar.gz" \
+            "https://github.com/Limine-Bootloader/Limine/releases/download/${LIMINE_VERSION}/limine-binary.tar.gz"
+          echo "${LIMINE_BINARY_SHA256}  $RUNNER_TEMP/limine/limine-binary.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/limine/limine-binary.tar.gz" -C "$RUNNER_TEMP/limine"
+          make -C "$RUNNER_TEMP/limine/limine-binary"
+          echo "$RUNNER_TEMP/limine/limine-binary" >> "$GITHUB_PATH"
+
+      - name: Build the ISO and boot it headless
+        run: cargo run -p wuxia-xtask -- qemu-test
+        env:
+          WUXIA_LLD: ld.lld
+          WUXIA_LIMINE_DIR: ${{ runner.temp }}/limine/limine-binary
