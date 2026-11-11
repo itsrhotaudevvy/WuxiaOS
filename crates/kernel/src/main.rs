@@ -61,13 +61,16 @@ pub extern "C" fn _start() -> ! {
     serial::write_str("WUXIA_FRAME_ALLOC_OK\n");
     serial::write_hex(first);
     serial::write_hex(second);
+    serial::write_str("WUXIA_TEST_PASS\n");
+    serial::debug_exit(0x10);
     halt_forever()
 }
 
 /// Panic handler for early bootstrap failures.
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    serial::write_str("WuxiaOS bootstrap panic\n");
+    serial::write_str("WUXIA_TEST_FAIL: bootstrap panic\n");
+    serial::debug_exit(1);
     halt_forever()
 }
 
@@ -111,6 +114,12 @@ mod serial {
     }
 
     /// Write a string to the legacy COM1 port, including CRLF line endings.
+    /// Signal the QEMU isa-debug-exit device with a test result.
+    pub fn debug_exit(value: u8) {
+        // SAFETY: The debug-exit device is configured by the test harness.
+        unsafe { outb(0xf4, value) };
+    }
+
     pub fn write_str(text: &str) {
         for byte in text.bytes() {
             if byte == b'\n' {

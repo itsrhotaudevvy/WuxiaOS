@@ -101,7 +101,9 @@ fn build_iso() -> ExitCode {
     if fs::create_dir_all(&efi).is_err() {
         return ExitCode::FAILURE;
     }
-    let source = PathBuf::from("/opt/homebrew/share/limine");
+    let source = PathBuf::from(
+        env::var("WUXIA_LIMINE_DIR").unwrap_or_else(|_| "/opt/homebrew/share/limine".into()),
+    );
     if fs::copy(
         "target/kernel/x86_64-unknown-none/debug/wuxia-kernel",
         root.join("boot/wuxia-kernel"),
@@ -172,16 +174,23 @@ fn qemu_test() -> ExitCode {
         "none",
         "-serial",
         "stdio",
+        "-device",
+        "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-cdrom",
         "target/wuxia.iso",
         "-boot",
         "d",
         "-no-reboot",
-        "-no-shutdown",
     ]);
-    if run(&mut command) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    match command.status() {
+        Ok(status) if status.code() == Some(33) => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!("QEMU test failed with status {status}");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("cannot run QEMU: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
