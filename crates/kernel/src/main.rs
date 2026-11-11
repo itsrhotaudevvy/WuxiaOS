@@ -11,6 +11,7 @@ use core::panic::PanicInfo;
 use limine::BaseRevision;
 use limine::request::{RequestsEndMarker, RequestsStartMarker, StackSizeRequest};
 
+mod gdt;
 mod idt;
 
 #[used]
