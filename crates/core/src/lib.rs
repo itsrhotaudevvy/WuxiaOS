@@ -30,6 +30,7 @@ pub mod pledge;
 pub mod priority;
 pub mod process;
 pub mod region;
+pub mod rlimit;
 pub mod schedule;
 pub mod signal;
 pub mod syscall;
