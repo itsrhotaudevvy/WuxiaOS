@@ -23,6 +23,7 @@ pub mod process;
 pub mod region;
 pub mod schedule;
 pub mod syscall;
+pub mod vfs;
 
 pub use address_space::AddressSpace;
 pub use capability::{Handle, HandleTable, Rights};

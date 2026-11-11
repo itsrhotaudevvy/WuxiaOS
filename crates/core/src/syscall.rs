@@ -25,8 +25,12 @@ pub struct Registers {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum PosixCall {
+    /// Read bytes into a validated userspace buffer.
+    Read = 0,
     /// Write bytes from a validated userspace buffer.
     Write = 1,
+    /// Open a file by name.
+    Open = 2,
     /// Close a process-local handle.
     Close = 3,
     /// Map anonymous writable memory.
@@ -45,7 +49,9 @@ impl PosixCall {
     /// Decode a raw number. Unknown calls return an error rather than being guessed.
     pub const fn from_raw(raw: u64) -> Option<Self> {
         match raw {
+            0 => Some(Self::Read),
             1 => Some(Self::Write),
+            2 => Some(Self::Open),
             3 => Some(Self::Close),
             9 => Some(Self::Map),
             11 => Some(Self::Unmap),
@@ -69,9 +75,27 @@ pub struct UserBuffer {
 /// Largest anonymous mapping request accepted from userspace.
 pub const MAX_MAP_LENGTH: u64 = 64 * 1024;
 
+/// Longest file path accepted by the open call.
+pub const MAX_PATH_LENGTH: u64 = crate::vfs::MAX_NAME_LENGTH as u64;
+
+/// Largest buffer a single POSIX read may fill.
+pub const MAX_READ_LENGTH: u64 = 256;
+
 /// A decoded POSIX request with validated arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PosixRequest {
+    /// Read from a process-local descriptor into a user buffer.
+    Read {
+        /// Process-local file descriptor.
+        descriptor: u32,
+        /// Validated destination range.
+        buffer: UserBuffer,
+    },
+    /// Open a file by name.
+    Open {
+        /// Validated path bytes, bounded by [`MAX_PATH_LENGTH`].
+        path: UserBuffer,
+    },
     /// Write from a validated user buffer to a process-local descriptor.
     Write {
         /// Process-local file descriptor.
@@ -111,6 +135,17 @@ impl PosixRequest {
     /// Decode a call number and register block without trusting any pointer.
     pub fn decode(call: u64, registers: &Registers) -> Result<Self> {
         match PosixCall::from_raw(call).ok_or(Error::InvalidInput)? {
+            PosixCall::Read => Ok(Self::Read {
+                descriptor: decode_descriptor(registers.args[0])?,
+                buffer: decode_bounded_buffer(
+                    registers.args[1],
+                    registers.args[2],
+                    MAX_READ_LENGTH,
+                )?,
+            }),
+            PosixCall::Open => Ok(Self::Open {
+                path: decode_bounded_buffer(registers.args[0], registers.args[1], MAX_PATH_LENGTH)?,
+            }),
             PosixCall::Write => Ok(Self::Write {
                 descriptor: decode_descriptor(registers.args[0])?,
                 buffer: decode_buffer(registers.args[1], registers.args[2])?,
@@ -156,7 +191,11 @@ fn decode_descriptor(raw: u64) -> Result<u32> {
 }
 
 fn decode_buffer(address: u64, length: u64) -> Result<UserBuffer> {
-    if address == 0 || length == 0 || length > MAX_WRITE_LENGTH {
+    decode_bounded_buffer(address, length, MAX_WRITE_LENGTH)
+}
+
+fn decode_bounded_buffer(address: u64, length: u64, bound: u64) -> Result<UserBuffer> {
+    if address == 0 || length == 0 || length > bound {
         return Err(Error::BadAddress);
     }
     address.checked_add(length).ok_or(Error::OutOfRange)?;
@@ -210,6 +249,38 @@ mod tests {
             PosixRequest::decode(9, &registers),
             Err(Error::InvalidInput)
         );
+    }
+
+    #[test]
+    fn open_paths_and_read_buffers_are_bounded() {
+        let mut registers = Registers {
+            args: [0x8000_0000, 5, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(2, &registers),
+            Ok(PosixRequest::Open {
+                path: UserBuffer {
+                    address: 0x8000_0000,
+                    length: 5
+                }
+            })
+        );
+        registers.args[1] = MAX_PATH_LENGTH + 1;
+        assert_eq!(PosixRequest::decode(2, &registers), Err(Error::BadAddress));
+
+        registers.args = [3, 0x8000_1000, 32, 0, 0, 0];
+        assert_eq!(
+            PosixRequest::decode(0, &registers),
+            Ok(PosixRequest::Read {
+                descriptor: 3,
+                buffer: UserBuffer {
+                    address: 0x8000_1000,
+                    length: 32
+                }
+            })
+        );
+        registers.args[2] = MAX_READ_LENGTH + 1;
+        assert_eq!(PosixRequest::decode(0, &registers), Err(Error::BadAddress));
     }
 
     #[test]

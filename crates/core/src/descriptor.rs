@@ -4,6 +4,7 @@
 //! standard streams open and never exposes a closed slot as valid, so a stale
 //! descriptor number cannot silently refer to a different object.
 
+use crate::vfs::FileId;
 use crate::{Error, Result};
 
 /// Number of descriptors preopened for a new process (stdin, stdout, stderr).
@@ -13,6 +14,8 @@ pub const STANDARD_DESCRIPTORS: u32 = 3;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DescriptorTable<const N: usize> {
     open: [bool; N],
+    files: [Option<FileId>; N],
+    offsets: [u64; N],
 }
 
 impl<const N: usize> Default for DescriptorTable<N> {
@@ -24,7 +27,11 @@ impl<const N: usize> Default for DescriptorTable<N> {
 impl<const N: usize> DescriptorTable<N> {
     /// Construct a table with no open descriptors.
     pub const fn new() -> Self {
-        Self { open: [false; N] }
+        Self {
+            open: [false; N],
+            files: [None; N],
+            offsets: [0; N],
+        }
     }
 
     /// Construct a table with stdin, stdout and stderr open.
@@ -39,7 +46,11 @@ impl<const N: usize> DescriptorTable<N> {
         if N > 2 {
             open[2] = true;
         }
-        Self { open }
+        Self {
+            open,
+            files: [None; N],
+            offsets: [0; N],
+        }
     }
 
     /// Whether `descriptor` currently refers to an open object.
@@ -49,6 +60,15 @@ impl<const N: usize> DescriptorTable<N> {
 
     /// Open the lowest free descriptor at or above the standard streams.
     pub fn open(&mut self) -> Result<u32> {
+        self.open_slot(None)
+    }
+
+    /// Open a file and return the descriptor that refers to it.
+    pub fn open_file(&mut self, file: FileId) -> Result<u32> {
+        self.open_slot(Some(file))
+    }
+
+    fn open_slot(&mut self, file: Option<FileId>) -> Result<u32> {
         for (index, slot) in self
             .open
             .iter_mut()
@@ -57,10 +77,39 @@ impl<const N: usize> DescriptorTable<N> {
         {
             if !*slot {
                 *slot = true;
+                self.files[index] = file;
+                self.offsets[index] = 0;
                 return Ok(index as u32);
             }
         }
         Err(Error::TableFull)
+    }
+
+    /// The file a descriptor refers to, if it is not a standard stream.
+    pub fn file(&self, descriptor: u32) -> Option<FileId> {
+        self.open
+            .get(descriptor as usize)
+            .copied()
+            .unwrap_or(false)
+            .then(|| self.files.get(descriptor as usize).copied().flatten())
+            .flatten()
+    }
+
+    /// Current read offset of a descriptor.
+    pub fn offset(&self, descriptor: u32) -> u64 {
+        self.offsets.get(descriptor as usize).copied().unwrap_or(0)
+    }
+
+    /// Advance the read offset of a descriptor by `count` bytes.
+    pub fn advance(&mut self, descriptor: u32, count: u64) -> Result<()> {
+        let index = descriptor as usize;
+        if !self.is_open(descriptor) || self.files.get(index).copied().flatten().is_none() {
+            return Err(Error::InvalidHandle);
+        }
+        self.offsets[index] = self.offsets[index]
+            .checked_add(count)
+            .ok_or(Error::OutOfRange)?;
+        Ok(())
     }
 
     /// Close an open descriptor, rejecting unknown or already closed slots.
@@ -68,6 +117,8 @@ impl<const N: usize> DescriptorTable<N> {
         match self.open.get_mut(descriptor as usize) {
             Some(slot) if *slot => {
                 *slot = false;
+                self.files[descriptor as usize] = None;
+                self.offsets[descriptor as usize] = 0;
                 Ok(())
             }
             _ => Err(Error::InvalidHandle),
@@ -109,6 +160,24 @@ mod tests {
         assert!(!table.is_open(1));
         assert_eq!(table.close(1), Err(Error::InvalidHandle));
         assert_eq!(table.close(9), Err(Error::InvalidHandle));
+    }
+
+    #[test]
+    fn file_descriptors_carry_identity_and_offsets() {
+        let mut table = DescriptorTable::<6>::with_standard_streams();
+        let file = FileId(1);
+        let descriptor = table.open_file(file).unwrap();
+        assert_eq!(descriptor, 3);
+        assert_eq!(table.file(descriptor), Some(file));
+        assert_eq!(table.file(1), None);
+        assert_eq!(table.offset(descriptor), 0);
+        table.advance(descriptor, 5).unwrap();
+        assert_eq!(table.offset(descriptor), 5);
+        assert_eq!(table.advance(1, 1), Err(Error::InvalidHandle));
+        table.close(descriptor).unwrap();
+        assert_eq!(table.file(descriptor), None);
+        assert_eq!(table.offset(descriptor), 0);
+        assert_eq!(table.open_file(FileId(2)), Ok(3));
     }
 
     #[test]
