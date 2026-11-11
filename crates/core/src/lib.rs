@@ -23,6 +23,7 @@ pub mod frames;
 pub mod futex;
 pub mod hhdm;
 pub mod image;
+pub mod initramfs;
 pub mod initstack;
 pub mod klog;
 pub mod load;
