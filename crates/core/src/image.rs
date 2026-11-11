@@ -98,6 +98,10 @@ impl<'a> PeImage<'a> {
         if optional_size < minimum_optional_size {
             return Err(Error::InvalidImage);
         }
+        // SectionAlignment (optional offset 32) must be a non-zero power of two.
+        if !read_u32(optional, 32)?.is_power_of_two() {
+            return Err(Error::InvalidImage);
+        }
         let table_size = (section_count as usize)
             .checked_mul(40)
             .ok_or(Error::InvalidImage)?;
@@ -107,14 +111,20 @@ impl<'a> PeImage<'a> {
         if bytes.get(optional_end..table_end).is_none() {
             return Err(Error::InvalidImage);
         }
-        Ok(Self {
+        let image = Self {
             bytes,
             kind,
             machine,
             optional_offset,
             sections_offset: optional_end,
             section_count,
-        })
+        };
+        // Check every section's raw range now, so a truncated file is rejected
+        // here instead of when a caller first asks for that section.
+        for index in 0..section_count as usize {
+            image.section(index)?;
+        }
+        Ok(image)
     }
 
     /// Return the validated PE format.
@@ -263,6 +273,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::LoaderPlan;
 
     fn minimal_pe64() -> [u8; 0x400] {
         let mut b = [0u8; 0x400];
@@ -276,6 +287,7 @@ mod tests {
         b[0x68..0x6c].copy_from_slice(&0x1000u32.to_le_bytes());
         b[0x70..0x78].copy_from_slice(&0x140000000u64.to_le_bytes());
         b[0x58 + 56..0x58 + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        b[0x58 + 32..0x58 + 36].copy_from_slice(&0x1000u32.to_le_bytes());
         b[0x58 + 16..0x58 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
         b[0x148..0x150].copy_from_slice(b".text\0\0\0");
         b[0x148 + 8..0x148 + 12].copy_from_slice(&0x100u32.to_le_bytes());
@@ -315,5 +327,310 @@ mod tests {
             PeImage::parse(&image[..0x100]),
             Err(Error::InvalidImage)
         ));
+    }
+
+    /// Deterministic linear congruential generator for mutation tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 16
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    fn set_u32(image: &mut [u8], offset: usize, value: u32) {
+        image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Offset of the single section header in `minimal_pe64`.
+    const SECTION_HEADER: usize = 0x148;
+
+    /// A PE32 image with a 96-byte optional header and the section table
+    /// moved to the PE32 position.
+    fn minimal_pe32() -> [u8; 0x400] {
+        let mut b = minimal_pe64();
+        b[0x44..0x46].copy_from_slice(&0x14cu16.to_le_bytes());
+        b[0x54..0x56].copy_from_slice(&96u16.to_le_bytes());
+        b[0x58..0x5a].copy_from_slice(&0x10b_u16.to_le_bytes());
+        b[0x70..0x78].fill(0);
+        set_u32(&mut b, 0x74, 0x40_0000);
+        let header: [u8; 40] = b[SECTION_HEADER..SECTION_HEADER + 40].try_into().unwrap();
+        b[SECTION_HEADER..SECTION_HEADER + 40].fill(0);
+        b[0xb8..0xe0].copy_from_slice(&header);
+        b
+    }
+
+    #[test]
+    fn every_truncation_of_a_minimal_pe_is_invalid() {
+        // Section raw data ends at 0x400, so every shorter prefix must fail at
+        // parse time, not only when a section is later read.
+        let image = minimal_pe64();
+        for len in 0..image.len() {
+            assert!(
+                matches!(PeImage::parse(&image[..len]), Err(Error::InvalidImage)),
+                "prefix of {len:#x} bytes"
+            );
+        }
+        assert!(PeImage::parse(&image).is_ok());
+    }
+
+    #[test]
+    fn pe_signature_offset_past_the_end_or_near_u32_max_is_rejected() {
+        for lfanew in [
+            0u32,
+            0x3c,
+            0x3fd,
+            0x400,
+            0x8000_0000,
+            0xFFFF_FFF0,
+            0xFFFF_FFFC,
+            u32::MAX,
+        ] {
+            let mut image = minimal_pe64();
+            set_u32(&mut image, 0x3c, lfanew);
+            assert!(
+                matches!(PeImage::parse(&image), Err(Error::InvalidImage)),
+                "e_lfanew {lfanew:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn machine_and_optional_magic_must_agree() {
+        let cases: [(u16, u16, Error); 4] = [
+            (0x8664, 0x10b, Error::Unsupported),
+            (0x14c, 0x20b, Error::Unsupported),
+            (0xaa64, 0x20b, Error::Unsupported),
+            (0x8664, 0x107, Error::InvalidImage),
+        ];
+        for (machine, magic, expected) in cases {
+            let mut image = minimal_pe64();
+            image[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+            image[0x58..0x5a].copy_from_slice(&magic.to_le_bytes());
+            assert_eq!(
+                PeImage::parse(&image).err(),
+                Some(expected),
+                "machine {machine:#x} magic {magic:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn section_count_must_be_one_to_ninety_six_and_fit_the_file() {
+        for count in [0u16, 97, 96, 0x7fff, u16::MAX] {
+            let mut image = minimal_pe64();
+            image[0x46..0x48].copy_from_slice(&count.to_le_bytes());
+            assert!(
+                matches!(PeImage::parse(&image), Err(Error::InvalidImage)),
+                "section count {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn size_of_optional_header_must_cover_the_format_and_fit_the_file() {
+        for size in [0u16, 1, 111, 0x1000, u16::MAX] {
+            let mut image = minimal_pe64();
+            image[0x54..0x56].copy_from_slice(&size.to_le_bytes());
+            assert!(
+                matches!(PeImage::parse(&image), Err(Error::InvalidImage)),
+                "optional header size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn pe32_uses_its_own_minimum_optional_header() {
+        let image = minimal_pe32();
+        let pe = PeImage::parse(&image).unwrap();
+        assert_eq!(pe.kind(), PeKind::Pe32);
+        assert_eq!(pe.info().unwrap().image_base, 0x40_0000);
+
+        let mut short = minimal_pe32();
+        short[0x54..0x56].copy_from_slice(&95u16.to_le_bytes());
+        assert!(matches!(PeImage::parse(&short), Err(Error::InvalidImage)));
+    }
+
+    #[test]
+    fn section_alignment_must_be_a_nonzero_power_of_two() {
+        let cases: [(u32, bool); 7] = [
+            (0, false),
+            (3, false),
+            (0x1800, false),
+            (0x8000_0001, false),
+            (u32::MAX, false),
+            (0x200, true),
+            (0x1000, true),
+        ];
+        for (alignment, valid) in cases {
+            let mut image = minimal_pe64();
+            set_u32(&mut image, 0x78, alignment);
+            assert_eq!(
+                PeImage::parse(&image).is_ok(),
+                valid,
+                "section alignment {alignment:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn section_raw_ranges_that_overflow_or_leave_the_file_are_rejected() {
+        let cases: [(u32, u32); 5] = [
+            (0xFFFF_FFFF, 0x10),
+            (0x200, 0xFFFF_FFFF),
+            (0xFFFF_FFF0, 0),
+            (0x40, 0x10),
+            (0x200, 0x201),
+        ];
+        for (raw_offset, raw_size) in cases {
+            let mut image = minimal_pe64();
+            set_u32(&mut image, SECTION_HEADER + 16, raw_size);
+            set_u32(&mut image, SECTION_HEADER + 20, raw_offset);
+            assert!(
+                matches!(PeImage::parse(&image), Err(Error::InvalidImage)),
+                "raw {raw_offset:#x}+{raw_size:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn section_virtual_ranges_must_not_wrap_and_must_fit_the_image() {
+        let cases: [(u32, u32); 4] = [
+            (0xFFFF_F000, 0x2000),
+            (0x1000, 0xFFFF_FFFF),
+            (0x1000, 0x2000),
+            (0x2000, 0x100),
+        ];
+        for (address, size) in cases {
+            let mut image = minimal_pe64();
+            set_u32(&mut image, SECTION_HEADER + 8, size);
+            set_u32(&mut image, SECTION_HEADER + 12, address);
+            let pe = PeImage::parse(&image).unwrap();
+            assert!(
+                matches!(pe.info(), Err(Error::InvalidImage)),
+                "virtual {address:#x}+{size:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn size_of_image_and_entry_point_must_bound_the_sections() {
+        // SizeOfImage is at optional+56 and AddressOfEntryPoint at optional+16.
+        let mut image = minimal_pe64();
+        set_u32(&mut image, 0x90, 0x11ff);
+        assert!(matches!(
+            PeImage::parse(&image).unwrap().info(),
+            Err(Error::InvalidImage)
+        ));
+
+        let mut image = minimal_pe64();
+        set_u32(&mut image, 0x90, 0);
+        assert!(matches!(
+            PeImage::parse(&image).unwrap().info(),
+            Err(Error::InvalidImage)
+        ));
+
+        for entry in [0x2000, 0xFFFF_FFFF] {
+            let mut image = minimal_pe64();
+            set_u32(&mut image, 0x68, entry);
+            assert!(matches!(
+                PeImage::parse(&image).unwrap().info(),
+                Err(Error::InvalidImage)
+            ));
+        }
+
+        // .text spans max(VirtualSize, SizeOfRawData) = 0x200 from 0x1000, so
+        // SizeOfImage of exactly 0x1200 is in bounds.
+        let mut image = minimal_pe64();
+        set_u32(&mut image, 0x90, 0x1200);
+        assert!(PeImage::parse(&image).unwrap().info().is_ok());
+    }
+
+    #[test]
+    fn overlapping_virtual_or_raw_ranges_are_rejected() {
+        let second = SECTION_HEADER + 40;
+
+        // Virtual overlap: [0x1080, 0x1180) against .text's [0x1000, 0x1100).
+        let mut image = minimal_pe64();
+        image[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+        set_u32(&mut image, second + 8, 0x100);
+        set_u32(&mut image, second + 12, 0x1080);
+        assert!(matches!(
+            PeImage::parse(&image).unwrap().info(),
+            Err(Error::InvalidImage)
+        ));
+
+        // Raw overlap: payload [0x280, 0x380) against .text's [0x200, 0x400).
+        let mut image = minimal_pe64();
+        image[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+        set_u32(&mut image, second + 8, 0x100);
+        set_u32(&mut image, second + 12, 0x1800);
+        set_u32(&mut image, second + 16, 0x100);
+        set_u32(&mut image, second + 20, 0x280);
+        assert!(matches!(
+            PeImage::parse(&image).unwrap().info(),
+            Err(Error::InvalidImage)
+        ));
+
+        // A disjoint second section is accepted.
+        let mut image = minimal_pe64();
+        image[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+        set_u32(&mut image, second + 8, 0x100);
+        set_u32(&mut image, second + 12, 0x1800);
+        assert!(PeImage::parse(&image).unwrap().info().is_ok());
+    }
+
+    #[test]
+    fn mutated_pe_images_never_panic_or_overflow() {
+        // Deterministic mutations of a valid image: random byte writes, biased
+        // toward the headers, plus all-ones u32 and u64 fields. Each parse
+        // result is either Ok or Err, and every accepted image is driven
+        // through the accessors and the load-plan derivation.
+        let base = minimal_pe64();
+        let mut rng = Lcg(0x5045_3332_2b6d_7574);
+        let (mut accepted, mut rejected) = (0usize, 0usize);
+        for iteration in 0..2000 {
+            let mut image = base;
+            for _ in 0..1 + rng.below(4) {
+                let span = if rng.below(2) == 0 {
+                    SECTION_HEADER + 40
+                } else {
+                    image.len()
+                };
+                let at = rng.below(span);
+                image[at] = rng.next_u64() as u8;
+            }
+            if iteration % 4 == 0 {
+                let at = rng.below(SECTION_HEADER + 40 - 8);
+                image[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+            if iteration % 3 == 0 {
+                let at = rng.below(SECTION_HEADER + 40 - 4);
+                set_u32(&mut image, at, u32::MAX);
+            }
+            match PeImage::parse(&image) {
+                Ok(pe) => {
+                    accepted += 1;
+                    let _ = pe.info();
+                    for index in 0..pe.section_count() as usize + 1 {
+                        let _ = pe.section(index);
+                    }
+                    let _ = LoaderPlan::<4>::from_pe(&image);
+                }
+                Err(_) => rejected += 1,
+            }
+        }
+        assert!(
+            accepted > 0 && rejected > 0,
+            "accepted {accepted}, rejected {rejected}"
+        );
     }
 }

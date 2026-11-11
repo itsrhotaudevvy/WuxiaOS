@@ -270,6 +270,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::LoaderPlan;
 
     fn minimal_elf() -> [u8; 0x2000] {
         let mut bytes = [0u8; 0x2000];
@@ -401,5 +402,209 @@ mod tests {
         assert!(segment.is_executable());
         assert!(segment.is_writable());
         assert!(segment.is_writable_and_executable());
+    }
+
+    /// Deterministic linear congruential generator for mutation tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 16
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    /// Bytes the minimal image needs: its header, its program table and the
+    /// file-backed `PT_LOAD` payload that ends at `0x1000 + 0x100`.
+    const MINIMAL_ELF_LEN: usize = 0x1100;
+
+    fn set_program_table(image: &mut [u8], offset: u64, count: u16, entry_size: u16) {
+        image[32..40].copy_from_slice(&offset.to_le_bytes());
+        image[54..56].copy_from_slice(&entry_size.to_le_bytes());
+        image[56..58].copy_from_slice(&count.to_le_bytes());
+    }
+
+    #[test]
+    fn every_truncation_of_a_minimal_image_is_invalid() {
+        let image = minimal_elf();
+        for len in 0..MINIMAL_ELF_LEN {
+            assert!(
+                matches!(Elf64Image::parse(&image[..len]), Err(Error::InvalidImage)),
+                "prefix of {len:#x} bytes"
+            );
+        }
+        assert!(Elf64Image::parse(&image[..MINIMAL_ELF_LEN]).is_ok());
+    }
+
+    #[test]
+    fn program_table_arithmetic_cannot_wrap() {
+        let cases: [(u64, u16, u16); 9] = [
+            (u64::MAX, 1, 56),
+            (u64::MAX - 0x20, 1, 56),
+            (0x40, u16::MAX, 56),
+            (0x40, 128, u16::MAX),
+            (0x40, 129, 56),
+            (0x40, 0, 56),
+            (0x40, 1, 0),
+            (0x40, 1, 55),
+            (0x2000, 1, 56),
+        ];
+        for (offset, count, entry_size) in cases {
+            let mut image = minimal_elf();
+            set_program_table(&mut image, offset, count, entry_size);
+            assert!(
+                matches!(Elf64Image::parse(&image), Err(Error::InvalidImage)),
+                "offset {offset:#x} count {count} entry size {entry_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn program_table_field_grid_never_panics() {
+        let offsets = [
+            0,
+            0x40,
+            0x1000,
+            0x1fff,
+            0x2000,
+            1u64 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let counts = [0u16, 1, 2, 128, 129, u16::MAX];
+        let entry_sizes = [0u16, 55, 56, 57, 64, u16::MAX];
+        for offset in offsets {
+            for count in counts {
+                for entry_size in entry_sizes {
+                    let mut image = minimal_elf();
+                    set_program_table(&mut image, offset, count, entry_size);
+                    if let Ok(elf) = Elf64Image::parse(&image) {
+                        for index in 0..elf.program_header_count() + 1 {
+                            let _ = elf.segment(index);
+                        }
+                        let _ = LoaderPlan::<4>::from_elf(&image);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn program_header_ranges_that_overflow_u64_are_rejected() {
+        // p_offset + p_filesz wraps past u64::MAX.
+        let mut image = minimal_elf();
+        image[0x40 + 8..0x40 + 16].copy_from_slice(&(u64::MAX - 0x10).to_le_bytes());
+        assert!(matches!(
+            Elf64Image::parse(&image),
+            Err(Error::InvalidImage)
+        ));
+
+        // p_vaddr + p_memsz wraps. The address is page aligned so the
+        // alignment congruence holds and the overlap pass reports the overflow.
+        let mut image = minimal_elf();
+        image[0x40 + 16..0x40 + 24].copy_from_slice(&0xffff_ffff_ffff_f000u64.to_le_bytes());
+        image[0x40 + 40..0x40 + 48].copy_from_slice(&0x2000u64.to_le_bytes());
+        assert!(matches!(Elf64Image::parse(&image), Err(Error::OutOfRange)));
+
+        // p_memsz itself is unrepresentable once the address is added.
+        let mut image = minimal_elf();
+        image[0x40 + 40..0x40 + 48].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Elf64Image::parse(&image).is_err());
+    }
+
+    #[test]
+    fn file_size_larger_than_memory_size_is_rejected() {
+        for (filesz, memsz) in [
+            (0x201u64, 0x200u64),
+            (u64::MAX, u64::MAX - 1),
+            (1, 0),
+            (u64::MAX, 0),
+            (1u64 << 63, 1u64 << 63),
+        ] {
+            let mut image = minimal_elf();
+            image[0x40 + 32..0x40 + 40].copy_from_slice(&filesz.to_le_bytes());
+            image[0x40 + 40..0x40 + 48].copy_from_slice(&memsz.to_le_bytes());
+            assert!(
+                Elf64Image::parse(&image).is_err(),
+                "filesz {filesz:#x} memsz {memsz:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_alignment_must_be_zero_or_a_congruent_power_of_two() {
+        let cases: [(u64, bool); 7] = [
+            (0, true),
+            (1, true),
+            (0x1000, true),
+            (3, false),
+            (0x1800, false),
+            (u64::MAX, false),
+            (1u64 << 63, false),
+        ];
+        for (align, valid) in cases {
+            let mut image = minimal_elf();
+            image[0x40 + 48..0x40 + 56].copy_from_slice(&align.to_le_bytes());
+            assert_eq!(
+                Elf64Image::parse(&image).is_ok(),
+                valid,
+                "p_align {align:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_entry_point_is_rejected() {
+        let mut image = minimal_elf();
+        image[24..32].copy_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(
+            Elf64Image::parse(&image),
+            Err(Error::InvalidImage)
+        ));
+    }
+
+    #[test]
+    fn mutated_elf_images_never_panic_or_overflow() {
+        // Deterministic mutations of a valid image: random byte writes, biased
+        // toward the header and program table, plus all-ones u64 fields. Each
+        // parse result is either Ok or Err, and every accepted image is driven
+        // through the segment accessor and the load-plan derivation.
+        let base = minimal_elf();
+        let mut rng = Lcg(0x454c_4636_3462_6974);
+        let (mut accepted, mut rejected) = (0usize, 0usize);
+        for iteration in 0..2000 {
+            let mut image = base;
+            for _ in 0..1 + rng.below(4) {
+                let span = if rng.below(2) == 0 { 0x78 } else { image.len() };
+                let at = rng.below(span);
+                image[at] = rng.next_u64() as u8;
+            }
+            if iteration % 4 == 0 {
+                let at = rng.below(0x78 - 8);
+                image[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+            match Elf64Image::parse(&image) {
+                Ok(elf) => {
+                    accepted += 1;
+                    let _ = elf.info();
+                    for index in 0..elf.program_header_count() + 1 {
+                        let _ = elf.segment(index);
+                    }
+                    let _ = LoaderPlan::<4>::from_elf(&image);
+                }
+                Err(_) => rejected += 1,
+            }
+        }
+        assert!(
+            accepted > 0 && rejected > 0,
+            "accepted {accepted}, rejected {rejected}"
+        );
     }
 }
