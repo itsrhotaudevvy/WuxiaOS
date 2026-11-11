@@ -314,12 +314,47 @@ pub fn access_check(
     desired: u32,
     mapping: &GenericMapping,
 ) -> Result<u32> {
-    let desired = map_generic(desired, mapping);
-    let allowed = match acl {
-        None => u32::MAX,
-        Some(acl) => granted_rights(acl, token_sids, mapping)?,
-    };
+    let allowed = granted_rights_by(acl, mapping, |sid, _| token_sids.contains(&sid))?;
+    resolve_request(desired, allowed, mapping)
+}
 
+/// Walk a DACL in order and return every right a caller is allowed.
+///
+/// `matches(sid, kind)` decides whether an ACE of `kind` for `sid` applies
+/// to the caller, which lets a token match some SIDs only against deny
+/// ACEs. `None` is a null DACL and allows every bit. The ordering rules are
+/// those of [`access_check`]; generic bits in ACE masks are mapped.
+pub fn granted_rights_by<F>(acl: Option<&Acl<'_>>, mapping: &GenericMapping, mut matches: F) -> Result<u32>
+where
+    F: FnMut(&[u8], AceKind) -> bool,
+{
+    let Some(acl) = acl else {
+        return Ok(u32::MAX);
+    };
+    let mut granted = 0u32;
+    let mut denied = 0u32;
+    for ace in acl.aces() {
+        let ace = ace?;
+        if !matches(ace.sid, ace.kind) {
+            continue;
+        }
+        let mask = map_generic(ace.mask, mapping);
+        match ace.kind {
+            AceKind::Allowed => granted |= mask & !denied,
+            AceKind::Denied => denied |= mask & !granted,
+        }
+    }
+    Ok(granted)
+}
+
+/// Decide a `desired` request against the set of `allowed` rights.
+///
+/// `desired` is mapped through `mapping` first. Every specifically named
+/// right must be allowed. With `MAXIMUM_ALLOWED`, the result also carries the
+/// grantable part of `allowed` and fails if that part is empty. Failures
+/// return [`Error::PermissionDenied`].
+pub const fn resolve_request(desired: u32, allowed: u32, mapping: &GenericMapping) -> Result<u32> {
+    let desired = map_generic(desired, mapping);
     let specific = desired & !MAXIMUM_ALLOWED;
     if specific & !allowed != 0 {
         return Err(Error::PermissionDenied);
@@ -332,24 +367,6 @@ pub fn access_check(
         return Err(Error::PermissionDenied);
     }
     Ok(maximal | specific)
-}
-
-/// Walk the DACL in order and return every right the token is allowed.
-fn granted_rights(acl: &Acl<'_>, token_sids: &[&[u8]], mapping: &GenericMapping) -> Result<u32> {
-    let mut granted = 0u32;
-    let mut denied = 0u32;
-    for ace in acl.aces() {
-        let ace = ace?;
-        if !token_sids.contains(&ace.sid) {
-            continue;
-        }
-        let mask = map_generic(ace.mask, mapping);
-        match ace.kind {
-            AceKind::Allowed => granted |= mask & !denied,
-            AceKind::Denied => denied |= mask & !granted,
-        }
-    }
-    Ok(granted)
 }
 
 #[cfg(test)]
