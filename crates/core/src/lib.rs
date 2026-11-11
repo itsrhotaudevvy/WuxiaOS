@@ -21,6 +21,7 @@ pub mod memory;
 pub mod nt;
 pub mod paging;
 pub mod personality;
+pub mod pipe;
 pub mod pledge;
 pub mod priority;
 pub mod process;
