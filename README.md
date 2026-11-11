@@ -20,7 +20,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X.
 - 34 `wuxia-core` host tests pass.
 - PE parsing validates container metadata only. No Windows program or driver is executed yet.
-- IDT/GDT definitions are scaffolding; CPU interrupt installation and userspace transitions are not complete.
+- The GDT, user segments and a TSS with `RSP0` are loaded; the IDT and userspace transitions are not complete.
 - No POSIX userspace, filesystem, scheduler, network stack, Windows application or Windows driver support exists yet.
 
 ## Build and test
@@ -51,6 +51,7 @@ The bootstrap kernel deliberately halts, so an interactive QEMU session does not
 
 ```text
 WUXIA_BOOT_OK: Limine entered the high-half kernel
+WUXIA_GDT_OK
 WUXIA_MEMORY_MAP_READY
 WUXIA_FRAME_ALLOC_OK
 WUXIA_HHDM_OK

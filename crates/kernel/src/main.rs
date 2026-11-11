@@ -50,6 +50,8 @@ pub extern "C" fn _start() -> ! {
     }
     serial::init();
     serial::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
+    gdt::init(gdt::current_stack_pointer());
+    serial::write_str("WUXIA_GDT_OK\n");
     let response = MEMORY_MAP_REQUEST
         .get_response()
         .expect("Limine did not provide a memory map");
