@@ -1,5 +1,8 @@
 //! Small NT vocabulary types used by the future native personality.
 
+use crate::syscall::{MAX_READ_LENGTH, MAX_WRITE_LENGTH, Registers, UserBuffer};
+use crate::{Error, Result};
+
 /// NT object classes used by the executive object-manager design.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -68,11 +71,124 @@ impl NtStatus {
     pub const NOT_IMPLEMENTED: Self = Self(0xc000_0002);
     /// STATUS_ACCESS_DENIED.
     pub const ACCESS_DENIED: Self = Self(0xc000_0022);
+    /// STATUS_INVALID_HANDLE.
+    pub const INVALID_HANDLE: Self = Self(0xc000_0008);
+    /// STATUS_BUFFER_TOO_SMALL.
+    pub const BUFFER_TOO_SMALL: Self = Self(0xc000_0023);
 
     /// Test the NTSTATUS severity bit.
     pub const fn is_success(self) -> bool {
         self.0 & 0x8000_0000 == 0
     }
+}
+
+/// Native services the NT personality understands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum NtCall {
+    /// Close an object handle.
+    Close = 0x0f,
+    /// Reserve and commit user virtual memory.
+    AllocateVirtualMemory = 0x18,
+    /// Terminate the calling process.
+    TerminateProcess = 0x29,
+    /// Read from a file handle.
+    ReadFile = 0x06,
+    /// Write to a file handle.
+    WriteFile = 0x08,
+}
+
+impl NtCall {
+    /// Decode a service number, rejecting anything unknown.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            0x0f => Some(Self::Close),
+            0x18 => Some(Self::AllocateVirtualMemory),
+            0x29 => Some(Self::TerminateProcess),
+            0x06 => Some(Self::ReadFile),
+            0x08 => Some(Self::WriteFile),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded NT request with validated arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NtRequest {
+    /// Close a handle.
+    Close {
+        /// Process-local handle number.
+        handle: u32,
+    },
+    /// Reserve user virtual memory of the requested length.
+    AllocateVirtualMemory {
+        /// Requested byte length.
+        length: u64,
+    },
+    /// Terminate the process with an NTSTATUS exit code.
+    TerminateProcess {
+        /// Exit status recorded for the process.
+        status: u32,
+    },
+    /// Read into a user buffer.
+    ReadFile {
+        /// File handle.
+        handle: u32,
+        /// Validated destination range.
+        buffer: UserBuffer,
+    },
+    /// Write from a user buffer.
+    WriteFile {
+        /// File handle.
+        handle: u32,
+        /// Validated source range.
+        buffer: UserBuffer,
+    },
+}
+
+impl NtRequest {
+    /// Decode a service number and register block without trusting pointers.
+    pub fn decode(call: u64, registers: &Registers) -> Result<Self> {
+        match NtCall::from_raw(call).ok_or(Error::InvalidInput)? {
+            NtCall::Close => Ok(Self::Close {
+                handle: decode_handle(registers.args[0])?,
+            }),
+            NtCall::AllocateVirtualMemory => {
+                let length = registers.args[1];
+                if length == 0 || length > crate::syscall::MAX_MAP_LENGTH {
+                    return Err(Error::InvalidInput);
+                }
+                Ok(Self::AllocateVirtualMemory { length })
+            }
+            NtCall::TerminateProcess => Ok(Self::TerminateProcess {
+                status: u32::try_from(registers.args[0]).map_err(|_| Error::InvalidInput)?,
+            }),
+            NtCall::ReadFile => Ok(Self::ReadFile {
+                handle: decode_handle(registers.args[0])?,
+                buffer: decode_buffer(registers.args[1], registers.args[2], MAX_READ_LENGTH)?,
+            }),
+            NtCall::WriteFile => Ok(Self::WriteFile {
+                handle: decode_handle(registers.args[0])?,
+                buffer: decode_buffer(registers.args[1], registers.args[2], MAX_WRITE_LENGTH)?,
+            }),
+        }
+    }
+}
+
+fn decode_handle(raw: u64) -> Result<u32> {
+    let handle = u32::try_from(raw).map_err(|_| Error::InvalidHandle)?;
+    if handle == 0 || handle as usize >= crate::process::DESCRIPTOR_CAPACITY {
+        return Err(Error::InvalidHandle);
+    }
+    Ok(handle)
+}
+
+fn decode_buffer(address: u64, length: u64, bound: u64) -> Result<UserBuffer> {
+    if address == 0 || length == 0 || length > bound {
+        return Err(Error::BadAddress);
+    }
+    address.checked_add(length).ok_or(Error::OutOfRange)?;
+    Ok(UserBuffer { address, length })
 }
 
 /// IRQL vocabulary used when defining a future driver execution model.
@@ -108,6 +224,48 @@ mod tests {
     fn nt_status_severity_is_explicit() {
         assert!(NtStatus::SUCCESS.is_success());
         assert!(!NtStatus::ACCESS_DENIED.is_success());
+    }
+
+    #[test]
+    fn nt_requests_are_decoded_with_validated_arguments() {
+        let mut registers = Registers {
+            args: [3, 0x8000_1000, 64, 0, 0, 0],
+        };
+        assert_eq!(
+            NtRequest::decode(0x08, &registers),
+            Ok(NtRequest::WriteFile {
+                handle: 3,
+                buffer: UserBuffer {
+                    address: 0x8000_1000,
+                    length: 64
+                }
+            })
+        );
+        assert_eq!(
+            NtRequest::decode(0x0f, &registers),
+            Ok(NtRequest::Close { handle: 3 })
+        );
+        assert_eq!(
+            NtRequest::decode(0x29, &registers),
+            Ok(NtRequest::TerminateProcess { status: 3 })
+        );
+
+        registers.args[0] = 0;
+        assert_eq!(
+            NtRequest::decode(0x0f, &registers),
+            Err(Error::InvalidHandle)
+        );
+        registers.args = [3, 0x8000_1000, MAX_READ_LENGTH + 1, 0, 0, 0];
+        assert_eq!(NtRequest::decode(0x06, &registers), Err(Error::BadAddress));
+        registers.args = [4, 4096, 0, 0, 0, 0];
+        assert_eq!(
+            NtRequest::decode(0x18, &registers),
+            Ok(NtRequest::AllocateVirtualMemory { length: 4096 })
+        );
+        assert_eq!(
+            NtRequest::decode(0x99, &registers),
+            Err(Error::InvalidInput)
+        );
     }
 
     #[test]

@@ -133,7 +133,7 @@ pub extern "C" fn _start() -> ! {
         "the bootstrap file cannot be created"
     );
     assert!(
-        files.create("motd", b"WuxiaOS\n").is_ok(),
+        files.create("motd", b"WuxiaOS files\n").is_ok(),
         "the second bootstrap file cannot be created"
     );
     vfs::install(files);

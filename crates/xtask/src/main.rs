@@ -32,6 +32,7 @@ const BOOT_MARKERS: &[&str] = &[
     "HELLO FROM USER",
     "USER MAP",
     "hello from wuxia fs",
+    "WuxiaOS files",
     "A SECOND PHASE",
     "SECOND PROCESS",
     "WUXIA_YIELD_SWITCH",
