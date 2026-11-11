@@ -19,6 +19,7 @@ pub mod image;
 pub mod load;
 pub mod memory;
 pub mod nt;
+pub mod nt_string;
 pub mod object_namespace;
 pub mod paging;
 pub mod path;
