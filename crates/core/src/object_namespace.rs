@@ -5,9 +5,12 @@
 //! Lookups are ASCII case-insensitive, as with `OBJ_CASE_INSENSITIVE`, while
 //! each node keeps the spelling it was created with.
 //!
-//! A [`NodeId`] is a slot index. It stays valid until its node is removed; a
-//! later `create` may then reuse the slot, so identifiers must not be kept
-//! across removals.
+//! A [`NodeId`] pairs a slot index with the generation the slot had when its
+//! node was created. Removing a node advances the slot's generation, so an
+//! identifier kept past removal is rejected with [`Error::InvalidHandle`]
+//! instead of naming whatever node later reuses the slot. A slot whose
+//! generation cannot advance any further is retired permanently rather than
+//! wrapped, so no identifier can ever match a different node in it.
 
 use crate::nt::ObjectType;
 use crate::{Error, Result};
@@ -24,17 +27,27 @@ pub const MAX_DEPTH: usize = 16;
 /// Slot index of the root directory.
 const ROOT: usize = 0;
 
+/// Generation of the root directory. The root is never removed, so its
+/// generation never changes and [`NodeId::ROOT`] stays valid forever.
+const ROOT_GENERATION: u32 = 0;
+
 /// Name stored for the root directory.
 const ROOT_NAME: &[u8] = b"\\";
 
 /// Identifier of a namespace node, valid only for the namespace that produced
 /// it and only until that node is removed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NodeId(usize);
+pub struct NodeId {
+    index: usize,
+    generation: u32,
+}
 
 impl NodeId {
     /// Identifier of the root directory `\`, which is always present.
-    pub const ROOT: Self = Self(ROOT);
+    pub const ROOT: Self = Self {
+        index: ROOT,
+        generation: ROOT_GENERATION,
+    };
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +57,12 @@ struct Node {
     parent: usize,
     object_type: ObjectType,
     present: bool,
+    /// Generation carried by identifiers of the node that occupies this slot.
+    /// Advanced by `remove`, so earlier identifiers no longer match.
+    generation: u32,
+    /// Set when `generation` reached its maximum and cannot advance. The slot
+    /// is then never reused, so the generation never wraps.
+    retired: bool,
 }
 
 impl Node {
@@ -53,10 +72,12 @@ impl Node {
         parent: ROOT,
         object_type: ObjectType::Directory,
         present: false,
+        generation: 0,
+        retired: false,
     };
 
     /// Build a live node from a name that has already been validated.
-    fn new(name: &[u8], parent: usize, object_type: ObjectType) -> Self {
+    fn new(name: &[u8], parent: usize, object_type: ObjectType, generation: u32) -> Self {
         let mut stored = [0u8; MAX_NAME_LENGTH];
         stored[..name.len()].copy_from_slice(name);
         Self {
@@ -65,6 +86,8 @@ impl Node {
             parent,
             object_type,
             present: true,
+            generation,
+            retired: false,
         }
     }
 
@@ -100,6 +123,8 @@ impl<const N: usize> ObjectNamespace<N> {
                 parent: ROOT,
                 object_type: ObjectType::Directory,
                 present: true,
+                generation: ROOT_GENERATION,
+                retired: false,
             };
         }
         Self { nodes }
@@ -130,7 +155,7 @@ impl<const N: usize> ObjectNamespace<N> {
         let parent_path = &path[..separator.max(1)];
         let name = &path.as_bytes()[separator + 1..];
 
-        let parent = self.lookup(parent_path)?.0;
+        let parent = self.lookup(parent_path)?.index;
         if self.node(parent)?.object_type != ObjectType::Directory {
             return Err(Error::InvalidState);
         }
@@ -141,10 +166,14 @@ impl<const N: usize> ObjectNamespace<N> {
         let slot = self
             .nodes
             .iter()
-            .position(|node| !node.present)
+            .position(|node| !node.present && !node.retired)
             .ok_or(Error::TableFull)?;
-        self.nodes[slot] = Node::new(name, parent, object_type);
-        Ok(NodeId(slot))
+        let generation = self.nodes[slot].generation;
+        self.nodes[slot] = Node::new(name, parent, object_type, generation);
+        Ok(NodeId {
+            index: slot,
+            generation,
+        })
     }
 
     /// Resolve an absolute path to its node.
@@ -168,42 +197,76 @@ impl<const N: usize> ObjectNamespace<N> {
             }
         }
         self.node(current)?;
-        Ok(NodeId(current))
+        Ok(self.id_of(current))
     }
 
-    /// Remove a node, freeing its slot for reuse.
+    /// Remove a node, freeing its slot for reuse under a new generation.
+    ///
+    /// Every identifier of the removed node becomes stale. If the slot's
+    /// generation is already at its maximum, the slot is retired instead and
+    /// is never used again.
     ///
     /// Errors:
     /// - [`Error::PermissionDenied`]: the node is the root, which is protected.
-    /// - [`Error::NotFound`]: the identifier does not name a live node.
+    /// - [`Error::InvalidHandle`]: the identifier is stale or foreign.
     /// - [`Error::InvalidState`]: the node is a directory that still has children.
     pub fn remove(&mut self, node: NodeId) -> Result<()> {
-        if node.0 == ROOT {
+        if node.index == ROOT {
             return Err(Error::PermissionDenied);
         }
-        self.node(node.0)?;
+        let index = self.live(node)?;
         if self
             .nodes
             .iter()
-            .any(|child| child.present && child.parent == node.0)
+            .any(|child| child.present && child.parent == index)
         {
             return Err(Error::InvalidState);
         }
-        self.nodes[node.0] = Node::VACANT;
+        let slot = &mut self.nodes[index];
+        let (generation, retired) = match slot.generation.checked_add(1) {
+            Some(next) => (next, false),
+            None => (slot.generation, true),
+        };
+        *slot = Node {
+            generation,
+            retired,
+            ..Node::VACANT
+        };
         Ok(())
     }
 
     /// The name of a node, in the case it was created with.
     ///
     /// The root is named `\`.
+    ///
+    /// Errors: [`Error::InvalidHandle`] for a stale or foreign identifier.
     pub fn name(&self, node: NodeId) -> Result<&str> {
-        let stored = self.node(node.0)?;
-        core::str::from_utf8(stored.name()).map_err(|_| Error::InvalidInput)
+        let index = self.live(node)?;
+        core::str::from_utf8(self.nodes[index].name()).map_err(|_| Error::InvalidInput)
     }
 
     /// The object type of a node.
+    ///
+    /// Errors: [`Error::InvalidHandle`] for a stale or foreign identifier.
     pub fn object_type(&self, node: NodeId) -> Result<ObjectType> {
-        Ok(self.node(node.0)?.object_type)
+        let index = self.live(node)?;
+        Ok(self.nodes[index].object_type)
+    }
+
+    /// Check an identifier against its slot and return the slot index.
+    fn live(&self, node: NodeId) -> Result<usize> {
+        match self.nodes.get(node.index) {
+            Some(slot) if slot.present && slot.generation == node.generation => Ok(node.index),
+            _ => Err(Error::InvalidHandle),
+        }
+    }
+
+    /// The identifier of the live node in slot `index`.
+    fn id_of(&self, index: usize) -> NodeId {
+        NodeId {
+            index,
+            generation: self.nodes[index].generation,
+        }
     }
 
     fn node(&self, index: usize) -> Result<&Node> {
@@ -382,8 +445,8 @@ mod tests {
         ns.remove(child).unwrap();
         ns.remove(dir).unwrap();
         assert_eq!(ns.lookup("\\Dir"), Err(Error::NotFound));
-        assert_eq!(ns.remove(dir), Err(Error::NotFound));
-        assert_eq!(ns.name(dir), Err(Error::NotFound));
+        assert_eq!(ns.remove(dir), Err(Error::InvalidHandle));
+        assert_eq!(ns.name(dir), Err(Error::InvalidHandle));
     }
 
     #[test]
@@ -465,10 +528,114 @@ mod tests {
         ns.remove(first).unwrap();
         assert_eq!(ns.lookup("\\First"), Err(Error::NotFound));
         let second = ns.create("\\Second", ObjectType::Mutant).unwrap();
-        assert_eq!(second, first);
+        assert_eq!(second.index, first.index);
+        assert_ne!(second, first);
         assert_eq!(ns.lookup("\\Second"), Ok(second));
         assert_eq!(ns.name(second), Ok("Second"));
         assert_eq!(ns.object_type(second), Ok(ObjectType::Mutant));
+    }
+
+    #[test]
+    fn stale_id_is_rejected_after_slot_is_reused() {
+        let mut ns = ObjectNamespace::<2>::new();
+        let first = ns.create("\\First", ObjectType::Event).unwrap();
+        ns.remove(first).unwrap();
+        let second = ns.create("\\Second", ObjectType::Mutant).unwrap();
+        assert_eq!(second.index, first.index);
+
+        assert_eq!(ns.name(first), Err(Error::InvalidHandle));
+        assert_eq!(ns.object_type(first), Err(Error::InvalidHandle));
+        assert_eq!(ns.remove(first), Err(Error::InvalidHandle));
+
+        // The rejected remove must leave the object now occupying the slot alone.
+        assert_eq!(ns.lookup("\\Second"), Ok(second));
+        assert_eq!(ns.name(second), Ok("Second"));
+        assert_eq!(ns.object_type(second), Ok(ObjectType::Mutant));
+        ns.remove(second).unwrap();
+        assert_eq!(ns.lookup("\\Second"), Err(Error::NotFound));
+    }
+
+    #[test]
+    fn ids_are_rejected_while_their_slot_is_vacant_or_foreign() {
+        let mut ns = ObjectNamespace::<4>::new();
+        let event = ns.create("\\Event", ObjectType::Event).unwrap();
+        ns.remove(event).unwrap();
+
+        assert_eq!(ns.name(event), Err(Error::InvalidHandle));
+        assert_eq!(ns.object_type(event), Err(Error::InvalidHandle));
+        assert_eq!(ns.remove(event), Err(Error::InvalidHandle));
+
+        let beyond = NodeId {
+            index: 99,
+            generation: 0,
+        };
+        assert_eq!(ns.name(beyond), Err(Error::InvalidHandle));
+        assert_eq!(ns.object_type(beyond), Err(Error::InvalidHandle));
+        assert_eq!(ns.remove(beyond), Err(Error::InvalidHandle));
+    }
+
+    #[test]
+    fn root_stays_valid_through_churn() {
+        let mut ns = ObjectNamespace::<4>::new();
+        let dir = ns.create("\\Dir", ObjectType::Directory).unwrap();
+        for _ in 0..100 {
+            let event = ns.create("\\Dir\\Event", ObjectType::Event).unwrap();
+            ns.remove(event).unwrap();
+            let other = ns.create("\\Other", ObjectType::Mutant).unwrap();
+            ns.remove(other).unwrap();
+        }
+        ns.remove(dir).unwrap();
+
+        assert_eq!(ns.lookup("\\"), Ok(NodeId::ROOT));
+        assert_eq!(ns.name(NodeId::ROOT), Ok("\\"));
+        assert_eq!(ns.object_type(NodeId::ROOT), Ok(ObjectType::Directory));
+        assert_eq!(ns.remove(NodeId::ROOT), Err(Error::PermissionDenied));
+        assert_eq!(ns.lookup("\\"), Ok(NodeId::ROOT));
+        assert!(ns.create("\\Late", ObjectType::Event).is_ok());
+    }
+
+    #[test]
+    fn exhausted_generation_retires_the_slot() {
+        let mut ns = ObjectNamespace::<3>::new();
+        // Start the slot one generation short of overflow. Reaching the
+        // maximum takes 2^32 cycles, so the test sets the counter directly.
+        ns.nodes[1].generation = u32::MAX - 1;
+
+        let before = ns.create("\\A", ObjectType::Event).unwrap();
+        assert_eq!(
+            before,
+            NodeId {
+                index: 1,
+                generation: u32::MAX - 1,
+            }
+        );
+        ns.remove(before).unwrap();
+
+        // The final generation is still issued once.
+        let last = ns.create("\\A", ObjectType::Event).unwrap();
+        assert_eq!(
+            last,
+            NodeId {
+                index: 1,
+                generation: u32::MAX,
+            }
+        );
+        ns.remove(last).unwrap();
+
+        // The slot cannot advance, so it is retired rather than wrapped to 0,
+        // which would make the old identifiers match again.
+        assert_eq!(ns.lookup("\\A"), Err(Error::NotFound));
+        assert_eq!(ns.name(before), Err(Error::InvalidHandle));
+        assert_eq!(ns.name(last), Err(Error::InvalidHandle));
+        assert_eq!(ns.remove(before), Err(Error::InvalidHandle));
+        assert_eq!(ns.remove(last), Err(Error::InvalidHandle));
+
+        // A retired slot is never handed out again: the other slot is used,
+        // and then the table is full.
+        let b = ns.create("\\B", ObjectType::Event).unwrap();
+        assert_eq!(b.index, 2);
+        assert_eq!(ns.create("\\C", ObjectType::Event), Err(Error::TableFull));
+        assert_eq!(ns.lookup("\\B"), Ok(b));
     }
 
     #[test]
