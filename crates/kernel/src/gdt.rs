@@ -38,4 +38,9 @@ impl Gdt {
     pub const fn new() -> Self {
         Self { entries: [0, SegmentDescriptor::code(0).0, SegmentDescriptor::code(0)] }
     }
+
+    /// Return the selector for the first executable kernel segment.
+    pub const fn kernel_code_selector(&self) -> u16 {
+        KERNEL_CODE_SELECTOR
+    }
 }
