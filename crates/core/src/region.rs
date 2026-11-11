@@ -1,8 +1,9 @@
-//! Host-testable physical-region normalization and bootstrap allocation.
+//! Host-testable physical-region normalization and one-way bootstrap allocation.
 //!
-//! The bump allocator never returns a frame twice and never allocates page
-//! zero. It intentionally cannot free frames; early page-table ownership is
-//! permanent for the lifetime of bootstrap.
+//! `BumpAllocator` is a one-way allocator kept for host tests: it never returns
+//! a frame twice, never allocates page zero, and cannot free frames. The kernel
+//! does not reference it. Its live allocator is `frames::FramePool`, which
+//! reclaims frames.
 
 use crate::{Error, Result};
 
