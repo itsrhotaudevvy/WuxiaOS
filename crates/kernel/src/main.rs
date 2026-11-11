@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-//! Minimal x86_64 Limine bootstrap.
+//! Minimal x86_64 Limine bootstrap with a headless serial console.
 //!
-//! This is a real high-half boot target. It reports a successful Limine entry
-//! on COM1 and then halts. It does not load Windows applications or drivers.
+//! This milestone proves a real high-half kernel entry. It does not yet load
+//! Windows applications or drivers; those require separate ABI and mapping work.
 
 use core::arch::asm;
 use core::panic::PanicInfo;

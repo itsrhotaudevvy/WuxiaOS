@@ -106,6 +106,7 @@ fn build_iso() -> ExitCode {
 
 fn qemu_test() -> ExitCode {
     let mut command = Command::new("qemu-system-x86_64");
+    command.args(["-display", "none"]);
     command.args([
         "-M", "q35", "-m", "128M", "-display", "none", "-serial", "stdio",
         "-cdrom", "target/wuxia.iso", "-boot", "d", "-no-reboot", "-no-shutdown",

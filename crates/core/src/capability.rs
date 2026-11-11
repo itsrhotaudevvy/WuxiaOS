@@ -107,8 +107,9 @@ impl<T, const N: usize> HandleTable<T, N> {
     }
 
     /// Insert an object, failing rather than overwriting a live capability.
+    /// A slot whose generation wrapped is permanently retired.
     pub fn insert(&mut self, object: T, rights: Rights) -> Result<Handle> {
-        let index = self.entries.iter().position(|entry| entry.object.is_none())
+        let index = self.entries.iter().position(|entry| entry.object.is_none() && entry.generation != 0)
             .ok_or(Error::TableFull)?;
         let generation = self.entries[index].generation;
         self.entries[index].object = Some((object, rights));
@@ -138,6 +139,9 @@ impl<T, const N: usize> HandleTable<T, N> {
         T: Clone,
     {
         let (value, rights) = self.resolve(source)?;
+        if !rights.contains(Rights::DUPLICATE) {
+            return Err(Error::PermissionDenied);
+        }
         if !rights.contains(requested) {
             return Err(Error::PermissionDenied);
         }
@@ -151,7 +155,9 @@ impl<T, const N: usize> HandleTable<T, N> {
         if entry.generation != handle.generation() || entry.object.is_none() {
             return Err(Error::InvalidHandle);
         }
-        entry.generation = entry.generation.wrapping_add(1).max(1);
+        // A wrapped generation would eventually revive an ancient handle.
+        // Retire the slot permanently instead of reissuing an old token.
+        entry.generation = entry.generation.checked_add(1).unwrap_or(0);
         entry.object.take().map(|(value, _)| value).ok_or(Error::InvalidHandle)
     }
 
