@@ -18,6 +18,7 @@ pub mod load;
 pub mod memory;
 pub mod nt;
 pub mod paging;
+pub mod pe_reloc;
 pub mod personality;
 pub mod process;
 pub mod region;
