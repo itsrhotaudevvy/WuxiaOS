@@ -20,7 +20,7 @@ use wuxia_core::paging::{
 pub const MAX_USER_SEGMENTS: usize = 8;
 
 /// Maximum physical frames a single user image can own.
-pub const MAX_IMAGE_FRAMES: usize = 32;
+pub const MAX_IMAGE_FRAMES: usize = 64;
 
 /// Records every frame an image allocation took, so teardown can return them.
 #[derive(Clone, Copy, Debug)]
@@ -237,6 +237,53 @@ static mut DIRECT_MAP_OFFSET: u64 = 0;
 pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error> {
     let reader = DirectMapReader { direct_map };
     walk(&reader, read_cr3(), virtual_address)
+}
+
+/// Map a fresh writable range into an existing user root at runtime.
+///
+/// The root's user subtree must already exist, as it does for a loaded process.
+pub fn map_user_range<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    tracker: &mut FrameTracker,
+    root: u64,
+    address: u64,
+    length: u64,
+    permissions: PagePermissions,
+) -> Result<(), Error> {
+    if !address.is_multiple_of(PAGE_SIZE)
+        || length == 0
+        || !length.is_multiple_of(PAGE_SIZE)
+        || address >= USER_ADDRESS_LIMIT
+    {
+        return Err(Error::InvalidInput);
+    }
+    let slot = table_index(address, 0)?;
+    let entry = read_entry(frame_pointer(direct_map, root)?, slot);
+    if !is_present(entry) {
+        return Err(Error::NotFound);
+    }
+    let pdpt = physical_address(entry);
+    for page in 0..length / PAGE_SIZE {
+        let page_address = address
+            .checked_add(page * PAGE_SIZE)
+            .ok_or(Error::OutOfRange)?;
+        if table_index(page_address, 0)? != slot || page_address >= USER_ADDRESS_LIMIT {
+            return Err(Error::BadAddress);
+        }
+        let frame = tracker.allocate(allocator)?;
+        zero_frame(direct_map, frame)?;
+        map_page(
+            allocator,
+            direct_map,
+            tracker,
+            pdpt,
+            page_address,
+            frame,
+            permissions,
+        )?;
+    }
+    Ok(())
 }
 
 /// Copy one frame's worth of a segment's file bytes into a physical frame.

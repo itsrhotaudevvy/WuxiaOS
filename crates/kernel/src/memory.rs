@@ -62,6 +62,12 @@ pub fn allocate_frame() -> Option<u64> {
     }
 }
 
+/// Run `operation` with exclusive access to the installed pool.
+pub fn with_pool<R>(operation: impl FnOnce(&mut KernelFrames) -> R) -> Option<R> {
+    // SAFETY: the pool is installed before ring 3 starts and traps do not nest.
+    unsafe { (*core::ptr::addr_of_mut!(POOL)).as_mut().map(operation) }
+}
+
 /// Return a frame to the installed pool.
 pub fn free_frame(frame: u64) -> Result<(), wuxia_core::Error> {
     // SAFETY: the pool is installed before ring 3 starts and traps do not nest.

@@ -18,7 +18,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - The kernel receives Limine's physical-memory map and allocates two distinct usable frames.
 - The kernel validates Limine's HHDM offset, builds a four-level page-table chain for a user code page and stack, clones the active PML4 into a fresh root, loads that root into CR3 and re-resolves both pages through the active tables.
 - `wuxia-core` paging contracts validate user virtual addresses and encode page-table and 4 KiB leaf entries with enforced W^X.
-- 74 `wuxia-core` host tests pass.
+- 76 `wuxia-core` host tests pass.
 - PE and ELF64 parsing validate container metadata and segment ranges only. No Windows program or driver is executed yet.
 - The GDT, user segments, TSS and an IDT with CPL0/CPL3 gates are loaded; the `int3` self-test returns through the full stub path.
 - A separate `wuxia-user` crate is linked at 512 GiB and embedded in the kernel. The loader parses its ELF64 program headers, allocates and zero-fills frames per segment, applies per-segment permissions and maps the entry point.
@@ -26,7 +26,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - The kernel enters CPL3 with `iretq` at the ELF entry point, rejects an out-of-region `write` pointer, copies a real message from user memory to the serial console through `write(1, …)` and ends on `exit(0)`.
 - After that process exits, a second embedded image faults on an unmapped write. The page-fault handler recognises a CPL3 fault, reports the error code, faulting address and instruction pointer and terminates the process while the kernel stays alive.
 - The bootstrap uses a reclaimable frame pool: freed frames are returned and reused, unlike the earlier one-way bump allocator.
-- A round-robin scheduler switches between two user processes on `yield` and on timer preemption, saving and restoring full trap frames and CR3 roots. The next-thread decision is a host-tested core function, and each thread owns its own process (identifier, address space, descriptors), so `getpid`, `exit` and descriptor checks act on the running thread. When a thread exits, every frame its image owned is returned to the pool, and the kernel proves one is immediately reusable.
+- A round-robin scheduler switches between two user processes on `yield` and on timer preemption, saving and restoring full trap frames and CR3 roots. The next-thread decision is a host-tested core function, and each thread owns its own process (identifier, address space, descriptors), so `getpid`, `exit` and descriptor checks act on the running thread. A `map` syscall allocates anonymous writable pages into the running process's live page tables at runtime. When a thread exits, every frame its image owned is returned to the pool, and the kernel proves one is immediately reusable.
 - No POSIX userspace, filesystem, priority scheduler, SMP, network stack, Windows application or Windows driver support exists yet.
 
 ## Build and test

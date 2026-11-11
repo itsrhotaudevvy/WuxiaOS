@@ -29,6 +29,8 @@ pub enum PosixCall {
     Write = 1,
     /// Close a process-local handle.
     Close = 3,
+    /// Map anonymous writable memory.
+    Map = 9,
     /// Yield the processor to another runnable thread.
     Yield = 24,
     /// Return the process identifier.
@@ -43,6 +45,7 @@ impl PosixCall {
         match raw {
             1 => Some(Self::Write),
             3 => Some(Self::Close),
+            9 => Some(Self::Map),
             24 => Some(Self::Yield),
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
@@ -60,6 +63,9 @@ pub struct UserBuffer {
     pub length: u64,
 }
 
+/// Largest anonymous mapping request accepted from userspace.
+pub const MAX_MAP_LENGTH: u64 = 64 * 1024;
+
 /// A decoded POSIX request with validated arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PosixRequest {
@@ -69,6 +75,11 @@ pub enum PosixRequest {
         descriptor: u32,
         /// Validated source range.
         buffer: UserBuffer,
+    },
+    /// Map anonymous writable memory and return its address.
+    Map {
+        /// Requested byte length, bounded by [`MAX_MAP_LENGTH`].
+        length: u64,
     },
     /// Close a process-local descriptor.
     Close {
@@ -94,6 +105,9 @@ impl PosixRequest {
                 descriptor: decode_descriptor(registers.args[0])?,
                 buffer: decode_buffer(registers.args[1], registers.args[2])?,
             }),
+            PosixCall::Map => Ok(Self::Map {
+                length: decode_map_length(registers.args[0])?,
+            }),
             PosixCall::Close => Ok(Self::Close {
                 descriptor: decode_descriptor(registers.args[0])?,
             }),
@@ -104,6 +118,13 @@ impl PosixRequest {
             }),
         }
     }
+}
+
+fn decode_map_length(raw: u64) -> Result<u64> {
+    if raw == 0 || raw > MAX_MAP_LENGTH {
+        return Err(Error::InvalidInput);
+    }
+    Ok(raw)
 }
 
 fn decode_descriptor(raw: u64) -> Result<u32> {
@@ -143,6 +164,27 @@ mod tests {
         assert_eq!(
             PosixRequest::decode(24, &registers),
             Ok(PosixRequest::Yield)
+        );
+    }
+
+    #[test]
+    fn map_requests_are_bounded() {
+        let mut registers = Registers {
+            args: [4096, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(9, &registers),
+            Ok(PosixRequest::Map { length: 4096 })
+        );
+        registers.args[0] = 0;
+        assert_eq!(
+            PosixRequest::decode(9, &registers),
+            Err(Error::InvalidInput)
+        );
+        registers.args[0] = MAX_MAP_LENGTH + 1;
+        assert_eq!(
+            PosixRequest::decode(9, &registers),
+            Err(Error::InvalidInput)
         );
     }
 

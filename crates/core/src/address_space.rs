@@ -123,6 +123,28 @@ impl<const N: usize> AddressSpace<N> {
             .any(|region| address >= region.start && last <= region.end())
     }
 
+    /// Choose a page-aligned address above every mapped region for `length` bytes.
+    pub fn top_gap(&self, length: u64) -> Result<u64> {
+        if length == 0 || !length.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::InvalidInput);
+        }
+        let highest = self.regions[..self.len]
+            .iter()
+            .map(|region| region.start + region.length)
+            .max()
+            .unwrap_or(0);
+        let start = highest
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(Error::OutOfRange)?
+            & !(PAGE_SIZE - 1);
+        let start = start.max(PAGE_SIZE);
+        let end = start.checked_add(length).ok_or(Error::OutOfRange)?;
+        if end > USER_ADDRESS_LIMIT {
+            return Err(Error::BadAddress);
+        }
+        Ok(start)
+    }
+
     /// Number of mapped regions.
     pub fn len(&self) -> usize {
         self.len
@@ -193,6 +215,23 @@ mod tests {
             executable: true,
         };
         assert_eq!(space.map(BASE, PAGE_SIZE, flags), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn top_gap_is_above_every_region_and_aligned() {
+        let mut space = AddressSpace::<4>::new();
+        assert_eq!(space.top_gap(PAGE_SIZE), Ok(PAGE_SIZE));
+
+        space
+            .map(0x8000_0000, 0x2000, PagePermissions::USER_CODE)
+            .unwrap();
+        space
+            .map(0x8000_4000, PAGE_SIZE, PagePermissions::USER_READ_ONLY)
+            .unwrap();
+        assert_eq!(space.top_gap(PAGE_SIZE), Ok(0x8000_5000));
+        assert_eq!(space.top_gap(0x2000), Ok(0x8000_5000));
+        assert_eq!(space.top_gap(0), Err(Error::InvalidInput));
+        assert_eq!(space.top_gap(0x1001), Err(Error::InvalidInput));
     }
 
     #[test]

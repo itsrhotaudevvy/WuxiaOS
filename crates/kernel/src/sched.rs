@@ -119,6 +119,48 @@ pub fn region_contains(address: u64, length: u64) -> bool {
     current_thread().is_some_and(|thread| thread.process.space().contains(address, length))
 }
 
+/// Map `length` anonymous writable bytes into the running process.
+pub fn map_current(length: u64) -> Option<u64> {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        let thread = threads[current].as_mut()?;
+        let length = length.checked_add(wuxia_core::paging::PAGE_SIZE - 1)?
+            & !(wuxia_core::paging::PAGE_SIZE - 1);
+        if length == 0 {
+            return None;
+        }
+        let address = thread.process.space().top_gap(length).ok()?;
+        let root = thread.root;
+        let direct_map = crate::paging::current_direct_map()?;
+        let mapped = crate::memory::with_pool(|pool| {
+            crate::paging::map_user_range(
+                pool,
+                direct_map,
+                &mut thread.frames,
+                root,
+                address,
+                length,
+                wuxia_core::PagePermissions::USER_READ_WRITE,
+            )
+        });
+        if !matches!(mapped, Some(Ok(()))) {
+            return None;
+        }
+        thread
+            .process
+            .space_mut()
+            .map(
+                address,
+                length,
+                wuxia_core::PagePermissions::USER_READ_WRITE,
+            )
+            .ok()?;
+        Some(address)
+    }
+}
+
 /// Mark the running process exited, rejecting a second exit.
 pub fn exit_process(code: u64) -> bool {
     // SAFETY: traps are non-nesting and the current index is stable here.
