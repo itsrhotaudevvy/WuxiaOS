@@ -55,6 +55,9 @@ static FAULT_ELF: &[u8] = include_bytes!(env!("WUXIA_FAULT_ELF_PATH"));
 /// Second scheduler participant embedded by the build script.
 static SECOND_ELF: &[u8] = include_bytes!(env!("WUXIA_SECOND_ELF_PATH"));
 
+/// Minimal PE32+ program exercised through the NT personality.
+static PE_IMAGE: &[u8] = include_bytes!(env!("WUXIA_PE_IMAGE_PATH"));
+
 /// Limine's documented kernel entry point.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -125,6 +128,11 @@ pub extern "C" fn _start() -> ! {
         "the frame pool did not reuse a freed frame"
     );
     serial::write_str("WUXIA_FRAME_RECLAIM_OK\n");
+
+    let pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE)
+        .expect("the PE self-test image cannot be loaded");
+    serial::write_str("WUXIA_PE_IMAGE_OK\n");
+    serial::write_hex(pe.entry);
     memory::install_pool(allocator);
 
     let mut files = vfs::KernelFs::new();
@@ -206,8 +214,26 @@ pub extern "C" fn _start() -> ! {
         )
         .expect("the second-process stack cannot be modeled");
 
+    let mut pe_process = wuxia_core::Process::<8>::new(3, wuxia_core::Personality::Nt)
+        .expect("the PE process cannot be created");
+    for segment in pe.segments() {
+        pe_process
+            .space_mut()
+            .map(segment.address, segment.length, segment.permissions)
+            .expect("a PE segment cannot be modeled");
+    }
+    pe_process
+        .space_mut()
+        .map(
+            pe.stack_address,
+            u64::from(wuxia_core::paging::PAGE_SIZE),
+            wuxia_core::PagePermissions::USER_READ_WRITE,
+        )
+        .expect("the PE stack cannot be modeled");
+
     let stack_top = image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     let second_stack_top = second.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
+    let pe_stack_top = pe.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
     assert_eq!(
         sched::register(
             image.new_pml4,
@@ -229,6 +255,11 @@ pub extern "C" fn _start() -> ! {
         )
         .is_some(),
         "the second thread cannot be registered"
+    );
+    assert!(
+        sched::register_deferred(pe.new_pml4, pe.entry, pe_stack_top, pe_process, pe.frames)
+            .is_some(),
+        "the PE thread cannot be registered"
     );
     serial::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.entry, stack_top);

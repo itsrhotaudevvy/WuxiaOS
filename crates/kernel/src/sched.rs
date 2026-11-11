@@ -32,6 +32,8 @@ pub struct Thread {
     /// Tick at which the thread was last resumed, so a pending timer
     /// interrupt cannot preempt it before its first instruction.
     pub resume_tick: u64,
+    /// Whether the thread waits for an explicit start after boot.
+    pub deferred: bool,
     /// Process identity, address space and descriptors for this thread.
     pub process: Process<8>,
     /// Frames owned by the thread's image.
@@ -91,12 +93,41 @@ pub fn register(
             runnable: true,
             wake_at: 0,
             resume_tick: 0,
+            deferred: false,
             process,
             frames,
         });
         write_volatile(addr_of_mut!(COUNT), count + 1);
         Some(count)
     }
+}
+
+/// Register a thread that starts only after every boot thread has exited.
+pub fn register_deferred(
+    root: u64,
+    entry: u64,
+    stack_top: u64,
+    process: Process<8>,
+    frames: crate::paging::FrameTracker,
+) -> Option<usize> {
+    let index = register(root, entry, stack_top, process, frames)?;
+    // SAFETY: registration happens once, before ring 3 starts.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        threads[index] = threads[index].map(|thread| Thread {
+            runnable: false,
+            deferred: true,
+            ..thread
+        });
+    }
+    Some(index)
+}
+
+/// Whether the running process selected the NT personality.
+pub fn is_nt() -> bool {
+    current_thread().is_some_and(|thread| {
+        thread.process.personality() == wuxia_core::personality::Personality::Nt
+    })
 }
 
 /// Process identifier of the running thread.
@@ -467,7 +498,25 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
                 return true;
             }
             if !idle_until_wakeup(threads) {
-                return false;
+                let deferred = threads
+                    .iter()
+                    .position(|slot| slot.is_some_and(|thread| thread.deferred));
+                let Some(index) = deferred else {
+                    return false;
+                };
+                let thread = threads[index].expect("a deferred thread exists");
+                *frame = thread.frame;
+                frame.rflags |= 0x200;
+                write_volatile(addr_of_mut!(CURRENT), index);
+                crate::paging::activate(thread.root);
+                if let Some(thread) = threads[index].as_mut() {
+                    thread.runnable = true;
+                    thread.deferred = false;
+                    thread.resume_tick = crate::interrupts::ticks().saturating_add(1);
+                }
+                serial::write_str("WUXIA_NT_ENTER\n");
+                serial::write_hex(index as u64);
+                return true;
             }
         }
     }

@@ -115,6 +115,26 @@ pub fn load_user_image<const N: usize>(
     bytes: &[u8],
 ) -> Result<UserImage, Error> {
     let plan = LoaderPlan::<MAX_USER_SEGMENTS>::from_elf(bytes)?;
+    load_image_plan(allocator, direct_map, &plan, bytes)
+}
+
+/// Build an address space from a PE32+ image and its validated plan.
+pub fn load_pe_image<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    bytes: &[u8],
+) -> Result<UserImage, Error> {
+    let plan = LoaderPlan::<MAX_USER_SEGMENTS>::from_pe(bytes)?;
+    load_image_plan(allocator, direct_map, &plan, bytes)
+}
+
+/// Map a validated plan and its file bytes into a fresh address space.
+pub fn load_image_plan<const N: usize>(
+    allocator: &mut FramePool<N>,
+    direct_map: DirectMap,
+    plan: &LoaderPlan<MAX_USER_SEGMENTS>,
+    bytes: &[u8],
+) -> Result<UserImage, Error> {
     let old_pml4 = read_cr3();
     let old_root = frame_pointer(direct_map, old_pml4)?;
 

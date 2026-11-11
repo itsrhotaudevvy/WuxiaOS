@@ -297,6 +297,10 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
 }
 
 fn service_syscall(frame: &mut InterruptFrame) {
+    if crate::sched::is_nt() {
+        service_nt_syscall(frame);
+        return;
+    }
     let registers = wuxia_core::syscall::Registers {
         args: [
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
@@ -321,33 +325,7 @@ fn service_syscall(frame: &mut InterruptFrame) {
             }
         }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
-            if !crate::sched::exit_process(code) {
-                serial::write_str("WUXIA_SYSCALL_INVALID\n");
-                frame.rax = u64::MAX;
-                return;
-            }
-            serial::write_str("WUXIA_SYSCALL_EXIT\n");
-            serial::write_hex(code);
-            if crate::sched::exit_current(frame) {
-                return;
-            }
-            serial::write_str("WUXIA_TEARDOWN_OK\n");
-            if let Some(frame) = crate::memory::allocate_frame() {
-                serial::write_str("WUXIA_TEARDOWN_REUSE_OK\n");
-                serial::write_hex(frame);
-                let _ = crate::memory::free_frame(frame);
-            }
-            if let Some(image) = crate::user::next_image() {
-                serial::write_str("WUXIA_FAULT_TEST\n");
-                crate::paging::activate(image.new_pml4);
-                crate::user::enter(
-                    image.entry,
-                    image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16,
-                );
-            }
-            serial::write_str("WUXIA_TEST_PASS\n");
-            serial::debug_exit(0x10);
-            halt();
+            terminate(frame, code, "WUXIA_SYSCALL_EXIT\n");
         }
         Ok(wuxia_core::syscall::PosixRequest::Open { path }) => {
             let mut scratch = [0u8; wuxia_core::syscall::MAX_PATH_LENGTH as usize];
@@ -470,6 +448,91 @@ fn read_cr2() -> u64 {
         asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+/// Terminate the calling process, resuming another thread or the next image.
+fn terminate(frame: &mut InterruptFrame, code: u64, label: &str) {
+    if !crate::sched::exit_process(code) {
+        serial::write_str("WUXIA_SYSCALL_INVALID\n");
+        frame.rax = u64::MAX;
+        return;
+    }
+    serial::write_str(label);
+    serial::write_hex(code);
+    if crate::sched::exit_current(frame) {
+        return;
+    }
+    serial::write_str("WUXIA_TEARDOWN_OK\n");
+    if let Some(frame) = crate::memory::allocate_frame() {
+        serial::write_str("WUXIA_TEARDOWN_REUSE_OK\n");
+        serial::write_hex(frame);
+        let _ = crate::memory::free_frame(frame);
+    }
+    if let Some(image) = crate::user::next_image() {
+        serial::write_str("WUXIA_FAULT_TEST\n");
+        crate::paging::activate(image.new_pml4);
+        crate::user::enter(
+            image.entry,
+            image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16,
+        );
+    }
+    serial::write_str("WUXIA_TEST_PASS\n");
+    serial::debug_exit(0x10);
+    halt();
+}
+
+/// Service a native NT request from a process with the NT personality.
+fn service_nt_syscall(frame: &mut InterruptFrame) {
+    use wuxia_core::nt::{NtRequest, NtStatus};
+
+    let registers = wuxia_core::syscall::Registers {
+        args: [
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ],
+    };
+    match NtRequest::decode(frame.rax, &registers) {
+        Ok(NtRequest::WriteFile { handle, buffer }) => {
+            if handle != 1
+                || !crate::sched::descriptor_open(handle)
+                || !crate::sched::region_contains(buffer.address, buffer.length)
+            {
+                frame.rax = u64::from(NtStatus::INVALID_HANDLE.0);
+                return;
+            }
+            match copy_user_to_serial(buffer.address, buffer.length) {
+                Ok(()) => {
+                    serial::write_str("WUXIA_NT_WRITE_OK\n");
+                    frame.rax = 0;
+                }
+                Err(_) => {
+                    serial::write_str("WUXIA_SYSCALL_FAULT\n");
+                    frame.rax = u64::from(NtStatus::ACCESS_DENIED.0);
+                }
+            }
+        }
+        Ok(NtRequest::Close { handle }) => {
+            frame.rax = if crate::sched::close_descriptor(handle) {
+                0
+            } else {
+                u64::from(NtStatus::INVALID_HANDLE.0)
+            };
+        }
+        Ok(NtRequest::AllocateVirtualMemory { length }) => {
+            frame.rax = match crate::sched::map_current(length) {
+                Some(address) => address,
+                None => u64::from(NtStatus::ACCESS_DENIED.0),
+            };
+        }
+        Ok(NtRequest::TerminateProcess { status }) => {
+            terminate(frame, u64::from(status), "WUXIA_NT_EXIT\n");
+        }
+        Ok(NtRequest::ReadFile { .. }) => {
+            frame.rax = u64::from(NtStatus::NOT_IMPLEMENTED.0);
+        }
+        Err(_) => {
+            frame.rax = u64::from(NtStatus::INVALID_PARAMETER.0);
+        }
+    }
 }
 
 /// Copy a bounded user range into `out` through the HHDM.
