@@ -36,7 +36,7 @@ The bootstrap bump allocator owns a bounded normalized map and never returns a f
 
 ## Security boundaries
 
-All pointers, offsets, lengths and service numbers crossing a personality boundary are untrusted. PE and ELF64 parsing does not map or execute images. Handle tables use generations and rights attenuation; NT status values and POSIX errors are not interchangeable. The bootstrap allocates physical frames from a validated pool: regions are page-aligned, the null frame and misaligned addresses are rejected, allocation is last-in-first-out and a freed frame is reused rather than leaked.
+All pointers, offsets, lengths and service numbers crossing a personality boundary are untrusted. PE and ELF64 parsing does not map or execute images; both feed the same validated load plan, so a future NT loader inherits the same W^X, alignment and address-limit checks. Handle tables use generations and rights attenuation; NT status values and POSIX errors are not interchangeable. The bootstrap allocates physical frames from a validated pool: regions are page-aligned, the null frame and misaligned addresses are rejected, allocation is last-in-first-out and a freed frame is reused rather than leaked.
 
 A future NT driver personality must preserve IRQL rules, nonpaged-memory restrictions, IRP completion ownership, cancellation and synchronization behavior. Arbitrary native drivers must not execute in the kernel address space until address-space isolation, exception containment and explicit memory protections are implemented.
 

@@ -53,6 +53,8 @@ pub struct Section {
     pub raw_size: u32,
     /// Section name, including trailing NUL bytes.
     pub name: [u8; 8],
+    /// COFF section characteristics, including read/write/execute bits.
+    pub characteristics: u32,
 }
 
 impl<'a> PeImage<'a> {
@@ -209,6 +211,7 @@ impl<'a> PeImage<'a> {
         let virtual_address = read_u32(header, 12)?;
         let raw_size = read_u32(header, 16)?;
         let raw_offset = read_u32(header, 20)? as usize;
+        let characteristics = read_u32(header, 36)?;
         let end = raw_offset
             .checked_add(raw_size as usize)
             .ok_or(Error::InvalidImage)?;
@@ -227,6 +230,7 @@ impl<'a> PeImage<'a> {
             raw_offset,
             raw_size,
             name,
+            characteristics,
         })
     }
 

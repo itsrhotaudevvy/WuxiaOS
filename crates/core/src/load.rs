@@ -4,6 +4,7 @@
 //! permissions and where the stack can live. It never touches memory.
 
 use crate::elf::{Elf64Image, ElfKind};
+use crate::image::PeImage;
 use crate::paging::{PAGE_SIZE, PagePermissions, USER_ADDRESS_LIMIT};
 use crate::{Error, Result};
 
@@ -96,6 +97,70 @@ impl<const N: usize> LoaderPlan<N> {
         })
     }
 
+    /// Derive a plan from a PE32+ image's sections.
+    ///
+    /// Image-base-relative section addresses must already be page-aligned, as
+    /// a 4 KiB `SectionAlignment` produces. Writable-executable sections are
+    /// rejected because the kernel never creates such a mapping.
+    pub fn from_pe(bytes: &[u8]) -> Result<Self> {
+        let pe = PeImage::parse(bytes)?;
+        let info = pe.info()?;
+        if info.entry_rva == 0 || u64::from(info.entry_rva) >= u64::from(info.size_of_image) {
+            return Err(Error::InvalidImage);
+        }
+        let entry = info
+            .image_base
+            .checked_add(u64::from(info.entry_rva))
+            .ok_or(Error::OutOfRange)?;
+        let mut segments = [None; N];
+        let mut count = 0;
+        for index in 0..pe.section_count() as usize {
+            let section = pe.section(index)?;
+            let memory_size = u64::from(section.virtual_size.max(section.raw_size));
+            if memory_size == 0 {
+                continue;
+            }
+            let address = info
+                .image_base
+                .checked_add(u64::from(section.virtual_address))
+                .ok_or(Error::OutOfRange)?;
+            if !address.is_multiple_of(PAGE_SIZE) {
+                return Err(Error::BadAddress);
+            }
+            let writable = section.characteristics & 0x8000_0000 != 0;
+            let executable = section.characteristics & 0x2000_0000 != 0;
+            if writable && executable {
+                return Err(Error::PermissionDenied);
+            }
+            let end = address.checked_add(memory_size).ok_or(Error::OutOfRange)?;
+            if end > USER_ADDRESS_LIMIT {
+                return Err(Error::BadAddress);
+            }
+            if count == N {
+                return Err(Error::TableFull);
+            }
+            let permissions = if executable {
+                PagePermissions::USER_CODE
+            } else if writable {
+                PagePermissions::USER_READ_WRITE
+            } else {
+                PagePermissions::USER_READ_ONLY
+            };
+            segments[count] = Some(LoadSegment {
+                address,
+                file_size: u64::from(section.raw_size),
+                memory_size,
+                file_offset: section.raw_offset,
+                permissions,
+            });
+            count += 1;
+        }
+        if count == 0 {
+            return Err(Error::InvalidImage);
+        }
+        Ok(Self { entry, segments })
+    }
+
     /// Entry-point virtual address.
     pub const fn entry(&self) -> u64 {
         self.entry
@@ -154,6 +219,68 @@ mod tests {
         bytes[program + 40..program + 48].copy_from_slice(&memory_size.to_le_bytes());
         bytes[program + 48..program + 56].copy_from_slice(&0x1000u64.to_le_bytes());
         bytes
+    }
+
+    fn tiny_pe64(text_characteristics: u32, data_virtual_address: u32) -> [u8; 0x1000] {
+        let mut bytes = [0u8; 0x1000];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        bytes[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        bytes[0x58..0x5a].copy_from_slice(&0x20b_u16.to_le_bytes());
+        bytes[0x68..0x6c].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[0x70..0x78].copy_from_slice(&0x140000000u64.to_le_bytes());
+        bytes[0x58 + 56..0x58 + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+
+        let text = 0x148;
+        bytes[text..text + 5].copy_from_slice(b".text");
+        bytes[text + 8..text + 12].copy_from_slice(&0x100u32.to_le_bytes());
+        bytes[text + 12..text + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[text + 16..text + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[text + 20..text + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[text + 36..text + 40].copy_from_slice(&text_characteristics.to_le_bytes());
+
+        let data = text + 40;
+        bytes[data..data + 5].copy_from_slice(b".data");
+        bytes[data + 8..data + 12].copy_from_slice(&0x100u32.to_le_bytes());
+        bytes[data + 12..data + 16].copy_from_slice(&data_virtual_address.to_le_bytes());
+        bytes[data + 16..data + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[data + 20..data + 24].copy_from_slice(&0x400u32.to_le_bytes());
+        bytes[data + 36..data + 40].copy_from_slice(&0xC0000040u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn derives_a_pe_plan_with_section_permissions() {
+        let image = tiny_pe64(0x6000_0020, 0x2000);
+        let plan = LoaderPlan::<4>::from_pe(&image).unwrap();
+        assert_eq!(plan.entry(), 0x1_4000_1000);
+        assert_eq!(plan.len(), 2);
+        let mut segments = plan.segments();
+        let text = segments.next().unwrap();
+        assert_eq!(text.address, 0x1_4000_1000);
+        assert_eq!(text.permissions, PagePermissions::USER_CODE);
+        let data = segments.next().unwrap();
+        assert_eq!(data.address, 0x1_4000_2000);
+        assert_eq!(data.permissions, PagePermissions::USER_READ_WRITE);
+        assert_eq!(plan.max_end().unwrap(), 0x1_4000_3000);
+    }
+
+    #[test]
+    fn pe_writable_executable_and_unaligned_sections_are_rejected() {
+        let image = tiny_pe64(0xE000_0020, 0x2000);
+        assert!(matches!(
+            LoaderPlan::<4>::from_pe(&image),
+            Err(Error::PermissionDenied)
+        ));
+
+        let image = tiny_pe64(0x6000_0020, 0x2010);
+        assert!(matches!(
+            LoaderPlan::<4>::from_pe(&image),
+            Err(Error::BadAddress)
+        ));
     }
 
     #[test]
