@@ -6,6 +6,7 @@
 //! Executable parsers validate untrusted metadata without executing it; actual
 //! mapping and ABI emulation belong to the architecture-specific kernel.
 
+pub mod acl;
 pub mod address_space;
 pub mod capability;
 pub mod descriptor;
