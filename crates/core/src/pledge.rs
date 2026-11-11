@@ -100,6 +100,8 @@ pub const fn required(call: PosixCall) -> Promises {
         PosixCall::Read
         | PosixCall::Write
         | PosixCall::Close
+        | PosixCall::Seek
+        | PosixCall::FileSize
         | PosixCall::Yield
         | PosixCall::Sleep
         | PosixCall::GetPid => Promises::STDIO,
@@ -158,11 +160,13 @@ impl Pledge {
 mod tests {
     use super::*;
 
-    const CALLS: [PosixCall; 10] = [
+    const CALLS: [PosixCall; 12] = [
         PosixCall::Read,
         PosixCall::Write,
         PosixCall::Open,
         PosixCall::Close,
+        PosixCall::Seek,
+        PosixCall::FileSize,
         PosixCall::Map,
         PosixCall::Unmap,
         PosixCall::Yield,
