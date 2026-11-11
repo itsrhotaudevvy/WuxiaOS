@@ -13,6 +13,7 @@ pub mod cow;
 pub mod credentials;
 pub mod descriptor;
 pub mod dispatcher;
+pub mod dospath;
 pub mod elf;
 pub mod elf_reloc;
 pub mod errno;
