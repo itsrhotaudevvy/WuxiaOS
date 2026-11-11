@@ -31,6 +31,7 @@ pub mod priority;
 pub mod process;
 pub mod region;
 pub mod schedule;
+pub mod sid;
 pub mod signal;
 pub mod syscall;
 pub mod unveil;
