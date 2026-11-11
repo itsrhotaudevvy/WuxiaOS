@@ -43,6 +43,9 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[unsafe(link_section = ".requests_end_marker")]
 static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
+/// Ring-3 ELF program embedded by the build script.
+static USER_ELF: &[u8] = include_bytes!(env!("WUXIA_USER_ELF_PATH"));
+
 /// Limine's documented kernel entry point.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -80,107 +83,66 @@ pub extern "C" fn _start() -> ! {
         .expect("the direct-map offset is not aligned higher-half memory");
     serial::write_str("WUXIA_HHDM_OK\n");
     serial::write_hex(direct_map.offset());
-
-    const MESSAGE: &[u8] = b"HELLO FROM USER\n";
-    let stack = allocator
-        .allocate_frame()
-        .expect("a user stack frame is required");
-    let data = allocator
-        .allocate_frame()
-        .expect("a user data frame is required");
-    paging::write_frame(direct_map, data, MESSAGE).expect("cannot write the user data page");
     paging::record_direct_map(direct_map);
 
-    let image = paging::install_user_image(&mut allocator, direct_map, first, stack, data)
-        .expect("cannot install the isolated user image");
+    let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)
+        .expect("cannot load the user ELF image");
+    serial::write_str("WUXIA_ELF_OK\n");
     serial::write_str("WUXIA_USER_IMAGE_OK\n");
     serial::write_hex(image.old_pml4);
     serial::write_hex(image.new_pml4);
-    serial::write_hex(image.code_address);
+    serial::write_hex(image.entry);
     serial::write_hex(image.stack_address);
-    serial::write_hex(image.data_address);
+    for segment in image.segments() {
+        serial::write_hex(segment.address);
+    }
 
     paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");
     serial::write_hex(paging::read_cr3());
 
-    let code = paging::resolve(direct_map, image.code_address)
-        .expect("the new root does not resolve the user code page");
-    assert_eq!(
-        code, image.code_entry,
-        "the code leaf changed after activation"
-    );
+    let entry = paging::resolve(direct_map, image.entry)
+        .expect("the new root does not resolve the entry point");
+    for segment in image.segments() {
+        let leaf = paging::resolve(direct_map, segment.address)
+            .expect("the new root does not resolve a user segment");
+        assert_eq!(leaf, segment.entry, "a user leaf changed after activation");
+    }
     let stack_leaf = paging::resolve(direct_map, image.stack_address)
         .expect("the new root does not resolve the user stack page");
     assert_eq!(
         stack_leaf, image.stack_entry,
         "the stack leaf changed after activation"
     );
-    let data_leaf = paging::resolve(direct_map, image.data_address)
-        .expect("the new root does not resolve the user data page");
-    assert_eq!(
-        data_leaf, image.data_entry,
-        "the data leaf changed after activation"
-    );
     serial::write_str("WUXIA_POST_SWITCH_PASS\n");
-    serial::write_hex(code);
+    serial::write_hex(entry);
     serial::write_hex(stack_leaf);
-    serial::write_hex(data_leaf);
 
-    // getpid; write(1, 0x1000, 8) is rejected; write(1, MESSAGE, len)
-    // succeeds; exit(0).
-    let mut program = [0u8; 82];
-    program.copy_from_slice(&[
-        0x48, 0xc7, 0xc0, 0x27, 0x00, 0x00, 0x00, // mov rax, 39 (getpid)
-        0xcd, 0x80, // int 0x80
-        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
-        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
-        0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 0x1000 (outside the image)
-        0x48, 0xc7, 0xc2, 0x08, 0x00, 0x00, 0x00, // mov rdx, 8
-        0xcd, 0x80, // int 0x80
-        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
-        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
-        0x48, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rsi, data
-        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // mov rdx, length
-        0xcd, 0x80, // int 0x80
-        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
-        0x48, 0x31, 0xff, // xor rdi, rdi
-        0xcd, 0x80, // int 0x80
-    ]);
-    program[53..61].copy_from_slice(&image.data_address.to_le_bytes());
-    program[64..68].copy_from_slice(&(MESSAGE.len() as u32).to_le_bytes());
-    paging::write_frame(direct_map, first, &program).expect("cannot write the user code page");
-
-    let mut process = wuxia_core::Process::<4>::new(
+    let mut process = wuxia_core::Process::<8>::new(
         wuxia_core::process::FIRST_PROCESS_ID,
         wuxia_core::Personality::Posix,
     )
     .expect("the bootstrap process cannot be created");
-    let space = process.space_mut();
-    space
-        .map(
-            image.code_address,
-            0x1000,
-            wuxia_core::PagePermissions::USER_CODE,
-        )
-        .expect("the code region cannot be modeled");
-    space
+    for segment in image.segments() {
+        process
+            .space_mut()
+            .map(segment.address, segment.length, segment.permissions)
+            .expect("a user segment cannot be modeled");
+    }
+    process
+        .space_mut()
         .map(
             image.stack_address,
-            0x1000,
+            u64::from(wuxia_core::paging::PAGE_SIZE),
             wuxia_core::PagePermissions::USER_READ_WRITE,
         )
-        .expect("the stack region cannot be modeled");
-    space
-        .map(
-            image.data_address,
-            0x1000,
-            wuxia_core::PagePermissions::USER_READ_ONLY,
-        )
-        .expect("the data region cannot be modeled");
+        .expect("the user stack cannot be modeled");
     user::set_process(process);
     serial::write_str("WUXIA_ENTER_USER\n");
-    user::enter(image.code_address, image.stack_address + 0x1000 - 16);
+    user::enter(
+        image.entry,
+        image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16,
+    );
 }
 
 /// Panic handler for early bootstrap failures.

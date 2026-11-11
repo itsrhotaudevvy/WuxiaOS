@@ -15,6 +15,7 @@ const BOOT_MARKERS: &[&str] = &[
     "WUXIA_MEMORY_MAP_READY",
     "WUXIA_FRAME_ALLOC_OK",
     "WUXIA_HHDM_OK",
+    "WUXIA_ELF_OK",
     "WUXIA_USER_IMAGE_OK",
     "WUXIA_CR3_OK",
     "WUXIA_POST_SWITCH_PASS",
@@ -144,8 +145,35 @@ fn build_kernel() -> ExitCode {
         eprintln!("rustup is required to select the x86_64 kernel toolchain");
         return ExitCode::FAILURE;
     };
+    let lld = env::var("WUXIA_LLD").unwrap_or_else(|_| {
+        if Path::new("/opt/homebrew/bin/ld.lld").exists() {
+            "/opt/homebrew/bin/ld.lld".into()
+        } else {
+            "ld.lld".into()
+        }
+    });
+    let mut user = Command::new("cargo");
+    user.env("RUSTC", &rustc);
+    user.args([
+        "build",
+        "-p",
+        "wuxia-user",
+        "--target",
+        "x86_64-unknown-none",
+        "--target-dir",
+        "target/user",
+    ]);
+    user.env("RUSTFLAGS", format!("-C linker={lld}"));
+    if !run(&mut user) {
+        return ExitCode::FAILURE;
+    }
+
     let mut command = Command::new("cargo");
     command.env("RUSTC", rustc);
+    let user_elf = env::current_dir()
+        .unwrap_or_default()
+        .join("target/user/x86_64-unknown-none/debug/wuxia-user");
+    command.env("WUXIA_USER_ELF", user_elf);
     command.args([
         "build",
         "-p",
@@ -155,13 +183,6 @@ fn build_kernel() -> ExitCode {
         "--target-dir",
         "target/kernel",
     ]);
-    let lld = env::var("WUXIA_LLD").unwrap_or_else(|_| {
-        if Path::new("/opt/homebrew/bin/ld.lld").exists() {
-            "/opt/homebrew/bin/ld.lld".into()
-        } else {
-            "ld.lld".into()
-        }
-    });
     command.env("RUSTFLAGS", format!("-C linker={lld}"));
     if run(&mut command) {
         ExitCode::SUCCESS

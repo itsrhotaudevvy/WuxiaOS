@@ -8,20 +8,29 @@
 use core::arch::asm;
 
 use wuxia_core::Error;
+use wuxia_core::elf::{Elf64Image, ElfKind, ProgramSegment};
 use wuxia_core::hhdm::DirectMap;
 use wuxia_core::paging::{
-    ENTRIES_PER_TABLE, PAGE_SIZE, PagePermissions, PageTableReader, is_present, leaf, table_entry,
-    table_index, walk,
+    ENTRIES_PER_TABLE, PAGE_SIZE, PagePermissions, PageTableReader, USER_ADDRESS_LIMIT, is_present,
+    leaf, physical_address, table_entry, table_index, walk,
 };
 use wuxia_core::region::BumpAllocator;
 
-/// The lowest PML4 slot considered for an isolated user mapping.
-///
-/// Slot zero is skipped because bootloaders commonly keep a low identity map
-/// there; slots 1..=255 are the remaining lower-half user range.
-const FIRST_USER_SLOT: usize = 1;
-/// Slot 255 still maps below the 128 TiB user address limit.
-const LAST_USER_SLOT: usize = 255;
+/// Maximum `PT_LOAD` segments the bootstrap loader tracks.
+pub const MAX_USER_SEGMENTS: usize = 8;
+
+/// One loaded user segment and its representative leaf entry.
+#[derive(Clone, Copy, Debug)]
+pub struct UserSegment {
+    /// Page-aligned start of the mapped range.
+    pub address: u64,
+    /// Length in bytes, a multiple of the page size.
+    pub length: u64,
+    /// Leaf entry of the first page, useful for post-switch verification.
+    pub entry: u64,
+    /// Permissions the range was mapped with.
+    pub permissions: PagePermissions,
+}
 
 /// Details of the installed and activated user image.
 #[derive(Clone, Copy, Debug)]
@@ -30,46 +39,130 @@ pub struct UserImage {
     pub old_pml4: u64,
     /// Physical root loaded into CR3.
     pub new_pml4: u64,
-    /// Virtual address of the executable code page.
-    pub code_address: u64,
+    /// Entry-point virtual address taken from the ELF header.
+    pub entry: u64,
     /// Virtual address of the writable stack page.
     pub stack_address: u64,
-    /// Virtual address of the read-only data page.
-    pub data_address: u64,
-    /// Encoded leaf entry for the code page.
-    pub code_entry: u64,
     /// Encoded leaf entry for the stack page.
     pub stack_entry: u64,
-    /// Encoded leaf entry for the data page.
-    pub data_entry: u64,
+    /// Loaded segments in image order.
+    pub segments: [Option<UserSegment>; MAX_USER_SEGMENTS],
 }
 
-/// Build a three-page user subtree, clone the active root and load it into CR3.
-pub fn install_user_image<const N: usize>(
+impl UserImage {
+    /// Iterate over the loaded segments.
+    pub fn segments(&self) -> impl Iterator<Item = &UserSegment> {
+        self.segments.iter().flatten()
+    }
+}
+
+/// Map an ELF64 executable into a fresh user subtree and load it into CR3.
+///
+/// Every loadable segment gets independently allocated frames, so the image
+/// never aliases kernel memory. Writable and executable segments are rejected
+/// before any page is mapped.
+pub fn load_user_image<const N: usize>(
     allocator: &mut BumpAllocator<N>,
     direct_map: DirectMap,
-    code_physical: u64,
-    stack_physical: u64,
-    data_physical: u64,
+    bytes: &[u8],
 ) -> Result<UserImage, Error> {
+    let elf = Elf64Image::parse(bytes)?;
+    if elf.info().kind != ElfKind::Executable {
+        return Err(Error::Unsupported);
+    }
     let old_pml4 = read_cr3();
     let old_root = frame_pointer(direct_map, old_pml4)?;
-    let slot = (FIRST_USER_SLOT..=LAST_USER_SLOT)
-        .find(|index| !is_present(read_entry(old_root, *index)))
-        .ok_or(Error::TableFull)?;
-    let code_address = (slot as u64) << 39;
-    let stack_address = code_address + PAGE_SIZE;
-    let data_address = stack_address + PAGE_SIZE;
 
-    let (pdpt, code_entry, stack_entry, data_entry) = link_pages(
+    let mut plan = [None; MAX_USER_SEGMENTS];
+    let mut count = 0;
+    for index in 0..elf.program_header_count() {
+        let segment = match elf.segment(index) {
+            Ok(segment) => segment,
+            Err(Error::NotFound) => continue,
+            Err(error) => return Err(error),
+        };
+        if segment.is_writable_and_executable() {
+            return Err(Error::PermissionDenied);
+        }
+        if count >= MAX_USER_SEGMENTS {
+            return Err(Error::OutOfRange);
+        }
+        if !segment.virtual_address.is_multiple_of(PAGE_SIZE)
+            || segment.memory_end()? > USER_ADDRESS_LIMIT
+        {
+            return Err(Error::BadAddress);
+        }
+        plan[count] = Some(segment);
+        count += 1;
+    }
+    if count == 0 {
+        return Err(Error::InvalidImage);
+    }
+
+    let slot = table_index(plan[0].expect("at least one segment").virtual_address, 0)?;
+    if is_present(read_entry(old_root, slot)) {
+        return Err(Error::AlreadyExists);
+    }
+
+    let pdpt = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    zero_frame(direct_map, pdpt)?;
+
+    let mut segments = [None; MAX_USER_SEGMENTS];
+    for (index, segment) in plan[..count].iter().flatten().enumerate() {
+        if table_index(segment.virtual_address, 0)? != slot {
+            return Err(Error::Unsupported);
+        }
+        let permissions = if segment.is_writable() {
+            PagePermissions::USER_READ_WRITE
+        } else if segment.is_executable() {
+            PagePermissions::USER_CODE
+        } else {
+            PagePermissions::USER_READ_ONLY
+        };
+        let pages = segment.memory_size.div_ceil(PAGE_SIZE);
+        let mut first_entry = 0;
+        for page in 0..pages {
+            let address = segment
+                .virtual_address
+                .checked_add(page * PAGE_SIZE)
+                .ok_or(Error::OutOfRange)?;
+            if table_index(address, 0)? != slot || address >= USER_ADDRESS_LIMIT {
+                return Err(Error::BadAddress);
+            }
+            let frame = allocator.allocate_frame().ok_or(Error::TableFull)?;
+            zero_frame(direct_map, frame)?;
+            copy_segment_bytes(direct_map, frame, address, segment, bytes)?;
+            let entry = map_page(allocator, direct_map, pdpt, address, frame, permissions)?;
+            if page == 0 {
+                first_entry = entry;
+            }
+        }
+        segments[index] = Some(UserSegment {
+            address: segment.virtual_address,
+            length: pages * PAGE_SIZE,
+            entry: first_entry,
+            permissions,
+        });
+    }
+
+    let highest = segments
+        .iter()
+        .flatten()
+        .map(|segment| segment.address + segment.length)
+        .max()
+        .ok_or(Error::InvalidImage)?;
+    if highest >= USER_ADDRESS_LIMIT || table_index(highest, 0)? != slot {
+        return Err(Error::BadAddress);
+    }
+    let stack_physical = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    zero_frame(direct_map, stack_physical)?;
+    let stack_entry = map_page(
         allocator,
         direct_map,
-        code_address,
-        code_physical,
-        stack_address,
+        pdpt,
+        highest,
         stack_physical,
-        data_address,
-        data_physical,
+        PagePermissions::USER_READ_WRITE,
     )?;
 
     let new_pml4 = allocator.allocate_frame().ok_or(Error::TableFull)?;
@@ -78,21 +171,15 @@ pub fn install_user_image<const N: usize>(
     for index in 0..ENTRIES_PER_TABLE {
         write_entry(new_root, index, read_entry(old_root, index));
     }
-    write_entry(
-        new_root,
-        table_index(code_address, 0)?,
-        table_entry(pdpt, true)?,
-    );
+    write_entry(new_root, slot, table_entry(pdpt, true)?);
 
     Ok(UserImage {
         old_pml4,
         new_pml4,
-        code_address,
-        stack_address,
-        data_address,
-        code_entry,
+        entry: elf.entry(),
+        stack_address: highest,
         stack_entry,
-        data_entry,
+        segments,
     })
 }
 
@@ -143,60 +230,99 @@ pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error
     walk(&reader, read_cr3(), virtual_address)
 }
 
-/// Copy a byte slice into a physical frame through the direct map.
-pub fn write_frame(direct_map: DirectMap, frame: u64, bytes: &[u8]) -> Result<(), Error> {
-    if bytes.len() > PAGE_SIZE as usize {
+/// Copy one frame's worth of a segment's file bytes into a physical frame.
+fn copy_segment_bytes(
+    direct_map: DirectMap,
+    frame: u64,
+    page_address: u64,
+    segment: &ProgramSegment,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let segment_end = segment
+        .virtual_address
+        .checked_add(segment.file_size)
+        .ok_or(Error::OutOfRange)?;
+    let page_end = page_address + PAGE_SIZE;
+    let copy_start = segment.virtual_address.max(page_address);
+    let copy_end = segment_end.min(page_end);
+    if copy_start >= copy_end {
+        return Ok(());
+    }
+    let offset = (copy_start - page_address) as usize;
+    let file_start = segment.file_offset + (copy_start - segment.virtual_address) as usize;
+    let length = (copy_end - copy_start) as usize;
+    let source = bytes
+        .get(file_start..file_start + length)
+        .ok_or(Error::InvalidImage)?;
+    write_frame_at(direct_map, frame, offset, source)
+}
+
+/// Write bytes into a physical frame at a byte offset through the direct map.
+fn write_frame_at(
+    direct_map: DirectMap,
+    frame: u64,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    if offset + bytes.len() > PAGE_SIZE as usize {
         return Err(Error::InvalidInput);
     }
     let destination = direct_map.physical_to_virtual(frame)? as *mut u8;
-    for (offset, byte) in bytes.iter().enumerate() {
-        // SAFETY: the frame is a 4 KiB direct-mapped page and the slice length
-        // was bounded above, so every write stays inside the frame.
+    for (index, byte) in bytes.iter().enumerate() {
+        // SAFETY: the frame is a 4 KiB direct-mapped page and the bound above
+        // keeps every write inside it.
         unsafe {
-            destination.add(offset).write_volatile(*byte);
+            destination.add(offset + index).write_volatile(*byte);
         }
     }
     Ok(())
 }
 
-fn link_pages<const N: usize>(
+/// Ensure a present subtable at `index`, allocating and zeroing one if absent.
+fn ensure_table<const N: usize>(
     allocator: &mut BumpAllocator<N>,
     direct_map: DirectMap,
-    code_address: u64,
-    code_physical: u64,
-    stack_address: u64,
-    stack_physical: u64,
-    data_address: u64,
-    data_physical: u64,
-) -> Result<(u64, u64, u64, u64), Error> {
-    let pdpt = allocator.allocate_frame().ok_or(Error::TableFull)?;
-    let pd = allocator.allocate_frame().ok_or(Error::TableFull)?;
-    let pt = allocator.allocate_frame().ok_or(Error::TableFull)?;
-    for frame in [pdpt, pd, pt] {
-        zero_frame(direct_map, frame)?;
+    table: *mut u64,
+    index: usize,
+) -> Result<u64, Error> {
+    let current = read_entry(table, index);
+    if is_present(current) {
+        return Ok(physical_address(current));
     }
-    write_entry(
+    let frame = allocator.allocate_frame().ok_or(Error::TableFull)?;
+    zero_frame(direct_map, frame)?;
+    write_entry(table, index, table_entry(frame, true)?);
+    Ok(frame)
+}
+
+/// Map one 4 KiB user page, creating intermediate tables on demand.
+fn map_page<const N: usize>(
+    allocator: &mut BumpAllocator<N>,
+    direct_map: DirectMap,
+    pdpt: u64,
+    address: u64,
+    frame: u64,
+    permissions: PagePermissions,
+) -> Result<u64, Error> {
+    let pd = ensure_table(
+        allocator,
+        direct_map,
         frame_pointer(direct_map, pdpt)?,
-        table_index(code_address, 1)?,
-        table_entry(pd, true)?,
-    );
-    write_entry(
-        frame_pointer(direct_map, pd)?,
-        table_index(code_address, 2)?,
-        table_entry(pt, true)?,
-    );
-    let code_entry = leaf(code_address, code_physical, PagePermissions::USER_CODE)?;
-    let stack_entry = leaf(
-        stack_address,
-        stack_physical,
-        PagePermissions::USER_READ_WRITE,
+        table_index(address, 1)?,
     )?;
-    let data_entry = leaf(data_address, data_physical, PagePermissions::USER_READ_ONLY)?;
-    let pointer = frame_pointer(direct_map, pt)?;
-    write_entry(pointer, table_index(code_address, 3)?, code_entry);
-    write_entry(pointer, table_index(stack_address, 3)?, stack_entry);
-    write_entry(pointer, table_index(data_address, 3)?, data_entry);
-    Ok((pdpt, code_entry, stack_entry, data_entry))
+    let pt = ensure_table(
+        allocator,
+        direct_map,
+        frame_pointer(direct_map, pd)?,
+        table_index(address, 2)?,
+    )?;
+    let entry = leaf(address, frame, permissions)?;
+    write_entry(
+        frame_pointer(direct_map, pt)?,
+        table_index(address, 3)?,
+        entry,
+    );
+    Ok(entry)
 }
 
 fn zero_frame(direct_map: DirectMap, frame: u64) -> Result<(), Error> {

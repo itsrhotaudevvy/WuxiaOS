@@ -13,10 +13,10 @@ use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 const INTERRUPTS_ENABLED: u64 = 1 << 1;
 
 /// The single bootstrap process.
-static mut PROCESS: Option<Process<4>> = None;
+static mut PROCESS: Option<Process<8>> = None;
 
 /// Install the bootstrap process after its address space is populated.
-pub fn set_process(process: Process<4>) {
+pub fn set_process(process: Process<8>) {
     // SAFETY: written once before ring 3 starts and read only afterwards.
     unsafe {
         *addr_of_mut!(PROCESS) = Some(process);
