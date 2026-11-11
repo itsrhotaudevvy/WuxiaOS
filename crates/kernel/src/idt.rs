@@ -140,6 +140,10 @@ pub struct InterruptFrame {
     pub cs: u64,
     /// Saved flags.
     pub rflags: u64,
+    /// Saved stack pointer. Present only for a trap taken from CPL3.
+    pub rsp: u64,
+    /// Saved stack selector. Present only for a trap taken from CPL3.
+    pub ss: u64,
 }
 
 /// Install handlers for the vectors the bootstrap can currently service.
@@ -299,14 +303,21 @@ fn service_syscall(frame: &mut InterruptFrame) {
             frame.rax = crate::user::process_id();
             serial::write_hex(frame.rax);
         }
+        Ok(wuxia_core::syscall::PosixRequest::Yield) => {
+            frame.rax = 0;
+            crate::sched::yield_current(frame);
+        }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
-            if !crate::user::exit_process(code) {
+            if crate::sched::current() == 0 && !crate::user::exit_process(code) {
                 serial::write_str("WUXIA_SYSCALL_INVALID\n");
                 frame.rax = u64::MAX;
                 return;
             }
             serial::write_str("WUXIA_SYSCALL_EXIT\n");
             serial::write_hex(code);
+            if crate::sched::exit_current(frame) {
+                return;
+            }
             if let Some(image) = crate::user::next_image() {
                 serial::write_str("WUXIA_FAULT_TEST\n");
                 crate::paging::activate(image.new_pml4);

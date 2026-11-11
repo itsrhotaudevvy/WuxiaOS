@@ -27,17 +27,31 @@ core::arch::global_asm!(
     "lea rsi, [rip + {message}]",
     "mov rdx, 16",
     "int 0x80",
+    // yield: the scheduler runs the second process, then resumes here
+    "mov rax, 24",
+    "int 0x80",
+    // write(1, second, 15): proves this process resumed
+    "mov rax, 1",
+    "mov rdi, 1",
+    "lea rsi, [rip + {second}]",
+    "mov rdx, 15",
+    "int 0x80",
     // exit(0)
     "mov rax, 60",
     "xor rdi, rdi",
     "int 0x80",
     "ud2",
     message = sym MESSAGE,
+    second = sym SECOND,
 );
 
 /// Greeting written to the serial console through `write(1, …)`.
 #[used]
 static MESSAGE: [u8; 16] = *b"HELLO FROM USER\n";
+
+/// Written after the yield resumes, proving the saved frame was restored.
+#[used]
+static SECOND: [u8; 15] = *b"A SECOND PHASE\n";
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {

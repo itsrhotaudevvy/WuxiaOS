@@ -125,8 +125,11 @@ pub const fn table_entry(frame: u64, user: bool) -> Result<u64> {
 }
 
 /// Return the table index for one of the four levels (`0` is PML4).
+///
+/// Only the index bits matter, so an address inside a page is as valid as the
+/// page base. Callers that map memory still validate alignment separately.
 pub const fn table_index(virtual_address: u64, level: usize) -> Result<usize> {
-    if !is_user_address(virtual_address) || level >= LEVELS {
+    if virtual_address == 0 || virtual_address >= USER_ADDRESS_LIMIT || level >= LEVELS {
         return Err(Error::BadAddress);
     }
     Ok(((virtual_address >> (39 - level * 9)) & 0x1ff) as usize)
@@ -172,7 +175,9 @@ pub trait PageTableReader {
 /// [`Error::Unsupported`] because the bootstrap map is 4 KiB only. Absent
 /// entries return [`Error::NotFound`].
 pub fn walk<R: PageTableReader>(reader: &R, root: u64, virtual_address: u64) -> Result<u64> {
-    if !is_user_address(virtual_address) {
+    // An address inside a mapped page resolves through the same indices as the
+    // page base, so only the range is validated here.
+    if virtual_address == 0 || virtual_address >= USER_ADDRESS_LIMIT {
         return Err(Error::BadAddress);
     }
     let mut table = root;
@@ -306,7 +311,10 @@ mod tests {
         assert_eq!(table_index(address, 3), Ok(359));
         assert_eq!(table_index(address, 4), Err(Error::BadAddress));
         assert_eq!(table_index(0, 0), Err(Error::BadAddress));
-        assert_eq!(table_index(0x1001, 0), Err(Error::BadAddress));
+        assert_eq!(
+            table_index(0x0000_7f12_3456_700f, 3),
+            Ok(table_index(0x0000_7f12_3456_7000, 3).unwrap())
+        );
     }
 
     #[test]
@@ -374,6 +382,11 @@ mod tests {
             ],
         };
         assert_eq!(walk(&reader, 0x1000, 0x400000), Ok(leaf_entry));
+        assert_eq!(
+            walk(&reader, 0x1000, 0x400fff),
+            Ok(leaf_entry),
+            "an address inside a mapped page must resolve"
+        );
     }
 
     #[test]
@@ -405,6 +418,10 @@ mod tests {
             walk(&null_table, 0x1000, 0x400000),
             Err(Error::InvalidState)
         );
-        assert_eq!(walk(&null_table, 0x1000, 0x1001), Err(Error::BadAddress));
+        assert_eq!(walk(&null_table, 0x1000, 0), Err(Error::BadAddress));
+        assert_eq!(
+            walk(&null_table, 0x1000, USER_ADDRESS_LIMIT),
+            Err(Error::BadAddress)
+        );
     }
 }

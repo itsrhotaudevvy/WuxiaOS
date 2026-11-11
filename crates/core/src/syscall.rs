@@ -29,6 +29,8 @@ pub enum PosixCall {
     Write = 1,
     /// Close a process-local handle.
     Close = 3,
+    /// Yield the processor to another runnable thread.
+    Yield = 24,
     /// Return the process identifier.
     GetPid = 39,
     /// Terminate the calling thread or process.
@@ -41,6 +43,7 @@ impl PosixCall {
         match raw {
             1 => Some(Self::Write),
             3 => Some(Self::Close),
+            24 => Some(Self::Yield),
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
             _ => None,
@@ -72,6 +75,8 @@ pub enum PosixRequest {
         /// Descriptor to close.
         descriptor: u32,
     },
+    /// Yield the processor to another runnable thread.
+    Yield,
     /// Return the process identifier.
     GetPid,
     /// Terminate the calling process with a status code.
@@ -92,6 +97,7 @@ impl PosixRequest {
             PosixCall::Close => Ok(Self::Close {
                 descriptor: decode_descriptor(registers.args[0])?,
             }),
+            PosixCall::Yield => Ok(Self::Yield),
             PosixCall::GetPid => Ok(Self::GetPid),
             PosixCall::Exit => Ok(Self::Exit {
                 code: registers.args[0],
@@ -127,6 +133,17 @@ mod tests {
             args: [1, 2, 3, 4, 5, 6],
         };
         assert_eq!(regs.args[5], 6);
+    }
+
+    #[test]
+    fn yield_decodes_without_arguments() {
+        let registers = Registers {
+            args: [0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            PosixRequest::decode(24, &registers),
+            Ok(PosixRequest::Yield)
+        );
     }
 
     #[test]

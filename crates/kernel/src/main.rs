@@ -18,6 +18,7 @@ mod idt;
 mod interrupts;
 mod memory;
 mod paging;
+mod sched;
 mod user;
 
 #[used]
@@ -49,6 +50,9 @@ static USER_ELF: &[u8] = include_bytes!(env!("WUXIA_USER_ELF_PATH"));
 
 /// Ring-3 fault self-test embedded by the build script.
 static FAULT_ELF: &[u8] = include_bytes!(env!("WUXIA_FAULT_ELF_PATH"));
+
+/// Second scheduler participant embedded by the build script.
+static SECOND_ELF: &[u8] = include_bytes!(env!("WUXIA_SECOND_ELF_PATH"));
 
 /// Limine's documented kernel entry point.
 #[unsafe(no_mangle)]
@@ -107,6 +111,9 @@ pub extern "C" fn _start() -> ! {
     let fault = paging::load_user_image(&mut allocator, direct_map, FAULT_ELF)
         .expect("cannot load the fault self-test image");
 
+    let second = paging::load_user_image(&mut allocator, direct_map, SECOND_ELF)
+        .expect("cannot load the second process image");
+
     let reclaimed = allocator.allocate().expect("no frame to reclaim");
     allocator
         .free(reclaimed)
@@ -160,11 +167,19 @@ pub extern "C" fn _start() -> ! {
         .expect("the user stack cannot be modeled");
     user::set_process(process);
     user::set_next_image(fault);
-    serial::write_str("WUXIA_ENTER_USER\n");
-    user::enter(
-        image.entry,
-        image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16,
+    let stack_top = image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
+    let second_stack_top = second.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16;
+    assert_eq!(
+        sched::register(image.new_pml4, image.entry, stack_top),
+        Some(0),
+        "the bootstrap thread cannot be registered"
     );
+    assert!(
+        sched::register(second.new_pml4, second.entry, second_stack_top).is_some(),
+        "the second thread cannot be registered"
+    );
+    serial::write_str("WUXIA_ENTER_USER\n");
+    user::enter(image.entry, stack_top);
 }
 
 /// Panic handler for early bootstrap failures.

@@ -33,8 +33,15 @@ fn main() {
         "WUXIA_FAULT_ELF",
         &workspace.join("target/user/x86_64-unknown-none/debug/wuxia-fault"),
     );
+    let second = embed(
+        &out,
+        "second_elf.bin",
+        "WUXIA_SECOND_ELF",
+        &workspace.join("target/user/x86_64-unknown-none/debug/wuxia-second"),
+    );
     println!("cargo:rustc-env=WUXIA_USER_ELF_PATH={}", user.display());
     println!("cargo:rustc-env=WUXIA_FAULT_ELF_PATH={}", fault.display());
+    println!("cargo:rustc-env=WUXIA_SECOND_ELF_PATH={}", second.display());
 }
 
 /// Copy a program into the build directory and return the embedded path.

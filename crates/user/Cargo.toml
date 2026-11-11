@@ -18,3 +18,7 @@ path = "src/main.rs"
 [[bin]]
 name = "wuxia-fault"
 path = "src/bin/fault.rs"
+
+[[bin]]
+name = "wuxia-second"
+path = "src/bin/second.rs"

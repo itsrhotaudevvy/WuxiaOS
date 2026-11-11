@@ -25,6 +25,10 @@ const BOOT_MARKERS: &[&str] = &[
     "WUXIA_SYSCALL_GETPID",
     "WUXIA_SYSCALL_REJECTED",
     "WUXIA_SYSCALL_WRITE_OK",
+    "HELLO FROM USER",
+    "A SECOND PHASE",
+    "SECOND PROCESS",
+    "WUXIA_YIELD_SWITCH",
     "WUXIA_SYSCALL_EXIT",
     "WUXIA_FAULT_TEST",
     "WUXIA_USER_PAGE_FAULT",
@@ -179,6 +183,7 @@ fn build_kernel() -> ExitCode {
         .join("target/user/x86_64-unknown-none/debug");
     command.env("WUXIA_USER_ELF", user_dir.join("wuxia-user"));
     command.env("WUXIA_FAULT_ELF", user_dir.join("wuxia-fault"));
+    command.env("WUXIA_SECOND_ELF", user_dir.join("wuxia-second"));
     command.args([
         "build",
         "-p",
