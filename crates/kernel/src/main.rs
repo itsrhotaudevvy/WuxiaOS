@@ -22,6 +22,7 @@ mod idt;
 mod imports;
 mod interrupts;
 mod irq;
+mod irql;
 mod log;
 mod memory;
 mod net;
@@ -530,9 +531,43 @@ pub extern "C" fn _start() -> ! {
     );
     log::write_str("WUXIA_POOL_OK\n");
     log::write_hex(block);
+    // The driver raised the interrupt level to dispatch level, read it, lowered it
+    // again and read it a second time, so the raise reached the same state the rest
+    // of the kernel reads rather than a driver-local copy.
+    // SAFETY: the three bytes are inside the driver's writable data section.
+    let (replaced, while_raised, after_lowering) = unsafe {
+        (
+            core::ptr::read_volatile((driver.base + 0x20c0) as *const u8),
+            core::ptr::read_volatile((driver.base + 0x20c1) as *const u8),
+            core::ptr::read_volatile((driver.base + 0x20c2) as *const u8),
+        )
+    };
+    assert_eq!(
+        replaced,
+        wuxia_core::irql::PASSIVE_LEVEL,
+        "the raise replaced another level"
+    );
+    assert_eq!(
+        while_raised,
+        wuxia_core::irql::DISPATCH_LEVEL,
+        "the raise did not take effect"
+    );
+    assert_eq!(
+        after_lowering,
+        wuxia_core::irql::PASSIVE_LEVEL,
+        "the lower did not take effect"
+    );
+    assert_eq!(
+        crate::irql::current(),
+        wuxia_core::irql::PASSIVE_LEVEL,
+        "the boot left the processor raised"
+    );
+    log::write_str("WUXIA_IRQL_OK\n");
+    log::write_hex(u64::from(while_raised));
+    log::write_hex(u64::from(crate::irql::current()));
     log::write_str("WUXIA_DRIVER_IMPORTS\n");
     log::write_hex(driver.imports as u64);
-    assert_eq!(driver.imports, 7, "not every import was bound");
+    assert_eq!(driver.imports, 9, "not every import was bound");
     // The driver asked RtlZeroMemory to clear sixteen bytes of its own data; the
     // boot checks the result, which proves the routine ran with both arguments.
     let mut cleared = 0;

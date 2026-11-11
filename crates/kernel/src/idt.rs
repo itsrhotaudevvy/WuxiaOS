@@ -349,8 +349,14 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
         0x80 => service_syscall(frame),
         vector if (0x21..=0x2f).contains(&vector) => {
             // A line the 8259 owns: acknowledge the line, the device and the APIC.
+            // The body runs at dispatch level, so nothing raised here can itself be
+            // interrupted at a level that would re-enter it.
             let line = (vector - 0x21) as u8 + 1;
-            if crate::irq::service_line(line).is_err() {
+            let previous = crate::irql::raise(wuxia_core::irql::DISPATCH_LEVEL)
+                .unwrap_or_else(crate::irql::current);
+            let serviced = crate::irq::service_line(line);
+            crate::irql::lower(previous);
+            if serviced.is_err() {
                 serial::write_str("WUXIA_IRQ_ACK_FAILED\n");
                 unsafe {
                     core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
@@ -358,7 +364,11 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
             }
         }
         vector if vector == u64::from(crate::apic::DEVICE_VECTOR) => {
-            if crate::irq::service().is_err() {
+            let previous = crate::irql::raise(wuxia_core::irql::DISPATCH_LEVEL)
+                .unwrap_or_else(crate::irql::current);
+            let serviced = crate::irq::service();
+            crate::irql::lower(previous);
+            if serviced.is_err() {
                 // A handler that cannot acknowledge the APIC would be re-entered
                 // forever, so a failure here is reported and interrupts stop.
                 serial::write_str("WUXIA_IRQ_ACK_FAILED\n");

@@ -24,7 +24,7 @@ use crate::log;
 const MAX_MESSAGE: usize = 128;
 
 /// Names a driver may import, in the order they are offered.
-pub const EXPORT_NAMES: [&str; 7] = [
+pub const EXPORT_NAMES: [&str; 9] = [
     "DbgPrint",
     "RtlZeroMemory",
     "KeGetCurrentIrql",
@@ -32,6 +32,8 @@ pub const EXPORT_NAMES: [&str; 7] = [
     "IoCreateDevice",
     "ExAllocatePoolWithTag",
     "ExFreePoolWithTag",
+    "KfRaiseIrql",
+    "KeLowerIrql",
 ];
 
 /// Where driver device mappings start.
@@ -85,6 +87,8 @@ unsafe extern "C" {
     fn wuxia_ddi_rtl_zero_memory(destination: *mut u8, length: usize) -> u64;
     fn wuxia_ddi_ke_get_current_irql() -> u64;
     fn wuxia_ddi_mm_map_io_space(physical: u64, length: u64, cache: u32) -> u64;
+    fn wuxia_ddi_kf_raise_irql(level: u8) -> u8;
+    fn wuxia_ddi_ke_lower_irql(level: u8);
     fn wuxia_ddi_ex_allocate_pool_with_tag(size: u64, tag: u32, pool_type: u32) -> u64;
     fn wuxia_ddi_ex_free_pool_with_tag(address: u64, tag: u32) -> u32;
     fn wuxia_ddi_io_create_device(
@@ -155,6 +159,24 @@ core::arch::global_asm!(
     "call {create_device}",
     "add rsp, 8",
     "ret",
+    // `KfRaiseIrql` answers with the level it replaced in `al`, so the thunk has to
+    // move the answer back into the register a Windows caller reads it from.
+    ".globl wuxia_ddi_kf_raise_irql",
+    ".p2align 4",
+    "wuxia_ddi_kf_raise_irql:",
+    "sub rsp, 0x28",
+    "movzx edi, cl",
+    "call {raise_irql}",
+    "add rsp, 0x28",
+    "ret",
+    ".globl wuxia_ddi_ke_lower_irql",
+    ".p2align 4",
+    "wuxia_ddi_ke_lower_irql:",
+    "sub rsp, 0x28",
+    "movzx edi, cl",
+    "call {lower_irql}",
+    "add rsp, 0x28",
+    "ret",
     ".globl wuxia_ddi_ex_allocate_pool_with_tag",
     ".p2align 4",
     "wuxia_ddi_ex_allocate_pool_with_tag:",
@@ -179,6 +201,8 @@ core::arch::global_asm!(
     irql = sym ke_get_current_irql,
     map_io_space = sym mm_map_io_space,
     create_device = sym io_create_device,
+    raise_irql = sym kf_raise_irql,
+    lower_irql = sym ke_lower_irql,
     allocate_pool = sym ex_allocate_pool_with_tag,
     free_pool = sym ex_free_pool_with_tag,
 );
@@ -215,9 +239,26 @@ extern "sysv64" fn rtl_zero_memory(destination: *mut u8, length: usize) -> u64 {
     0
 }
 
-/// Report the interrupt request level as passive, which is where the loader runs.
+/// Report the interrupt request level the processor is at.
 extern "sysv64" fn ke_get_current_irql() -> u64 {
-    0
+    u64::from(crate::irql::current())
+}
+
+/// `KfRaiseIrql`: raise to `level` and answer with the level it replaced.
+///
+/// A raise that cannot be honoured - a level a processor cannot hold, or one below
+/// the level already held - leaves the processor where it was and answers with the
+/// current level, so a caller that lowers back gets the same value it was given.
+extern "sysv64" fn kf_raise_irql(level: u8) -> u64 {
+    match crate::irql::raise(level) {
+        Some(previous) => u64::from(previous),
+        None => u64::from(crate::irql::current()),
+    }
+}
+
+/// `KeLowerIrql`: lower to the level a previous raise returned.
+extern "sysv64" fn ke_lower_irql(level: u8) {
+    crate::irql::lower(level);
 }
 
 /// Map a device's registers into the supervisor address space.
@@ -436,6 +477,8 @@ pub fn resolve(module: &str, name: &str) -> Result<u64, wuxia_core::Error> {
         "IoCreateDevice" => Ok(wuxia_ddi_io_create_device as usize as u64),
         "ExAllocatePoolWithTag" => Ok(wuxia_ddi_ex_allocate_pool_with_tag as usize as u64),
         "ExFreePoolWithTag" => Ok(wuxia_ddi_ex_free_pool_with_tag as usize as u64),
+        "KfRaiseIrql" => Ok(wuxia_ddi_kf_raise_irql as usize as u64),
+        "KeLowerIrql" => Ok(wuxia_ddi_ke_lower_irql as usize as u64),
         _ => Err(wuxia_core::Error::NotFound),
     }
 }

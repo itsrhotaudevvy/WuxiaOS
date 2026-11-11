@@ -29,6 +29,7 @@ pub mod hhdm;
 pub mod image;
 pub mod initramfs;
 pub mod initstack;
+pub mod irql;
 pub mod klog;
 pub mod load;
 pub mod memory;
