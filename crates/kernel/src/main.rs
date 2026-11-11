@@ -46,6 +46,9 @@ static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 /// Ring-3 ELF program embedded by the build script.
 static USER_ELF: &[u8] = include_bytes!(env!("WUXIA_USER_ELF_PATH"));
 
+/// Ring-3 fault self-test embedded by the build script.
+static FAULT_ELF: &[u8] = include_bytes!(env!("WUXIA_FAULT_ELF_PATH"));
+
 /// Limine's documented kernel entry point.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -97,6 +100,9 @@ pub extern "C" fn _start() -> ! {
         serial::write_hex(segment.address);
     }
 
+    let fault = paging::load_user_image(&mut allocator, direct_map, FAULT_ELF)
+        .expect("cannot load the fault self-test image");
+
     paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");
     serial::write_hex(paging::read_cr3());
@@ -138,6 +144,7 @@ pub extern "C" fn _start() -> ! {
         )
         .expect("the user stack cannot be modeled");
     user::set_process(process);
+    user::set_next_image(fault);
     serial::write_str("WUXIA_ENTER_USER\n");
     user::enter(
         image.entry,

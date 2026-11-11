@@ -14,3 +14,7 @@ workspace = true
 [[bin]]
 name = "wuxia-user"
 path = "src/main.rs"
+
+[[bin]]
+name = "wuxia-fault"
+path = "src/bin/fault.rs"

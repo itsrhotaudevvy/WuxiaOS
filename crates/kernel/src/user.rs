@@ -15,6 +15,9 @@ const INTERRUPTS_ENABLED: u64 = 1 << 1;
 /// The single bootstrap process.
 static mut PROCESS: Option<Process<8>> = None;
 
+/// The image started after the bootstrap process exits.
+static mut NEXT_IMAGE: Option<crate::paging::UserImage> = None;
+
 /// Install the bootstrap process after its address space is populated.
 pub fn set_process(process: Process<8>) {
     // SAFETY: written once before ring 3 starts and read only afterwards.
@@ -59,6 +62,20 @@ pub fn close_descriptor(descriptor: u32) -> bool {
             None => false,
         }
     }
+}
+
+/// Store the image started after the bootstrap process exits.
+pub fn set_next_image(image: crate::paging::UserImage) {
+    // SAFETY: written once before ring 3 starts.
+    unsafe {
+        *addr_of_mut!(NEXT_IMAGE) = Some(image);
+    }
+}
+
+/// Return the image started after the bootstrap process exits.
+pub fn next_image() -> Option<crate::paging::UserImage> {
+    // SAFETY: the image is written once before ring 3 starts.
+    unsafe { read_volatile(addr_of!(NEXT_IMAGE)) }
 }
 
 /// Mark the current process exited. Returns false if it is absent or already

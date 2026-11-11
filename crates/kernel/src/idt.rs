@@ -258,6 +258,17 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
         }
         14 => {
             let address = read_cr2();
+            if frame.cs & 3 == 3 {
+                // A fault raised by ring 3 terminates the process; the kernel
+                // keeps running and reports the fault instead of dying with it.
+                serial::write_str("WUXIA_USER_PAGE_FAULT\n");
+                serial::write_hex(frame.error);
+                serial::write_hex(address);
+                serial::write_hex(frame.rip);
+                serial::write_str("WUXIA_TEST_PASS\n");
+                serial::debug_exit(0x10);
+                halt();
+            }
             serial::write_str("WUXIA_PAGE_FAULT\n");
             serial::write_hex(frame.error);
             serial::write_hex(address);
@@ -293,6 +304,14 @@ fn service_syscall(frame: &mut InterruptFrame) {
             }
             serial::write_str("WUXIA_SYSCALL_EXIT\n");
             serial::write_hex(code);
+            if let Some(image) = crate::user::next_image() {
+                serial::write_str("WUXIA_FAULT_TEST\n");
+                crate::paging::activate(image.new_pml4);
+                crate::user::enter(
+                    image.entry,
+                    image.stack_address + u64::from(wuxia_core::paging::PAGE_SIZE) - 16,
+                );
+            }
             serial::write_str("WUXIA_TEST_PASS\n");
             serial::debug_exit(0x10);
             halt();

@@ -23,6 +23,7 @@ An experimental Rust operating-system kernel with two explicit userspace persona
 - The GDT, user segments, TSS and an IDT with CPL0/CPL3 gates are loaded; the `int3` self-test returns through the full stub path.
 - A separate `wuxia-user` crate is linked at 512 GiB and embedded in the kernel. The loader parses its ELF64 program headers, allocates and zero-fills frames per segment, applies per-segment permissions and maps the entry point.
 - The kernel enters CPL3 with `iretq` at the ELF entry point, rejects an out-of-region `write` pointer, copies a real message from user memory to the serial console through `write(1, …)` and ends on `exit(0)`.
+- After that process exits, a second embedded image faults on an unmapped write. The page-fault handler recognises a CPL3 fault, reports the error code, faulting address and instruction pointer and terminates the process while the kernel stays alive.
 - No POSIX userspace, filesystem, scheduler, network stack, Windows application or Windows driver support exists yet.
 
 ## Build and test

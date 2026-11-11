@@ -24,6 +24,8 @@ const BOOT_MARKERS: &[&str] = &[
     "WUXIA_SYSCALL_REJECTED",
     "WUXIA_SYSCALL_WRITE_OK",
     "WUXIA_SYSCALL_EXIT",
+    "WUXIA_FAULT_TEST",
+    "WUXIA_USER_PAGE_FAULT",
     "WUXIA_TEST_PASS",
 ];
 
@@ -170,10 +172,11 @@ fn build_kernel() -> ExitCode {
 
     let mut command = Command::new("cargo");
     command.env("RUSTC", rustc);
-    let user_elf = env::current_dir()
+    let user_dir = env::current_dir()
         .unwrap_or_default()
-        .join("target/user/x86_64-unknown-none/debug/wuxia-user");
-    command.env("WUXIA_USER_ELF", user_elf);
+        .join("target/user/x86_64-unknown-none/debug");
+    command.env("WUXIA_USER_ELF", user_dir.join("wuxia-user"));
+    command.env("WUXIA_FAULT_ELF", user_dir.join("wuxia-fault"));
     command.args([
         "build",
         "-p",
