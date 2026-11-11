@@ -75,7 +75,20 @@ WUXIA_SYSCALL_EXIT
 WUXIA_TEST_PASS
 ```
 
-On Apple Silicon Homebrew, `xtask` selects `rustup which rustc` and Homebrew LLD if present because Homebrew's compiler does not share rustup's target sysroot. Set `WUXIA_LLD` to override the linker. The build currently assumes a standard Limine installation under `/opt/homebrew/share/limine`; a portable Limine-data discovery mechanism is planned.
+On Apple Silicon Homebrew, `xtask` selects `rustup which rustc` and Homebrew LLD if present because Homebrew's compiler does not share rustup's target sysroot. Set `WUXIA_LLD` to override the linker.
+
+`iso` locates the Limine data files (`limine-bios.sys`, `limine-bios-cd.bin`, `limine-uefi-cd.bin` and `BOOTX64.EFI`) by taking the first location that contains all of them, checked in this order:
+
+1. `WUXIA_LIMINE_DIR`, if set. If it is set but lacks any of those files, the build fails instead of falling back.
+2. The directory printed by `limine --print-datadir` (Limine 8 and later).
+3. `<prefix>/share/limine`, where `<prefix>/bin/limine` is the `limine` binary found on `PATH`.
+4. `/opt/homebrew/share/limine`, `/usr/local/share/limine` and `/usr/share/limine`.
+
+If no location qualifies, the error lists every location tried. To use a Limine installation outside these locations, set `WUXIA_LIMINE_DIR` to its data directory:
+
+```sh
+WUXIA_LIMINE_DIR=/path/to/limine/share/limine cargo run -p wuxia-xtask -- iso
+```
 
 ## Design direction
 
