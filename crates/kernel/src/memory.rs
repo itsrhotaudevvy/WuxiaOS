@@ -121,6 +121,9 @@ impl<const N: usize> BumpAllocator<N> {
     /// Allocate the next unique physical frame.
     pub fn allocate_frame(&mut self) -> Option<u64> {
         for index in 0..self.len {
+            if self.regions[index].start == 0 && self.cursors[index] == 0 {
+                self.cursors[index] = 4096;
+            }
             if self.cursors[index] < self.regions[index].length {
                 let address = self.regions[index].start + self.cursors[index];
                 self.cursors[index] += 4096;

@@ -147,6 +147,38 @@ impl<'a> PeImage<'a> {
                 return Err(Error::InvalidImage);
             }
         }
+        for first in 0..self.section_count as usize {
+            let a = self.section(first)?;
+            let a_virtual_end = a
+                .virtual_address
+                .checked_add(a.virtual_size.max(a.raw_size))
+                .ok_or(Error::InvalidImage)?;
+            let a_raw_end = a
+                .raw_offset
+                .checked_add(a.raw_size as usize)
+                .ok_or(Error::InvalidImage)?;
+            for other_index in (first + 1)..self.section_count as usize {
+                let b = self.section(other_index)?;
+                let b_end = b
+                    .virtual_address
+                    .checked_add(b.virtual_size.max(b.raw_size))
+                    .ok_or(Error::InvalidImage)?;
+                if a.virtual_address < b_end && b.virtual_address < a_virtual_end {
+                    return Err(Error::InvalidImage);
+                }
+                let b_raw_end = b
+                    .raw_offset
+                    .checked_add(b.raw_size as usize)
+                    .ok_or(Error::InvalidImage)?;
+                if a.raw_size != 0
+                    && b.raw_size != 0
+                    && a.raw_offset < b_raw_end
+                    && b.raw_offset < a_raw_end
+                {
+                    return Err(Error::InvalidImage);
+                }
+            }
+        }
         let image_base = match self.kind {
             PeKind::Pe32 => read_u32(self.bytes, self.optional_offset + 28)? as u64,
             PeKind::Pe32Plus => read_u64(self.bytes, self.optional_offset + 24)?,
