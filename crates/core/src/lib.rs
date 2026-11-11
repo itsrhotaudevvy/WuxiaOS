@@ -14,6 +14,7 @@ pub mod elf;
 pub mod errno;
 pub mod error;
 pub mod frames;
+pub mod futex;
 pub mod hhdm;
 pub mod image;
 pub mod load;
