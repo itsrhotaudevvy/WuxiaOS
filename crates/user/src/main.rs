@@ -15,6 +15,11 @@ core::arch::global_asm!(
     // getpid
     "mov rax, 39",
     "int 0x80",
+    // Busy loop: long enough for the timer to preempt this process.
+    "mov rcx, 50000000",
+    "2:",
+    "dec rcx",
+    "jnz 2b",
     // write(1, 0x1000, 8): outside the mapped image and must be rejected
     "mov rax, 1",
     "mov rdi, 1",

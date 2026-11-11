@@ -15,6 +15,9 @@ core::arch::global_asm!(
     "lea rsi, [rip + {message}]",
     "mov rdx, 15",
     "int 0x80",
+    // yield back to the first process
+    "mov rax, 24",
+    "int 0x80",
     // exit(0)
     "mov rax, 60",
     "xor rdi, rdi",

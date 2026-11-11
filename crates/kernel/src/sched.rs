@@ -88,6 +88,17 @@ pub fn current() -> usize {
 ///
 /// Returns false when no other thread is runnable, leaving `frame` untouched.
 pub fn yield_current(frame: &mut InterruptFrame) -> bool {
+    switch(frame, false)
+}
+
+/// Preempt the running thread from the timer interrupt.
+///
+/// Returns false when no other thread is runnable, leaving `frame` untouched.
+pub fn preempt(frame: &mut InterruptFrame) -> bool {
+    switch(frame, true)
+}
+
+fn switch(frame: &mut InterruptFrame, preempted: bool) -> bool {
     // SAFETY: traps are non-nesting, so the scheduler is the only writer.
     unsafe {
         let threads = &mut *addr_of_mut!(THREADS);
@@ -95,18 +106,22 @@ pub fn yield_current(frame: &mut InterruptFrame) -> bool {
         if let Some(thread) = threads[current].as_mut() {
             thread.frame = *frame;
         }
-        let count = read_volatile(addr_of!(COUNT));
-        let next = (1..=count)
-            .map(|offset| (current + offset) % count)
-            .find(|index| threads[*index].is_some_and(|thread| thread.runnable));
-        let Some(next) = next else {
+        let mut runnable = [false; MAX_THREADS];
+        for (index, slot) in threads.iter().enumerate() {
+            runnable[index] = slot.is_some_and(|thread| thread.runnable);
+        }
+        let Some(next) = wuxia_core::schedule::next_runnable(current, &runnable) else {
             return false;
         };
         let thread = threads[next].expect("a runnable thread exists");
         *frame = thread.frame;
         write_volatile(addr_of_mut!(CURRENT), next);
         crate::paging::activate(thread.root);
-        serial::write_str("WUXIA_YIELD_SWITCH\n");
+        if preempted {
+            serial::write_str("WUXIA_PREEMPT_SWITCH\n");
+        } else {
+            serial::write_str("WUXIA_YIELD_SWITCH\n");
+        }
         serial::write_hex(next as u64);
         true
     }
@@ -123,11 +138,11 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
         if let Some(thread) = threads[current].as_mut() {
             thread.runnable = false;
         }
-        let count = read_volatile(addr_of!(COUNT));
-        let next = (1..=count)
-            .map(|offset| (current + offset) % count)
-            .find(|index| threads[*index].is_some_and(|thread| thread.runnable));
-        let Some(next) = next else {
+        let mut runnable = [false; MAX_THREADS];
+        for (index, slot) in threads.iter().enumerate() {
+            runnable[index] = slot.is_some_and(|thread| thread.runnable);
+        }
+        let Some(next) = wuxia_core::schedule::next_runnable(current, &runnable) else {
             return false;
         };
         let thread = threads[next].expect("a runnable thread exists");

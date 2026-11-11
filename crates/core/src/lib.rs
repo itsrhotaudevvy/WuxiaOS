@@ -21,6 +21,7 @@ pub mod paging;
 pub mod personality;
 pub mod process;
 pub mod region;
+pub mod schedule;
 pub mod syscall;
 
 pub use address_space::AddressSpace;

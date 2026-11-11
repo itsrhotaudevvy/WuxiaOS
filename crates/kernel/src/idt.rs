@@ -282,7 +282,12 @@ extern "C" fn dispatch(frame: *mut InterruptFrame) {
             serial::debug_exit(1);
             halt();
         }
-        0x20 => crate::interrupts::tick(),
+        0x20 => {
+            crate::interrupts::tick();
+            if frame.cs & 3 == 3 {
+                crate::sched::preempt(frame);
+            }
+        }
         0x80 => service_syscall(frame),
         _ => {
             serial::write_str("WUXIA_UNEXPECTED_VECTOR\n");
