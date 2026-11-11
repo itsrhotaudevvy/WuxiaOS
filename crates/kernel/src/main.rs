@@ -20,6 +20,7 @@ mod imports;
 mod interrupts;
 mod log;
 mod memory;
+mod net;
 mod paging;
 mod pci;
 mod sched;
@@ -159,21 +160,56 @@ pub extern "C" fn _start() -> ! {
     log::write_str("WUXIA_PCI_OK\n");
     log::write_hex(devices as u64);
     if let Some(physical) = network {
-        let window = paging::map_mmio(&mut allocator, direct_map, 0, physical, 1)
+        // The register file spans more than one page: transmit descriptors and
+        // the receive address registers are several pages into BAR0.
+        let pages = u64::from(wuxia_core::net::BAR_SIZE) / wuxia_core::paging::PAGE_SIZE;
+        let window = paging::map_mmio(&mut allocator, direct_map, 0, physical, pages)
             .expect("the network device window cannot be mapped");
         log::write_str("WUXIA_MMIO_OK\n");
         log::write_hex(window);
-        // SAFETY: the window names one mapped, uncached device page. The
-        // registers are read-only here and a slave device cannot fault the CPU.
-        let (control, status) = unsafe {
-            (
-                core::ptr::read_volatile(window as *const u32),
-                core::ptr::read_volatile((window + 8) as *const u32),
-            )
-        };
+        let device = net::Device::new(window);
         log::write_str("WUXIA_MMIO_CTRL\n");
-        log::write_hex(u64::from(control));
-        log::write_hex(u64::from(status));
+        log::write_hex(u64::from(
+            device.control().expect("the controller has no CTRL"),
+        ));
+        device.reset().expect("the controller does not leave reset");
+        log::write_str("WUXIA_NET_RESET\n");
+        log::write_hex(u64::from(
+            device.control().expect("the controller has no CTRL"),
+        ));
+        let mac = device.mac().expect("the controller has no station address");
+        log::write_str("WUXIA_NET_MAC\n");
+        for word in wuxia_core::net::mac_words(mac) {
+            log::write_hex(u64::from(word));
+        }
+        let link = device
+            .bring_up()
+            .expect("the controller does not answer the link request");
+        log::write_str("WUXIA_NET_LINK\n");
+        log::write_hex(u64::from(link));
+        log::write_hex(u64::from(
+            device.status().expect("the controller has no STATUS"),
+        ));
+
+        // A broadcast frame with a locally administered ethertype. Nothing
+        // answers it; the point is that the transmit engine fetched the
+        // descriptor and the frame and reported completion.
+        let mut frame = [0u8; wuxia_core::net::MIN_FRAME];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&mac);
+        frame[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
+        frame[14..19].copy_from_slice(b"wuxia");
+        match device.transmit(&mut allocator, direct_map, &frame) {
+            Ok(descriptor) => {
+                log::write_str("WUXIA_NET_TX_OK\n");
+                log::write_hex(u64::from(descriptor[12]));
+                log::write_hex(u64::from(descriptor[11]));
+            }
+            Err(error) => {
+                log::write_str("WUXIA_NET_TX_FAILED\n");
+                log::write_hex(error as u64);
+            }
+        }
     }
 
     let image = paging::load_user_image(&mut allocator, direct_map, USER_ELF)

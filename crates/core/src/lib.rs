@@ -29,6 +29,7 @@ pub mod initstack;
 pub mod klog;
 pub mod load;
 pub mod memory;
+pub mod net;
 pub mod nt;
 pub mod nt_service;
 pub mod nt_string;
