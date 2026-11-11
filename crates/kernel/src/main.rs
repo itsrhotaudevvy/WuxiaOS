@@ -11,6 +11,8 @@ use core::panic::PanicInfo;
 use limine::BaseRevision;
 use limine::request::{RequestsEndMarker, RequestsStartMarker, StackSizeRequest};
 
+mod idt;
+
 #[used]
 #[unsafe(link_section = ".requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
