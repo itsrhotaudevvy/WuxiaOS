@@ -341,6 +341,43 @@ fn service_syscall(frame: &mut InterruptFrame) {
             serial::debug_exit(0x10);
             halt();
         }
+        Ok(wuxia_core::syscall::PosixRequest::Open { path }) => {
+            let mut scratch = [0u8; wuxia_core::syscall::MAX_PATH_LENGTH as usize];
+            let opened = copy_user_bytes(path.address, path.length, &mut scratch)
+                .ok()
+                .and_then(|count| core::str::from_utf8(&scratch[..count]).ok())
+                .and_then(crate::sched::open_path);
+            match opened {
+                Some(descriptor) => {
+                    serial::write_str("WUXIA_SYSCALL_OPEN\n");
+                    serial::write_hex(u64::from(descriptor));
+                    frame.rax = u64::from(descriptor);
+                }
+                None => {
+                    serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
+        Ok(wuxia_core::syscall::PosixRequest::Read { descriptor, buffer }) => {
+            let length = buffer.length as usize;
+            let mut scratch = [0u8; wuxia_core::syscall::MAX_READ_LENGTH as usize];
+            let read = crate::sched::descriptor_file(descriptor).and_then(|(file, offset)| {
+                let count = crate::vfs::read(file, offset, &mut scratch[..length])?;
+                copy_user_from(buffer.address, &scratch[..count]).ok()?;
+                crate::sched::advance_descriptor(descriptor, count as u64).then_some(count)
+            });
+            match read {
+                Some(count) => {
+                    serial::write_str("WUXIA_SYSCALL_READ\n");
+                    frame.rax = count as u64;
+                }
+                None => {
+                    serial::write_str("WUXIA_SYSCALL_INVALID\n");
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
         Ok(wuxia_core::syscall::PosixRequest::Write { descriptor, buffer }) => {
             if descriptor != 1
                 || !crate::sched::descriptor_open(descriptor)
@@ -407,6 +444,49 @@ fn read_cr2() -> u64 {
         asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+/// Copy a bounded user range into `out` through the HHDM.
+fn copy_user_bytes(address: u64, length: u64, out: &mut [u8]) -> Result<usize, wuxia_core::Error> {
+    let map = crate::paging::current_direct_map().ok_or(wuxia_core::Error::InvalidState)?;
+    let entry = crate::paging::resolve(map, address)?;
+    if !wuxia_core::paging::is_user(entry) {
+        return Err(wuxia_core::Error::PermissionDenied);
+    }
+    let frame = wuxia_core::paging::physical_address(entry);
+    let offset = address % wuxia_core::paging::PAGE_SIZE;
+    if offset + length > wuxia_core::paging::PAGE_SIZE {
+        return Err(wuxia_core::Error::InvalidInput);
+    }
+    let count = (length as usize).min(out.len());
+    let source = map.physical_to_virtual(frame + offset)? as *const u8;
+    for (index, slot) in out.iter_mut().take(count).enumerate() {
+        // SAFETY: the leaf is user-accessible and the bounded range stays
+        // inside one 4 KiB frame.
+        *slot = unsafe { source.add(index).read_volatile() };
+    }
+    Ok(count)
+}
+
+/// Copy `data` into a bounded, writable user range through the HHDM.
+fn copy_user_from(address: u64, data: &[u8]) -> Result<(), wuxia_core::Error> {
+    let map = crate::paging::current_direct_map().ok_or(wuxia_core::Error::InvalidState)?;
+    let entry = crate::paging::resolve(map, address)?;
+    if !wuxia_core::paging::is_user(entry) || !wuxia_core::paging::is_writable(entry) {
+        return Err(wuxia_core::Error::PermissionDenied);
+    }
+    let frame = wuxia_core::paging::physical_address(entry);
+    let offset = address % wuxia_core::paging::PAGE_SIZE;
+    if offset + data.len() as u64 > wuxia_core::paging::PAGE_SIZE {
+        return Err(wuxia_core::Error::InvalidInput);
+    }
+    let destination = map.physical_to_virtual(frame + offset)? as *mut u8;
+    for (index, byte) in data.iter().enumerate() {
+        // SAFETY: the leaf is present and writable, and the bounded range
+        // stays inside one 4 KiB frame.
+        unsafe { destination.add(index).write_volatile(*byte) };
+    }
+    Ok(())
 }
 
 /// Forward a validated user buffer to the serial console through the HHDM.

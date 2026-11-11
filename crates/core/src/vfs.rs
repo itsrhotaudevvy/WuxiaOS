@@ -22,15 +22,6 @@ struct File {
     length: usize,
 }
 
-impl File {
-    const EMPTY: Self = Self {
-        name: [0; MAX_NAME_LENGTH],
-        name_length: 0,
-        start: 0,
-        length: 0,
-    };
-}
-
 /// A fixed-capacity read-only file store.
 #[derive(Clone, Copy, Debug)]
 pub struct MemFs<const FILES: usize, const BYTES: usize> {

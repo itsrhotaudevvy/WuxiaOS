@@ -20,6 +20,7 @@ mod memory;
 mod paging;
 mod sched;
 mod user;
+mod vfs;
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -125,6 +126,26 @@ pub extern "C" fn _start() -> ! {
     );
     serial::write_str("WUXIA_FRAME_RECLAIM_OK\n");
     memory::install_pool(allocator);
+
+    let mut files = vfs::KernelFs::new();
+    assert!(
+        files.create("hello", b"hello from wuxia fs\n").is_ok(),
+        "the bootstrap file cannot be created"
+    );
+    assert!(
+        files.create("motd", b"WuxiaOS\n").is_ok(),
+        "the second bootstrap file cannot be created"
+    );
+    vfs::install(files);
+    let mut probe = [0u8; 32];
+    assert!(
+        matches!(
+            vfs::read(wuxia_core::vfs::FileId(0), 0, &mut probe),
+            Some(20)
+        ),
+        "the bootstrap file cannot be read back"
+    );
+    serial::write_str("WUXIA_FS_OK\n");
 
     paging::activate(image.new_pml4);
     serial::write_str("WUXIA_CR3_OK\n");

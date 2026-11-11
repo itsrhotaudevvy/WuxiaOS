@@ -114,6 +114,46 @@ pub fn close_descriptor(descriptor: u32) -> bool {
     }
 }
 
+/// Resolve a path and open it on the running process.
+pub fn open_path(name: &str) -> Option<u32> {
+    let file = crate::vfs::lookup(name)?;
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current]
+            .as_mut()?
+            .process
+            .descriptors_mut()
+            .open_file(file)
+            .ok()
+    }
+}
+
+/// File and current offset behind an open descriptor.
+pub fn descriptor_file(descriptor: u32) -> Option<(wuxia_core::vfs::FileId, u64)> {
+    let thread = current_thread()?;
+    let descriptors = thread.process.descriptors();
+    let file = descriptors.file(descriptor)?;
+    Some((file, descriptors.offset(descriptor)))
+}
+
+/// Advance the read offset of an open file descriptor.
+pub fn advance_descriptor(descriptor: u32, count: u64) -> bool {
+    // SAFETY: traps are non-nesting, so the current thread is stable.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        threads[current].as_mut().is_some_and(|thread| {
+            thread
+                .process
+                .descriptors_mut()
+                .advance(descriptor, count)
+                .is_ok()
+        })
+    }
+}
+
 /// Whether `[address, address + length)` is mapped by the running process.
 pub fn region_contains(address: u64, length: u64) -> bool {
     current_thread().is_some_and(|thread| thread.process.space().contains(address, length))

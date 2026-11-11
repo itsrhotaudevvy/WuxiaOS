@@ -160,6 +160,11 @@ pub const fn is_user(entry: u64) -> bool {
     entry & USER != 0
 }
 
+/// Whether a leaf entry permits writes.
+pub const fn is_writable(entry: u64) -> bool {
+    entry & WRITABLE != 0
+}
+
 /// Read-only access to a physical page-table entry.
 ///
 /// Implementations translate a physical table frame through whatever mapping
@@ -343,9 +348,14 @@ mod tests {
         let kernel = leaf(0x400000, 0x2000, PagePermissions::KERNEL_READ_ONLY).unwrap();
         assert!(!is_user(kernel));
 
+        let writable = leaf(0x400000, 0x2000, PagePermissions::USER_READ_WRITE).unwrap();
+        assert!(is_writable(writable));
+        assert!(!is_executable(writable));
+
         let code = leaf(0x400000, 0x3000, PagePermissions::USER_CODE).unwrap();
         assert!(is_user(code));
         assert!(is_executable(code));
+        assert!(!is_writable(code));
     }
 
     #[test]
