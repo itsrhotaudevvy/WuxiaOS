@@ -24,6 +24,7 @@ pub mod pledge;
 pub mod process;
 pub mod region;
 pub mod schedule;
+pub mod signal;
 pub mod syscall;
 pub mod vfs;
 
