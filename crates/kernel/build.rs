@@ -70,16 +70,17 @@ fn embed(out: &std::path::Path, name: &str, variable: &str, default: &std::path:
 /// terminates the process, plus a writable data section as the read target.
 fn write_pe_image(out: &std::path::Path) -> PathBuf {
     let target = out.join("pe_image.bin");
-    let mut image = vec![0u8; 0x800];
+    let mut image = vec![0u8; 0xa00];
 
     image[0..2].copy_from_slice(b"MZ");
     image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
 
     image[0x40..0x44].copy_from_slice(b"PE\0\0");
     image[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
-    // Three sections: .text, a writable .data used as the read buffer and a
-    // .reloc section naming the absolute addresses in .data.
-    image[0x46..0x48].copy_from_slice(&3u16.to_le_bytes());
+    // Four sections: .text, a writable .data used as the read buffer, a
+    // .reloc section naming the absolute addresses in .data and an .idata
+    // section holding the import table the kernel resolves.
+    image[0x46..0x48].copy_from_slice(&4u16.to_le_bytes());
     image[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
     image[0x56..0x58].copy_from_slice(&0x22u16.to_le_bytes());
 
@@ -87,7 +88,7 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
     // SizeOfCode, then SizeOfInitializedData.
     image[optional + 4..optional + 8].copy_from_slice(&0x200u32.to_le_bytes());
-    image[optional + 8..optional + 12].copy_from_slice(&0x400u32.to_le_bytes());
+    image[optional + 8..optional + 12].copy_from_slice(&0x600u32.to_le_bytes());
     image[optional + 16..optional + 20].copy_from_slice(&0x1000u32.to_le_bytes());
     image[optional + 20..optional + 24].copy_from_slice(&0x1000u32.to_le_bytes());
     image[optional + 24..optional + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
@@ -96,8 +97,8 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     image[optional + 36..optional + 40].copy_from_slice(&0x200u32.to_le_bytes());
     image[optional + 40..optional + 42].copy_from_slice(&6u16.to_le_bytes());
     image[optional + 48..optional + 50].copy_from_slice(&6u16.to_le_bytes());
-    // SizeOfImage covers all three sections.
-    image[optional + 56..optional + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+    // SizeOfImage covers all four sections.
+    image[optional + 56..optional + 60].copy_from_slice(&0x5000u32.to_le_bytes());
     image[optional + 60..optional + 64].copy_from_slice(&0x200u32.to_le_bytes());
     image[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
     image[optional + 72..optional + 80].copy_from_slice(&0x10_0000u64.to_le_bytes());
@@ -109,6 +110,11 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     let reloc_directory = optional + 112 + 5 * 8;
     image[reloc_directory..reloc_directory + 4].copy_from_slice(&0x3000u32.to_le_bytes());
     image[reloc_directory + 4..reloc_directory + 8].copy_from_slice(&12u32.to_le_bytes());
+    // The import directory sits at index 1 and spans a descriptor plus its
+    // all-zero terminator.
+    let import_directory = optional + 112 + 8;
+    image[import_directory..import_directory + 4].copy_from_slice(&0x4000u32.to_le_bytes());
+    image[import_directory + 4..import_directory + 8].copy_from_slice(&40u32.to_le_bytes());
 
     let section = optional + 240;
     image[section..section + 5].copy_from_slice(b".text");
@@ -137,6 +143,16 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     // IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_CNT_INITIALIZED_DATA.
     image[reloc + 36..reloc + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
 
+    let idata = reloc + 40;
+    image[idata..idata + 6].copy_from_slice(b".idata");
+    image[idata + 8..idata + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[idata + 12..idata + 16].copy_from_slice(&0x4000u32.to_le_bytes());
+    image[idata + 16..idata + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    image[idata + 20..idata + 24].copy_from_slice(&0x800u32.to_le_bytes());
+    // IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA:
+    // the loader rewrites the import address table, so it must be writable.
+    image[idata + 36..idata + 40].copy_from_slice(&0xc000_0040u32.to_le_bytes());
+
     // One IMAGE_REL_BASED_DIR64 block covering the UNICODE_STRING Buffer field
     // at RVA 0x1108: page RVA, block size and the entry, then a pad word that
     // keeps the block a multiple of four bytes.
@@ -144,9 +160,10 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     image[0x604..0x608].copy_from_slice(&12u32.to_le_bytes());
     image[0x608..0x60a].copy_from_slice(&0xa108u16.to_le_bytes());
 
-    // NtCreateFile(&name), NtReadFile(handle, data, 0x40),
-    // NtWriteFile(1, data, bytes_read), NtTerminateProcess(0).
-    let code: [u8; 104] = [
+    // NtCreateFile(&name), NtReadFile(handle, data, 0x40), the query-counter
+    // call, then NtWriteFile and NtTerminateProcess reached through the import
+    // address table at RVA 0x4040.
+    let code: [u8; 97] = [
         0x48, 0xc7, 0xc0, 0x34, 0x00, 0x00, 0x00, // mov rax, 0x34 (NtCreateFile)
         0x48, 0x8d, 0x3d, 0xf2, 0x00, 0x00, 0x00, // lea rdi, [rip + 0xf2]
         0xcd, 0x80, // int 0x80
@@ -157,17 +174,15 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
         0x48, 0xc7, 0xc2, 0x40, 0x00, 0x00, 0x00, // mov rdx, 0x40
         0xcd, 0x80, // int 0x80
         0x49, 0x89, 0xc5, // mov r13, rax
-        0x48, 0xc7, 0xc0, 0x08, 0x00, 0x00, 0x00, // mov rax, 8 (NtWriteFile)
-        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
-        0x48, 0x8d, 0x35, 0xbb, 0x0f, 0x00, 0x00, // lea rsi, [rip + 0xfbb]
-        0x4c, 0x89, 0xea, // mov rdx, r13
-        0xcd, 0x80, // int 0x80
         0x48, 0xc7, 0xc0, 0x31, 0x00, 0x00, 0x00, // mov rax, 0x31 (query counter)
-        0x48, 0x8d, 0x3d, 0xe8, 0x0f, 0x00, 0x00, // lea rdi, [rip + 0xfe8]
+        0x48, 0x8d, 0x3d, 0x82, 0x10, 0x00, 0x00, // lea rdi, [rip + 0x1082]
         0xcd, 0x80, // int 0x80
-        0x48, 0xc7, 0xc0, 0x29, 0x00, 0x00, 0x00, // mov rax, 0x29 (terminate)
-        0x48, 0x31, 0xff, // xor rdi, rdi
-        0xcd, 0x80, // int 0x80
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
+        0x48, 0x8d, 0x35, 0xb2, 0x0f, 0x00, 0x00, // lea rsi, [rip + 0xfb2]
+        0x4c, 0x89, 0xea, // mov rdx, r13
+        0xff, 0x15, 0xe9, 0x2f, 0x00, 0x00, // call [rip + 0x2fe9] (NtWriteFile)
+        0x31, 0xff, // xor edi, edi
+        0xff, 0x15, 0xe9, 0x2f, 0x00, 0x00, // call [rip + 0x2fe9] (NtTerminateProcess)
         0x0f, 0x0b, // ud2
     ];
     image[0x200..0x200 + code.len()].copy_from_slice(&code);
@@ -182,6 +197,20 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
         let offset = 0x310 + index * 2;
         image[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
     }
+    // One import descriptor for ntdll.dll: ILT at 0x4028, IAT at 0x4040, the
+    // module name at 0x4058 and two hint/name entries. The descriptor table is
+    // terminated by an all-zero 20-byte entry.
+    image[0x800..0x804].copy_from_slice(&0x4028u32.to_le_bytes());
+    image[0x80c..0x810].copy_from_slice(&0x4058u32.to_le_bytes());
+    image[0x810..0x814].copy_from_slice(&0x4040u32.to_le_bytes());
+    image[0x828..0x82c].copy_from_slice(&0x4064u32.to_le_bytes());
+    image[0x830..0x834].copy_from_slice(&0x4072u32.to_le_bytes());
+    image[0x840..0x844].copy_from_slice(&0x4064u32.to_le_bytes());
+    image[0x848..0x84c].copy_from_slice(&0x4072u32.to_le_bytes());
+    image[0x858..0x862].copy_from_slice(b"ntdll.dll\0");
+    image[0x864..0x872].copy_from_slice(b"\0\0NtWriteFile\0");
+    image[0x872..0x887].copy_from_slice(b"\0\0NtTerminateProcess\0");
+
     fs::write(&target, image).expect("cannot write the PE test image");
     target
 }

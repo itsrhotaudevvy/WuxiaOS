@@ -16,6 +16,7 @@ use limine::request::{
 mod cpu;
 mod gdt;
 mod idt;
+mod imports;
 mod interrupts;
 mod log;
 mod memory;
@@ -193,13 +194,17 @@ pub extern "C" fn _start() -> ! {
     log::write_str("WUXIA_FRAME_RECLAIM_OK\n");
 
     let pe_delta = pe_displacement();
-    let pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE, pe_delta)
+    let mut pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE, pe_delta)
         .expect("the PE self-test image cannot be loaded");
     log::write_str("WUXIA_PE_IMAGE_OK\n");
     log::write_hex(pe.entry);
     log::write_str("WUXIA_PE_RELOCATED\n");
     log::write_hex(pe_delta as u64);
     log::write_hex(pe.entry);
+    let imports = imports::resolve(&mut allocator, direct_map, &mut pe, PE_IMAGE, pe_delta)
+        .expect("the PE self-test image has an import that cannot be resolved");
+    log::write_str("WUXIA_IMPORTS_OK\n");
+    log::write_hex(imports as u64);
     memory::install_pool(allocator);
 
     let mut files = vfs::KernelFs::new();
@@ -404,8 +409,13 @@ fn pe_displacement() -> i64 {
 
 /// Panic handler for early bootstrap failures.
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
     serial::write_str("WUXIA_TEST_FAIL: bootstrap panic\n");
+    if let Some(location) = info.location() {
+        serial::write_str("WUXIA_PANIC_AT\n");
+        log::write_hex(location.line() as u64);
+        log::write_hex(location.column() as u64);
+    }
     serial::debug_exit(1);
     halt_forever()
 }

@@ -410,6 +410,65 @@ pub fn apply_pe_relocations(
     Ok(patched)
 }
 
+/// Write one 8-byte value to a mapped user address.
+///
+/// The address must already resolve in `root` to a writable-capable frame; the
+/// write goes through the direct map so it does not depend on the leaf's
+/// permission bits while the image is being prepared.
+///
+/// Errors: `NotFound` when the address is not mapped and `InvalidImage` when
+/// the value does not fit inside one page.
+pub fn write_user_u64(
+    direct_map: DirectMap,
+    root: u64,
+    address: u64,
+    value: u64,
+) -> Result<(), Error> {
+    if address % PAGE_SIZE > PAGE_SIZE - 8 {
+        return Err(Error::InvalidImage);
+    }
+    let (table, index) = leaf_slot(direct_map, root, address)?;
+    let entry = read_entry(table, index);
+    if !is_present(entry) || is_huge(entry) {
+        return Err(Error::NotFound);
+    }
+    let frame = physical_address(entry);
+    let target = direct_map.physical_to_virtual(frame + address % PAGE_SIZE)? as *mut u64;
+    // SAFETY: the slot lies inside a mapped frame of the image and the callers
+    // prepare images before ring 3 can race the write.
+    unsafe {
+        target.write_volatile(value);
+    }
+    Ok(())
+}
+
+/// Write a byte range to a mapped user address.
+///
+/// The whole range must lie inside one page that resolves in `root`.
+pub fn write_user_bytes(
+    direct_map: DirectMap,
+    root: u64,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let offset = address % PAGE_SIZE;
+    if offset as usize + bytes.len() > PAGE_SIZE as usize {
+        return Err(Error::InvalidImage);
+    }
+    let (table, index) = leaf_slot(direct_map, root, address)?;
+    let entry = read_entry(table, index);
+    if !is_present(entry) || is_huge(entry) {
+        return Err(Error::NotFound);
+    }
+    let frame = physical_address(entry);
+    let start = direct_map.physical_to_virtual(frame + offset)? as *mut u8;
+    // SAFETY: the range was bounds-checked against one mapped frame.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), start, bytes.len());
+    }
+    Ok(())
+}
+
 /// Resolve a user address through the currently active root.
 pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error> {
     let reader = DirectMapReader { direct_map };
