@@ -34,6 +34,7 @@ const BOOT_MARKERS: &[&str] = &[
     "HELLO FROM USER",
     "USER MAP",
     "hello from wuxia fs",
+    "CROSS PAGE BUF",
     "WuxiaOS files",
     "SLEPT",
     "A SECOND PHASE",

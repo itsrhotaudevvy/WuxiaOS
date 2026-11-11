@@ -461,17 +461,24 @@ fn copy_user_bytes(address: u64, length: u64, out: &mut [u8]) -> Result<usize, w
     if !wuxia_core::paging::is_user(entry) {
         return Err(wuxia_core::Error::PermissionDenied);
     }
-    let frame = wuxia_core::paging::physical_address(entry);
-    let offset = address % wuxia_core::paging::PAGE_SIZE;
-    if offset + length > wuxia_core::paging::PAGE_SIZE {
-        return Err(wuxia_core::Error::InvalidInput);
-    }
     let count = (length as usize).min(out.len());
-    let source = map.physical_to_virtual(frame + offset)? as *const u8;
-    for (index, slot) in out.iter_mut().take(count).enumerate() {
-        // SAFETY: the leaf is user-accessible and the bounded range stays
-        // inside one 4 KiB frame.
-        *slot = unsafe { source.add(index).read_volatile() };
+    let mut copied = 0;
+    while copied < count {
+        let cursor = address + copied as u64;
+        let entry = crate::paging::resolve(map, cursor)?;
+        if !wuxia_core::paging::is_user(entry) {
+            return Err(wuxia_core::Error::PermissionDenied);
+        }
+        let frame = wuxia_core::paging::physical_address(entry);
+        let offset = cursor % wuxia_core::paging::PAGE_SIZE;
+        let chunk = ((wuxia_core::paging::PAGE_SIZE - offset) as usize).min(count - copied);
+        let source = map.physical_to_virtual(frame + offset)? as *const u8;
+        for index in 0..chunk {
+            // SAFETY: the leaf is user-accessible and the chunk stays
+            // inside one 4 KiB frame.
+            out[copied + index] = unsafe { source.add(index).read_volatile() };
+        }
+        copied += chunk;
     }
     Ok(count)
 }
@@ -483,16 +490,23 @@ fn copy_user_from(address: u64, data: &[u8]) -> Result<(), wuxia_core::Error> {
     if !wuxia_core::paging::is_user(entry) || !wuxia_core::paging::is_writable(entry) {
         return Err(wuxia_core::Error::PermissionDenied);
     }
-    let frame = wuxia_core::paging::physical_address(entry);
-    let offset = address % wuxia_core::paging::PAGE_SIZE;
-    if offset + data.len() as u64 > wuxia_core::paging::PAGE_SIZE {
-        return Err(wuxia_core::Error::InvalidInput);
-    }
-    let destination = map.physical_to_virtual(frame + offset)? as *mut u8;
-    for (index, byte) in data.iter().enumerate() {
-        // SAFETY: the leaf is present and writable, and the bounded range
-        // stays inside one 4 KiB frame.
-        unsafe { destination.add(index).write_volatile(*byte) };
+    let mut copied = 0;
+    while copied < data.len() {
+        let cursor = address + copied as u64;
+        let entry = crate::paging::resolve(map, cursor)?;
+        if !wuxia_core::paging::is_user(entry) || !wuxia_core::paging::is_writable(entry) {
+            return Err(wuxia_core::Error::PermissionDenied);
+        }
+        let frame = wuxia_core::paging::physical_address(entry);
+        let offset = cursor % wuxia_core::paging::PAGE_SIZE;
+        let chunk = ((wuxia_core::paging::PAGE_SIZE - offset) as usize).min(data.len() - copied);
+        let destination = map.physical_to_virtual(frame + offset)? as *mut u8;
+        for index in 0..chunk {
+            // SAFETY: the leaf is present and writable, and the chunk stays
+            // inside one 4 KiB frame.
+            unsafe { destination.add(index).write_volatile(data[copied + index]) };
+        }
+        copied += chunk;
     }
     Ok(())
 }
@@ -507,17 +521,23 @@ fn copy_user_to_serial(address: u64, length: u64) -> Result<(), wuxia_core::Erro
     if !wuxia_core::paging::is_user(entry) {
         return Err(wuxia_core::Error::PermissionDenied);
     }
-    let frame = wuxia_core::paging::physical_address(entry);
-    let offset = address % wuxia_core::paging::PAGE_SIZE;
-    if offset + length > wuxia_core::paging::PAGE_SIZE {
-        return Err(wuxia_core::Error::InvalidInput);
-    }
-    let source = map.physical_to_virtual(frame + offset)? as *const u8;
-    for index in 0..length as usize {
-        // SAFETY: the leaf is present and user-accessible, and the bounded
-        // range stays inside one 4 KiB frame.
-        let byte = unsafe { source.add(index).read_volatile() };
-        serial::write_byte(byte);
+    let mut copied = 0;
+    while copied < length {
+        let cursor = address + copied;
+        let entry = crate::paging::resolve(map, cursor)?;
+        if !wuxia_core::paging::is_user(entry) {
+            return Err(wuxia_core::Error::PermissionDenied);
+        }
+        let frame = wuxia_core::paging::physical_address(entry);
+        let offset = cursor % wuxia_core::paging::PAGE_SIZE;
+        let chunk = (wuxia_core::paging::PAGE_SIZE - offset).min(length - copied);
+        let source = map.physical_to_virtual(frame + offset)? as *const u8;
+        for index in 0..chunk as usize {
+            // SAFETY: the leaf is user-accessible and the chunk stays
+            // inside one 4 KiB frame.
+            serial::write_byte(unsafe { source.add(index).read_volatile() });
+        }
+        copied += chunk;
     }
     Ok(())
 }
