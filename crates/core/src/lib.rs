@@ -21,6 +21,7 @@ pub mod memory;
 pub mod nt;
 pub mod object_namespace;
 pub mod paging;
+pub mod path;
 pub mod pe_reloc;
 pub mod personality;
 pub mod pipe;
@@ -31,6 +32,7 @@ pub mod region;
 pub mod schedule;
 pub mod signal;
 pub mod syscall;
+pub mod unveil;
 pub mod vfs;
 
 pub use address_space::AddressSpace;
