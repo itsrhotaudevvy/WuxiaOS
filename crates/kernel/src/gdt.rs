@@ -36,7 +36,13 @@ pub struct Gdt {
 impl Gdt {
     /// Construct null, kernel code and kernel data descriptors.
     pub const fn new() -> Self {
-        Self { entries: [0, SegmentDescriptor::code(0).0, SegmentDescriptor::code(0)] }
+        Self {
+            entries: [
+                0,
+                SegmentDescriptor::code(0).0,
+                SegmentDescriptor::data(0).0,
+            ],
+        }
     }
 
     /// Return the selector for the first executable kernel segment.

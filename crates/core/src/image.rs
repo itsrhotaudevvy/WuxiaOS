@@ -75,9 +75,14 @@ impl<'a> PeImage<'a> {
             return Err(Error::InvalidImage);
         }
         let optional_offset = pe.checked_add(24).ok_or(Error::InvalidImage)?;
-        let optional_size = read_u16(bytes, pe.checked_add(20).ok_or(Error::InvalidImage)?)? as usize;
-        let optional_end = optional_offset.checked_add(optional_size).ok_or(Error::InvalidImage)?;
-        let optional = bytes.get(optional_offset..optional_end).ok_or(Error::InvalidImage)?;
+        let optional_size =
+            read_u16(bytes, pe.checked_add(20).ok_or(Error::InvalidImage)?)? as usize;
+        let optional_end = optional_offset
+            .checked_add(optional_size)
+            .ok_or(Error::InvalidImage)?;
+        let optional = bytes
+            .get(optional_offset..optional_end)
+            .ok_or(Error::InvalidImage)?;
         let kind = match read_u16(optional, 0)? {
             0x10b if machine == 0x14c => PeKind::Pe32,
             0x20b if machine == 0x8664 => PeKind::Pe32Plus,
@@ -91,8 +96,12 @@ impl<'a> PeImage<'a> {
         if optional_size < minimum_optional_size {
             return Err(Error::InvalidImage);
         }
-        let table_size = (section_count as usize).checked_mul(40).ok_or(Error::InvalidImage)?;
-        let table_end = optional_end.checked_add(table_size).ok_or(Error::InvalidImage)?;
+        let table_size = (section_count as usize)
+            .checked_mul(40)
+            .ok_or(Error::InvalidImage)?;
+        let table_end = optional_end
+            .checked_add(table_size)
+            .ok_or(Error::InvalidImage)?;
         if bytes.get(optional_end..table_end).is_none() {
             return Err(Error::InvalidImage);
         }
@@ -130,7 +139,9 @@ impl<'a> PeImage<'a> {
         }
         for index in 0..self.section_count as usize {
             let section = self.section(index)?;
-            let end = section.virtual_address.checked_add(section.virtual_size.max(section.raw_size))
+            let end = section
+                .virtual_address
+                .checked_add(section.virtual_size.max(section.raw_size))
                 .ok_or(Error::InvalidImage)?;
             if end > size_of_image {
                 return Err(Error::InvalidImage);
@@ -140,7 +151,13 @@ impl<'a> PeImage<'a> {
             PeKind::Pe32 => read_u32(self.bytes, self.optional_offset + 28)? as u64,
             PeKind::Pe32Plus => read_u64(self.bytes, self.optional_offset + 24)?,
         };
-        Ok(PeInfo { kind: self.kind, machine: self.machine, image_base, size_of_image, entry_rva })
+        Ok(PeInfo {
+            kind: self.kind,
+            machine: self.machine,
+            image_base,
+            size_of_image,
+            entry_rva,
+        })
     }
 
     /// Return one section header and its file bounds.
@@ -148,7 +165,10 @@ impl<'a> PeImage<'a> {
         if index >= self.section_count as usize {
             return Err(Error::NotFound);
         }
-        let offset = self.sections_offset.checked_add(index * 40).ok_or(Error::InvalidImage)?;
+        let offset = self
+            .sections_offset
+            .checked_add(index * 40)
+            .ok_or(Error::InvalidImage)?;
         let end = offset.checked_add(40).ok_or(Error::InvalidImage)?;
         let header = self.bytes.get(offset..end).ok_or(Error::InvalidImage)?;
         let mut name = [0u8; 8];
@@ -157,7 +177,9 @@ impl<'a> PeImage<'a> {
         let virtual_address = read_u32(header, 12)?;
         let raw_size = read_u32(header, 16)?;
         let raw_offset = read_u32(header, 20)? as usize;
-        let end = raw_offset.checked_add(raw_size as usize).ok_or(Error::InvalidImage)?;
+        let end = raw_offset
+            .checked_add(raw_size as usize)
+            .ok_or(Error::InvalidImage)?;
         if raw_size != 0 && raw_offset < self.sections_offset + self.section_count as usize * 40 {
             return Err(Error::InvalidImage);
         }
@@ -167,7 +189,13 @@ impl<'a> PeImage<'a> {
         if self.bytes.get(raw_offset..end).is_none() {
             return Err(Error::InvalidImage);
         }
-        Ok(Section { virtual_address, virtual_size, raw_offset, raw_size, name })
+        Ok(Section {
+            virtual_address,
+            virtual_size,
+            raw_offset,
+            raw_size,
+            name,
+        })
     }
 
     /// Return the raw image bytes for later copying by a validated mapper.
@@ -191,7 +219,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     let end = offset.checked_add(8).ok_or(Error::InvalidImage)?;
     let bytes = bytes.get(offset..end).ok_or(Error::InvalidImage)?;
-    Ok(u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]))
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
 }
 
 #[cfg(test)]
@@ -232,7 +262,10 @@ mod tests {
     #[test]
     fn rejects_short_and_bad_signature_images() {
         assert!(matches!(PeImage::parse(&[]), Err(Error::InvalidImage)));
-        assert!(matches!(PeImage::parse(&[0; 0x400]), Err(Error::InvalidImage)));
+        assert!(matches!(
+            PeImage::parse(&[0; 0x400]),
+            Err(Error::InvalidImage)
+        ));
         let mut image = [0u8; 0x200];
         image[..2].copy_from_slice(b"MZ");
         image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
@@ -242,6 +275,9 @@ mod tests {
     #[test]
     fn rejects_a_truncated_section_table() {
         let image = minimal_pe64();
-        assert!(matches!(PeImage::parse(&image[..0x100]), Err(Error::InvalidImage)));
+        assert!(matches!(
+            PeImage::parse(&image[..0x100]),
+            Err(Error::InvalidImage)
+        ));
     }
 }

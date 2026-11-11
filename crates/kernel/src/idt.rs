@@ -15,6 +15,19 @@ pub struct IdtEntry {
 
 impl IdtEntry {
     /// Construct a present interrupt gate without installing it in the CPU.
+    pub const fn missing() -> Self {
+        Self {
+            offset_low: 0,
+            selector: 0,
+            ist: 0,
+            attributes: 0,
+            offset_middle: 0,
+            offset_high: 0,
+            reserved: 0,
+        }
+    }
+
+    /// Construct a present interrupt gate without installing it in the CPU.
     pub const fn interrupt(handler: usize, selector: u16, privilege: u8) -> Self {
         Self {
             offset_low: handler as u16,
@@ -48,18 +61,30 @@ pub struct Idt {
 impl Idt {
     /// Construct an empty IDT with all descriptors marked not-present.
     pub const fn new() -> Self {
-        Self { entries: [IdtEntry::default(); 256] }
+        Self {
+            entries: [IdtEntry {
+                offset_low: 0,
+                selector: 0,
+                ist: 0,
+                attributes: 0,
+                offset_middle: 0,
+                offset_high: 0,
+                reserved: 0,
+            }; 256],
+        }
     }
 
     /// Set one exception vector's descriptor.
     pub fn set_handler(&mut self, vector: u8, handler: usize, privilege: u8) {
-        self.entries[vector] = IdtEntry::interrupt(handler, 0x08, privilege);
+        self.entries[vector as usize] = IdtEntry::interrupt(handler, 0x08, privilege);
     }
 
     /// Install the table after all required exception stubs are present.
     pub fn load(&self) {
         // SAFETY: This routine is called only after the caller has populated a
         // complete static IDT and validated its handler addresses.
-        unsafe { core::arch::asm!("lidt [{0}]", in(reg) &self, options(readonly, nostack, preserves_flags)) };
+        unsafe {
+            core::arch::asm!("lidt [{0}]", in(reg) &self, options(readonly, nostack, preserves_flags))
+        };
     }
 }

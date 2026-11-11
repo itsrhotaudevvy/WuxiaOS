@@ -15,11 +15,17 @@ pub struct Frame(u64);
 impl Frame {
     /// Construct a frame only from a page-aligned physical address.
     pub const fn new(address: u64) -> Result<Self> {
-        if address % FRAME_SIZE == 0 { Ok(Self(address)) } else { Err(Error::InvalidInput) }
+        if address % FRAME_SIZE == 0 {
+            Ok(Self(address))
+        } else {
+            Err(Error::InvalidInput)
+        }
     }
 
     /// Return the physical address.
-    pub const fn address(self) -> u64 { self.0 }
+    pub const fn address(self) -> u64 {
+        self.0
+    }
 }
 
 /// A fixed-size frame allocator with explicit allocation state.
@@ -33,24 +39,32 @@ pub struct FrameAllocator<const N: usize> {
 impl<const N: usize> FrameAllocator<N> {
     /// Create an empty fixed-capacity allocator.
     pub const fn new() -> Self {
-        Self { frames: [0; N], used: [false; N], len: 0 }
+        Self {
+            frames: [0; N],
+            used: [false; N],
+            len: 0,
+        }
     }
 
     /// Add a free physical frame without duplicating an existing one.
     pub fn add(&mut self, frame: Frame) -> Result<()> {
-        if self.len >= N { return Err(Error::TableFull); }
-        if self.frames[..self.len].contains(&frame.0) { return Err(Error::AlreadyExists); }
+        if self.len >= N {
+            return Err(Error::TableFull);
+        }
+        if self.frames[..self.len].contains(&frame.0) {
+            return Err(Error::AlreadyExists);
+        }
         self.frames[self.len] = frame.0;
         self.len += 1;
         Ok(())
     }
 
     /// Allocate one available frame.
-    pub fn allocate(&mut self) -> Result<u64> {
+    pub fn allocate(&mut self) -> Result<Frame> {
         for index in 0..self.len {
             if !self.used[index] {
                 self.used[index] = true;
-                return Ok(self.frames[index]);
+                return Ok(Frame(self.frames[index]));
             }
         }
         Err(Error::TableFull)
@@ -58,9 +72,13 @@ impl<const N: usize> FrameAllocator<N> {
 
     /// Release a frame previously allocated by this allocator.
     pub fn release(&mut self, frame: Frame) -> Result<()> {
-        let index = self.frames[..self.len].iter().position(|address| *address == frame.0)
+        let index = self.frames[..self.len]
+            .iter()
+            .position(|address| *address == frame.0)
             .ok_or(Error::InvalidHandle)?;
-        if !self.used[index] { return Err(Error::InvalidState); }
+        if !self.used[index] {
+            return Err(Error::InvalidState);
+        }
         self.used[index] = false;
         Ok(())
     }
@@ -88,7 +106,7 @@ mod tests {
         let frame = Frame::new(0x1000).unwrap();
         allocator.add(frame).unwrap();
         assert_eq!(allocator.available(), 1);
-        assert_eq!(allocator.allocate(), Ok(0x1000));
+        assert_eq!(allocator.allocate(), Ok(frame));
         assert_eq!(allocator.available(), 0);
         assert_eq!(allocator.allocate(), Err(Error::TableFull));
         allocator.release(frame).unwrap();

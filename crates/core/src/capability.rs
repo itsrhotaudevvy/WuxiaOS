@@ -30,7 +30,11 @@ impl Rights {
 
     /// Accept only known permission bits.
     pub const fn from_bits(bits: u32) -> Option<Self> {
-        if bits & !Self::ALL.0 == 0 { Some(Self(bits)) } else { None }
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
     }
 
     /// Check whether every requested permission is present.
@@ -102,14 +106,22 @@ impl<T, const N: usize> HandleTable<T, N> {
     /// Construct an empty table with valid nonzero generations.
     pub const fn new() -> Self {
         Self {
-            entries: [const { Entry { generation: 1, object: None } }; N],
+            entries: [const {
+                Entry {
+                    generation: 1,
+                    object: None,
+                }
+            }; N],
         }
     }
 
     /// Insert an object, failing rather than overwriting a live capability.
     /// A slot whose generation wrapped is permanently retired.
     pub fn insert(&mut self, object: T, rights: Rights) -> Result<Handle> {
-        let index = self.entries.iter().position(|entry| entry.object.is_none() && entry.generation != 0)
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.object.is_none() && entry.generation != 0)
             .ok_or(Error::TableFull)?;
         let generation = self.entries[index].generation;
         self.entries[index].object = Some((object, rights));
@@ -120,7 +132,11 @@ impl<T, const N: usize> HandleTable<T, N> {
     pub fn get(&self, handle: Handle, required: Rights) -> Result<&T> {
         let entry = self.entry(handle)?;
         let (value, rights) = entry.object.as_ref().ok_or(Error::InvalidHandle)?;
-        if rights.contains(required) { Ok(value) } else { Err(Error::PermissionDenied) }
+        if rights.contains(required) {
+            Ok(value)
+        } else {
+            Err(Error::PermissionDenied)
+        }
     }
 
     /// Mutably resolve a capability after checking its rights.
@@ -158,7 +174,11 @@ impl<T, const N: usize> HandleTable<T, N> {
         // A wrapped generation would eventually revive an ancient handle.
         // Retire the slot permanently instead of reissuing an old token.
         entry.generation = entry.generation.checked_add(1).unwrap_or(0);
-        entry.object.take().map(|(value, _)| value).ok_or(Error::InvalidHandle)
+        entry
+            .object
+            .take()
+            .map(|(value, _)| value)
+            .ok_or(Error::InvalidHandle)
     }
 
     /// Return the rights on one particular handle.
@@ -168,7 +188,10 @@ impl<T, const N: usize> HandleTable<T, N> {
 
     /// Return the number of live objects.
     pub fn len(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.object.is_some()).count()
+        self.entries
+            .iter()
+            .filter(|entry| entry.object.is_some())
+            .count()
     }
 
     /// Test whether no capabilities have been allocated.
@@ -214,7 +237,10 @@ mod tests {
         assert_eq!(table.get(old, Rights::WRITE), Err(Error::PermissionDenied));
         assert_eq!(table.close(old), Ok(7));
         assert_eq!(table.get(old, Rights::NONE), Err(Error::InvalidHandle));
-        assert_eq!(table.get(Handle::from_raw(u64::MAX), Rights::NONE), Err(Error::InvalidHandle));
+        assert_eq!(
+            table.get(Handle::from_raw(u64::MAX), Rights::NONE),
+            Err(Error::InvalidHandle)
+        );
     }
 
     #[test]
@@ -232,7 +258,10 @@ mod tests {
     fn duplicate_cannot_gain_rights() {
         let mut table = HandleTable::<u32, 2>::new();
         let read = table.insert(42, Rights::READ | Rights::DUPLICATE).unwrap();
-        assert_eq!(table.duplicate(read, Rights::READ | Rights::WRITE), Err(Error::PermissionDenied));
+        assert_eq!(
+            table.duplicate(read, Rights::READ | Rights::WRITE),
+            Err(Error::PermissionDenied)
+        );
         let copy = table.duplicate(read, Rights::READ).unwrap();
         assert_eq!(table.rights(copy), Ok(Rights::READ));
         assert_eq!(table.get(copy, Rights::READ), Ok(&42));

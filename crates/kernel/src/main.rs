@@ -43,11 +43,24 @@ pub extern "C" fn _start() -> ! {
     }
     serial::init();
     serial::write_str("WUXIA_BOOT_OK: Limine entered the high-half kernel\n");
-    if let Some(response) = MEMORY_MAP_REQUEST.get_response() {
-        serial::write_str("WUXIA_MEMORY_MAP_READY\n");
-    } else {
-        panic!("Limine did not provide a memory map");
-    }
+    let response = MEMORY_MAP_REQUEST
+        .get_response()
+        .expect("Limine did not provide a memory map");
+    let map =
+        memory::from_limine::<32>(response).expect("invalid or oversized physical memory map");
+    let mut allocator = memory::BumpAllocator::new(&map);
+    let first = allocator
+        .allocate_frame()
+        .expect("no usable physical frame");
+    assert_ne!(first, 0, "the bootstrap must not allocate the null page");
+    let second = allocator
+        .allocate_frame()
+        .expect("a second usable frame is required");
+    assert_ne!(first, second, "frame allocator returned a duplicate");
+    serial::write_str("WUXIA_MEMORY_MAP_READY\n");
+    serial::write_str("WUXIA_FRAME_ALLOC_OK\n");
+    serial::write_hex(first);
+    serial::write_hex(second);
     halt_forever()
 }
 
@@ -84,6 +97,17 @@ mod serial {
             outb(COM1 + 2, 0xc7);
             outb(COM1 + 4, 0x0b);
         }
+    }
+
+    /// Write a physical address as hexadecimal with a trailing newline.
+    pub fn write_hex(value: u64) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        write_str("0x");
+        for shift in (0..16).rev() {
+            let digit = ((value >> (shift * 4)) & 0xf) as usize;
+            put_byte(HEX[digit]);
+        }
+        write_str("\n");
     }
 
     /// Write a string to the legacy COM1 port, including CRLF line endings.

@@ -9,8 +9,8 @@
 pub mod capability;
 pub mod error;
 pub mod image;
-pub mod nt;
 pub mod memory;
+pub mod nt;
 pub mod personality;
 pub mod syscall;
 

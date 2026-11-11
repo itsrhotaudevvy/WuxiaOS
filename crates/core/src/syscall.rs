@@ -54,7 +54,9 @@ mod tests {
 
     #[test]
     fn raw_registers_are_not_assumed_to_be_pointers() {
-        let regs = Registers { args: [1, 2, 3, 4, 5, 6] };
+        let regs = Registers {
+            args: [1, 2, 3, 4, 5, 6],
+        };
         assert_eq!(regs.args[5], 6);
     }
 
