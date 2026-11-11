@@ -123,9 +123,17 @@ pub fn load_pe_image<const N: usize>(
     allocator: &mut FramePool<N>,
     direct_map: DirectMap,
     bytes: &[u8],
+    delta: i64,
 ) -> Result<UserImage, Error> {
-    let plan = LoaderPlan::<MAX_USER_SEGMENTS>::from_pe(bytes)?;
-    load_image_plan(allocator, direct_map, &plan, bytes)
+    let plan = LoaderPlan::<MAX_USER_SEGMENTS>::from_pe(bytes)?.relocate(delta)?;
+    let image = load_image_plan(allocator, direct_map, &plan, bytes)?;
+    let patched = apply_pe_relocations(direct_map, image.new_pml4, bytes, delta)?;
+    if delta != 0 && patched == 0 {
+        // A moved image with no relocation slots can only run at its preferred
+        // base, so refuse instead of handing ring 3 a pointer into nothing.
+        return Err(Error::Unsupported);
+    }
+    Ok(image)
 }
 
 /// Map a validated plan and its file bytes into a fresh address space.
@@ -262,6 +270,57 @@ pub fn current_direct_map() -> Option<DirectMap> {
 }
 
 static mut DIRECT_MAP_OFFSET: u64 = 0;
+
+/// Apply the image's base relocations to already mapped pages.
+///
+/// The image was mapped at `preferred_base + delta`, so every DIR64 slot the
+/// `.reloc` directory names needs `delta` added. Slots are patched through the
+/// direct map, which keeps the operation independent of the page permissions
+/// the plan chose, but each target must still resolve in `root`: a slot that
+/// names an address the loader did not map is rejected rather than written
+/// somewhere else.
+///
+/// Errors: `InvalidImage` for a malformed directory or a slot that straddles a
+/// page, and `NotFound` for a slot outside the mapped image.
+pub fn apply_pe_relocations(
+    direct_map: DirectMap,
+    root: u64,
+    bytes: &[u8],
+    delta: i64,
+) -> Result<usize, Error> {
+    let relocations = wuxia_core::pe_reloc::relocation_directory(bytes)?;
+    if relocations.is_empty() {
+        return Ok(0);
+    }
+    let (preferred, _) = wuxia_core::pe_common::image_base_and_size(bytes)?;
+    let mut patched = 0usize;
+    for slot in wuxia_core::pe_reloc::dir64_slots(relocations) {
+        let rva = slot?;
+        let address = preferred
+            .checked_add(u64::from(rva))
+            .and_then(|address| address.checked_add_signed(delta))
+            .ok_or(Error::OutOfRange)?;
+        if address % PAGE_SIZE > PAGE_SIZE - 8 {
+            return Err(Error::InvalidImage);
+        }
+        let (table, index) = leaf_slot(direct_map, root, address)?;
+        let entry = read_entry(table, index);
+        if !is_present(entry) || is_huge(entry) {
+            return Err(Error::NotFound);
+        }
+        let frame = physical_address(entry);
+        let offset = address % PAGE_SIZE;
+        let target = direct_map.physical_to_virtual(frame + offset)? as *mut u64;
+        // SAFETY: the slot lies inside a mapped 4 KiB frame of the image, the
+        // page tables were just validated, and traps do not nest here.
+        unsafe {
+            let value = target.read_volatile();
+            target.write_volatile(value.wrapping_add_signed(delta));
+        }
+        patched += 1;
+    }
+    Ok(patched)
+}
 
 /// Resolve a user address through the currently active root.
 pub fn resolve(direct_map: DirectMap, virtual_address: u64) -> Result<u64, Error> {

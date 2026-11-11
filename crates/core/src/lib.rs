@@ -35,6 +35,7 @@ pub mod nt_string;
 pub mod object_namespace;
 pub mod paging;
 pub mod path;
+pub mod pci;
 pub mod pe_common;
 pub mod pe_export;
 pub mod pe_import;

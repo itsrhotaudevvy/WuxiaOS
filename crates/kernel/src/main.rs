@@ -20,6 +20,7 @@ mod interrupts;
 mod log;
 mod memory;
 mod paging;
+mod pci;
 mod sched;
 mod time;
 mod user;
@@ -60,6 +61,9 @@ static SECOND_ELF: &[u8] = include_bytes!(env!("WUXIA_SECOND_ELF_PATH"));
 
 /// Minimal PE32+ program exercised through the NT personality.
 static PE_IMAGE: &[u8] = include_bytes!(env!("WUXIA_PE_IMAGE_PATH"));
+
+/// Highest displacement the PE self-test image is mapped away from its base.
+const PE_DISPLACEMENT_WINDOW: u64 = 0x40_0000;
 
 /// Limine's documented kernel entry point.
 #[unsafe(no_mangle)]
@@ -153,9 +157,13 @@ pub extern "C" fn _start() -> ! {
     );
     log::write_str("WUXIA_FRAME_RECLAIM_OK\n");
 
-    let pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE)
+    let pe_delta = pe_displacement();
+    let pe = paging::load_pe_image(&mut allocator, direct_map, PE_IMAGE, pe_delta)
         .expect("the PE self-test image cannot be loaded");
     log::write_str("WUXIA_PE_IMAGE_OK\n");
+    log::write_hex(pe.entry);
+    log::write_str("WUXIA_PE_RELOCATED\n");
+    log::write_hex(pe_delta as u64);
     log::write_hex(pe.entry);
     memory::install_pool(allocator);
 
@@ -178,6 +186,20 @@ pub extern "C" fn _start() -> ! {
         "the bootstrap file cannot be read back"
     );
     log::write_str("WUXIA_FS_OK\n");
+
+    let devices = pci::enumerate(|function| {
+        log::write_str("WUXIA_PCI_DEVICE\n");
+        log::write_hex(u64::from(function.vendor));
+        log::write_hex(u64::from(function.device_id));
+        log::write_hex(u64::from(function.class));
+        for bar in pci::bars(function).into_iter().flatten() {
+            log::write_str("WUXIA_PCI_BAR\n");
+            log::write_hex(u64::from(bar.is_io));
+            log::write_hex(bar.base);
+        }
+    });
+    log::write_str("WUXIA_PCI_OK\n");
+    log::write_hex(devices as u64);
 
     paging::activate(image.new_pml4);
     log::write_str("WUXIA_CR3_OK\n");
@@ -326,6 +348,37 @@ pub extern "C" fn _start() -> ! {
     sched::activate_first_stack();
     log::write_str("WUXIA_ENTER_USER\n");
     user::enter(image.entry, stack_top);
+}
+
+/// Choose a page-aligned displacement for the PE self-test image.
+///
+/// The image is mapped away from its preferred base so the relocations the
+/// build emits are exercised on every boot, and the displacement is drawn from
+/// a ChaCha20 stream seeded with the invariant timestamp counter so two boots
+/// differ.
+///
+/// This is address-space layout randomisation as a mechanism, not yet as a
+/// security boundary: a TSC seed is observable but not secret, and the
+/// bootstrap has no hardware entropy source to reseed from. It is documented
+/// here and in `docs/ARCHITECTURE.md` so nobody mistakes it for an ASLR
+/// guarantee.
+fn pe_displacement() -> i64 {
+    if wuxia_core::pe_common::image_base_and_size(PE_IMAGE).is_err() {
+        return 0;
+    }
+    let mut seed = [0u8; 32];
+    for chunk in seed.chunks_mut(8) {
+        // SAFETY: reading the timestamp counter has no side effects.
+        let ticks = unsafe { core::arch::x86_64::_rdtsc() };
+        chunk.copy_from_slice(&ticks.to_le_bytes());
+    }
+    let mut rng = wuxia_core::random::ChaChaRng::from_seed(seed);
+    let slots = PE_DISPLACEMENT_WINDOW / wuxia_core::paging::PAGE_SIZE;
+    let slot = match rng.below(slots) {
+        Ok(slot) => slot,
+        Err(_) => return 0,
+    };
+    (slot as i64) * (wuxia_core::paging::PAGE_SIZE as i64)
 }
 
 /// Panic handler for early bootstrap failures.

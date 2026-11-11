@@ -191,6 +191,52 @@ impl<const N: usize> LoaderPlan<N> {
         self.segments.iter().flatten()
     }
 
+    /// Move every address in the plan by `delta`.
+    ///
+    /// Used to honour a load address that differs from the image's preferred
+    /// base. `delta` must be page-aligned, and every moved range must stay
+    /// page-aligned, inside the user address window and free of overflow, so a
+    /// relocated plan is exactly as trustworthy as the plan it came from.
+    ///
+    /// Errors:
+    /// - [`Error::InvalidInput`]: `delta` is not a multiple of [`PAGE_SIZE`].
+    /// - [`Error::BadAddress`]: a moved range leaves the user window.
+    /// - [`Error::OutOfRange`]: an address does not fit.
+    pub fn relocate(self, delta: i64) -> Result<Self> {
+        if delta % PAGE_SIZE as i64 != 0 {
+            return Err(Error::InvalidInput);
+        }
+        let mut segments = [None; N];
+        for (index, segment) in self.segments.iter().enumerate() {
+            let Some(segment) = segment else {
+                continue;
+            };
+            let address = segment
+                .address
+                .checked_add_signed(delta)
+                .ok_or(Error::OutOfRange)?;
+            if address == 0 || !address.is_multiple_of(PAGE_SIZE) {
+                return Err(Error::BadAddress);
+            }
+            let moved = LoadSegment {
+                address,
+                ..*segment
+            };
+            if moved.end()? >= USER_ADDRESS_LIMIT {
+                return Err(Error::BadAddress);
+            }
+            segments[index] = Some(moved);
+        }
+        let entry = self
+            .entry
+            .checked_add_signed(delta)
+            .ok_or(Error::OutOfRange)?;
+        if !entry_is_executable(&segments, entry) {
+            return Err(Error::BadAddress);
+        }
+        Ok(Self { entry, segments })
+    }
+
     /// Number of loadable segments.
     pub fn len(&self) -> usize {
         self.segments.iter().flatten().count()
@@ -289,6 +335,33 @@ mod tests {
         assert_eq!(data.address, 0x1_4000_2000);
         assert_eq!(data.permissions, PagePermissions::USER_READ_WRITE);
         assert_eq!(plan.max_end().unwrap(), 0x1_4000_3000);
+    }
+
+    #[test]
+    fn relocating_a_pe_plan_moves_every_range() {
+        let image = tiny_pe64(0x6000_0020, 0x2000);
+        let plan = LoaderPlan::<4>::from_pe(&image).unwrap();
+        let moved = plan.relocate(0x20_0000).unwrap();
+        assert_eq!(moved.entry(), 0x1_4000_1000 + 0x20_0000);
+        let mut segments = moved.segments();
+        assert_eq!(segments.next().unwrap().address, 0x1_4000_1000 + 0x20_0000);
+        assert_eq!(segments.next().unwrap().address, 0x1_4000_2000 + 0x20_0000);
+        assert_eq!(moved.max_end().unwrap(), 0x1_4000_3000 + 0x20_0000);
+    }
+
+    #[test]
+    fn relocation_requires_alignment_and_stays_inside_the_user_window() {
+        let image = tiny_pe64(0x6000_0020, 0x2000);
+        let plan = LoaderPlan::<4>::from_pe(&image).unwrap();
+        assert!(matches!(plan.relocate(1), Err(Error::InvalidInput)));
+        assert!(matches!(
+            plan.relocate(-0x1_4000_1000),
+            Err(Error::BadAddress)
+        ));
+        assert!(matches!(
+            plan.relocate(i64::MAX & !0xfff),
+            Err(Error::OutOfRange) | Err(Error::BadAddress)
+        ));
     }
 
     #[test]

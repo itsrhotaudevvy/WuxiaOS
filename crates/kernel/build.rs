@@ -70,15 +70,16 @@ fn embed(out: &std::path::Path, name: &str, variable: &str, default: &std::path:
 /// terminates the process, plus a writable data section as the read target.
 fn write_pe_image(out: &std::path::Path) -> PathBuf {
     let target = out.join("pe_image.bin");
-    let mut image = vec![0u8; 0x600];
+    let mut image = vec![0u8; 0x800];
 
     image[0..2].copy_from_slice(b"MZ");
     image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
 
     image[0x40..0x44].copy_from_slice(b"PE\0\0");
     image[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
-    // Two sections: .text and a writable .data used as the read buffer.
-    image[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+    // Three sections: .text, a writable .data used as the read buffer and a
+    // .reloc section naming the absolute addresses in .data.
+    image[0x46..0x48].copy_from_slice(&3u16.to_le_bytes());
     image[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
     image[0x56..0x58].copy_from_slice(&0x22u16.to_le_bytes());
 
@@ -86,7 +87,7 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
     // SizeOfCode, then SizeOfInitializedData.
     image[optional + 4..optional + 8].copy_from_slice(&0x200u32.to_le_bytes());
-    image[optional + 8..optional + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[optional + 8..optional + 12].copy_from_slice(&0x400u32.to_le_bytes());
     image[optional + 16..optional + 20].copy_from_slice(&0x1000u32.to_le_bytes());
     image[optional + 20..optional + 24].copy_from_slice(&0x1000u32.to_le_bytes());
     image[optional + 24..optional + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
@@ -95,14 +96,19 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     image[optional + 36..optional + 40].copy_from_slice(&0x200u32.to_le_bytes());
     image[optional + 40..optional + 42].copy_from_slice(&6u16.to_le_bytes());
     image[optional + 48..optional + 50].copy_from_slice(&6u16.to_le_bytes());
-    // SizeOfImage covers both sections.
-    image[optional + 56..optional + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+    // SizeOfImage covers all three sections.
+    image[optional + 56..optional + 60].copy_from_slice(&0x4000u32.to_le_bytes());
     image[optional + 60..optional + 64].copy_from_slice(&0x200u32.to_le_bytes());
     image[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
     image[optional + 72..optional + 80].copy_from_slice(&0x10_0000u64.to_le_bytes());
     image[optional + 80..optional + 88].copy_from_slice(&0x1000u64.to_le_bytes());
     image[optional + 88..optional + 96].copy_from_slice(&0x10_0000u64.to_le_bytes());
     image[optional + 96..optional + 104].copy_from_slice(&0x1000u64.to_le_bytes());
+    // NumberOfRvaAndSizes, then the base-relocation directory at index 5.
+    image[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
+    let reloc_directory = optional + 112 + 5 * 8;
+    image[reloc_directory..reloc_directory + 4].copy_from_slice(&0x3000u32.to_le_bytes());
+    image[reloc_directory + 4..reloc_directory + 8].copy_from_slice(&12u32.to_le_bytes());
 
     let section = optional + 240;
     image[section..section + 5].copy_from_slice(b".text");
@@ -121,6 +127,22 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     image[data + 20..data + 24].copy_from_slice(&0x400u32.to_le_bytes());
     // IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA.
     image[data + 36..data + 40].copy_from_slice(&0xc000_0040u32.to_le_bytes());
+
+    let reloc = data + 40;
+    image[reloc..reloc + 6].copy_from_slice(b".reloc");
+    image[reloc + 8..reloc + 12].copy_from_slice(&0x200u32.to_le_bytes());
+    image[reloc + 12..reloc + 16].copy_from_slice(&0x3000u32.to_le_bytes());
+    image[reloc + 16..reloc + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    image[reloc + 20..reloc + 24].copy_from_slice(&0x600u32.to_le_bytes());
+    // IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_CNT_INITIALIZED_DATA.
+    image[reloc + 36..reloc + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
+
+    // One IMAGE_REL_BASED_DIR64 block covering the UNICODE_STRING Buffer field
+    // at RVA 0x1108: page RVA, block size and the entry, then a pad word that
+    // keeps the block a multiple of four bytes.
+    image[0x600..0x604].copy_from_slice(&0x1000u32.to_le_bytes());
+    image[0x604..0x608].copy_from_slice(&12u32.to_le_bytes());
+    image[0x608..0x60a].copy_from_slice(&0xa108u16.to_le_bytes());
 
     // NtCreateFile(&name), NtReadFile(handle, data, 0x40),
     // NtWriteFile(1, data, bytes_read), NtTerminateProcess(0).
@@ -150,9 +172,9 @@ fn write_pe_image(out: &std::path::Path) -> PathBuf {
     ];
     image[0x200..0x200 + code.len()].copy_from_slice(&code);
 
-    // A UNICODE_STRING at 0x140001100 naming L"hello" at 0x140001110.
-    // The image is loaded at its preferred base, so the Buffer field is an
-    // absolute address and needs no relocation.
+    // A UNICODE_STRING at 0x140001100 naming L"hello" at 0x140001110. The
+    // Buffer field holds an absolute preferred-base address, so the .reloc
+    // entry above moves it whenever the image is loaded elsewhere.
     image[0x300..0x302].copy_from_slice(&10u16.to_le_bytes());
     image[0x302..0x304].copy_from_slice(&12u16.to_le_bytes());
     image[0x308..0x310].copy_from_slice(&0x1_4000_1110u64.to_le_bytes());
