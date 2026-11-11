@@ -12,6 +12,7 @@ pub mod image;
 pub mod memory;
 pub mod nt;
 pub mod personality;
+pub mod region;
 pub mod syscall;
 
 pub use capability::{Handle, HandleTable, Rights};
