@@ -26,6 +26,7 @@ The sub-sections describe the bootstrap kernel as it runs today. Anything not de
 - `crates/core/src/hhdm.rs` validates Limine's higher-half direct-map offset and performs checked physical-to-virtual and virtual-to-physical translation. The kernel uses it to zero and write frames and to walk page tables.
 - `crates/kernel/src/paging.rs` builds a PML4/PDPT/PD/PT chain for an image's segments and stack inside one previously absent lower-half PML4 slot; a present slot is refused. It clones the active PML4 into a fresh frame, installs the subtree and loads the clone into CR3. Every bootloader entry is copied, so the kernel image, direct map and stack remain reachable after the switch. `paging::resolve` then walks the entry point, each segment and the stack through the active root.
 - Boot runs an `int3` self-test through the full trap stub, remaps the 8259 PIC away from the exception vectors, programs the 8254 PIT at 100 Hz, unmasks only IRQ0 and waits for five ticks before continuing. The timer handler increments a counter and acknowledges the PIC.
+- Kernel log lines are stored in a static `wuxia_core::klog` ring and mirrored to COM1 by `crates/kernel/src/log.rs`.
 
 ### User entry and syscalls
 
@@ -65,13 +66,14 @@ The sub-sections describe the bootstrap kernel as it runs today. Anything not de
 
 The following `crates/core` modules have host tests but no reference in `crates/kernel`. Each was checked with `grep -rn "wuxia_core::<module>" crates/kernel`, which found no match for any of them. Some of them are reached only through a type that the kernel does call: `Process` owns `AddressSpace` and `DescriptorTable`, `LoaderPlan` parses ELF through `elf` and PE through `image`, and `wuxia_core::Error` is defined in `error`. Those five modules (`address_space`, `descriptor`, `elf`, `image`, `error`) run in the kernel and are not listed here.
 
-- Image formats and loader support: `elf_reloc` (ELF dynamic RELATIVE relocations), `initstack` (System V initial stacks), `pe_export`, `pe_import`, `pe_pdata`, `pe_reloc` and `pe_tls`. The `pe_*` modules reference only each other, so the kernel cannot reach them.
-- NT object model and names: `acl`, `dispatcher`, `dospath`, `nt_string`, `object_namespace`, `path`, `registry` and `sid`.
+- Image formats and loader support: `elf_reloc` (ELF dynamic RELATIVE relocations), `initstack` (System V initial stacks), `pe_export`, `pe_import`, `pe_pdata`, `pe_reloc` (including DIR64 slot enumeration) and `pe_resource` (resource directories), `pe_tls`, and `initramfs` (cpio `newc`/`crc` and ustar archives). The `pe_*` modules reference only each other, so the kernel cannot reach them.
+- `security_descriptor` (self-relative `SECURITY_DESCRIPTOR` read/write over the ACL, SID and token models) and `nt_service` (per-build NT service tables).
+- NT object model and names: `acl`, `dispatcher`, `dospath`, `nt_string`, `object_namespace`, `path`, `registry`, `security_descriptor` and `sid`.
 - POSIX process and I/O: `credentials`, `cow` (copy-on-write bookkeeping), `dirtree`, `futex`, `pipe`, `proctree`, `rlimit` and `signal`.
 - Policy and capabilities: `capability` (generational handle tables with rights attenuation), `pledge` and `unveil`.
 - Status codes: `errno` (errno and NTSTATUS mapping).
-- Scheduling, time and services: `priority`, `timer`, `klog` (kernel log ring) and `random` (ChaCha20 RNG with ASLR base selection).
-- Memory: `memory`, a bounded frame pool that the kernel superseded with `frames`.
+- Scheduling, time and services: `priority`, `timer` and `random` (ChaCha20 RNG with ASLR base selection).
+- Memory: `memory`, a bounded frame pool that the kernel superseded with `frames`, and `buddy`, a binary buddy allocator over seeded page-frame regions.
 
 ## Memory and isolation roadmap
 
