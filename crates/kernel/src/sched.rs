@@ -27,6 +27,11 @@ pub struct Thread {
     pub frame: InterruptFrame,
     /// Whether the thread can still be scheduled.
     pub runnable: bool,
+    /// Tick at which a sleeping thread becomes ready; zero when awake.
+    pub wake_at: u64,
+    /// Tick at which the thread was last resumed, so a pending timer
+    /// interrupt cannot preempt it before its first instruction.
+    pub resume_tick: u64,
     /// Process identity, address space and descriptors for this thread.
     pub process: Process<8>,
     /// Frames owned by the thread's image.
@@ -84,6 +89,8 @@ pub fn register(
             root,
             frame: initial_frame(entry, stack_top),
             runnable: true,
+            wake_at: 0,
+            resume_tick: 0,
             process,
             frames,
         });
@@ -263,21 +270,124 @@ fn current_thread() -> Option<Thread> {
     }
 }
 
-/// Save `frame`, switch to the next runnable thread and load its frame.
+/// Clear wake deadlines that have passed.
+fn refresh(threads: &mut [Option<Thread>; MAX_THREADS], now: u64) {
+    for slot in threads.iter_mut() {
+        if let Some(thread) = slot {
+            if thread.wake_at != 0 && now >= thread.wake_at {
+                thread.wake_at = 0;
+            }
+        }
+    }
+}
+
+/// Whether each thread is ready to run now.
+fn ready_flags(threads: &[Option<Thread>; MAX_THREADS]) -> [bool; MAX_THREADS] {
+    let mut ready = [false; MAX_THREADS];
+    for (index, slot) in threads.iter().enumerate() {
+        ready[index] = slot.is_some_and(|thread| thread.runnable && thread.wake_at == 0);
+    }
+    ready
+}
+
+/// Wait, without spinning, until a sleeping thread's deadline passes.
 ///
-/// Returns false when no other thread is runnable, leaving `frame` untouched.
+/// Returns false when no blocked thread is left to wake.
+fn idle_until_wakeup(threads: &[Option<Thread>; MAX_THREADS]) -> bool {
+    let earliest = threads
+        .iter()
+        .flatten()
+        .filter(|thread| thread.runnable && thread.wake_at != 0)
+        .map(|thread| thread.wake_at)
+        .min();
+    let Some(earliest) = earliest else {
+        return false;
+    };
+    while crate::interrupts::ticks() < earliest {
+        // SAFETY: enabling interrupts lets the PIT arrive and halting wakes
+        // on that interrupt.
+        unsafe {
+            core::arch::asm!(
+                "sti",
+                "hlt",
+                "cli",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    true
+}
+
+/// Save `frame` and resume another ready thread.
+///
+/// Returns false when no other thread is ready, leaving `frame` untouched.
 pub fn yield_current(frame: &mut InterruptFrame) -> bool {
-    switch(frame, false)
+    switch(frame, "WUXIA_YIELD_SWITCH\n")
 }
 
 /// Preempt the running thread from the timer interrupt.
 ///
 /// Returns false when no other thread is runnable, leaving `frame` untouched.
 pub fn preempt(frame: &mut InterruptFrame) -> bool {
-    switch(frame, true)
+    // SAFETY: traps are non-nesting, so the scheduler is the only writer.
+    unsafe {
+        let threads = &*addr_of!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        let now = crate::interrupts::ticks();
+        if threads[current].is_some_and(|thread| now <= thread.resume_tick) {
+            return false;
+        }
+    }
+    switch(frame, "WUXIA_PREEMPT_SWITCH\n")
 }
 
-fn switch(frame: &mut InterruptFrame, preempted: bool) -> bool {
+/// Mark the running thread asleep until `millis` have elapsed.
+///
+/// Switches to another ready thread when one exists; otherwise the kernel
+/// halts until the deadline and the call returns in place.
+pub fn sleep_current(frame: &mut InterruptFrame, millis: u64) -> bool {
+    let Some(target) = wuxia_core::schedule::deadline(
+        crate::interrupts::ticks(),
+        millis,
+        crate::interrupts::TIMER_HZ,
+    ) else {
+        return false;
+    };
+    // SAFETY: traps are non-nesting, so the scheduler is the only writer.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        if let Some(thread) = threads[current].as_mut() {
+            thread.wake_at = target.max(1);
+        }
+    }
+    if switch(frame, "WUXIA_SLEEP_BLOCK\n") {
+        return true;
+    }
+    while crate::interrupts::ticks() < target {
+        // SAFETY: enabling interrupts lets the PIT arrive and halting wakes
+        // on that interrupt.
+        unsafe {
+            core::arch::asm!(
+                "sti",
+                "hlt",
+                "cli",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    // SAFETY: traps are non-nesting, so the scheduler is the only writer.
+    unsafe {
+        let threads = &mut *addr_of_mut!(THREADS);
+        let current = read_volatile(addr_of!(CURRENT));
+        if let Some(thread) = threads[current].as_mut() {
+            thread.wake_at = 0;
+        }
+    }
+    false
+}
+
+fn switch(frame: &mut InterruptFrame, label: &str) -> bool {
     // SAFETY: traps are non-nesting, so the scheduler is the only writer.
     unsafe {
         let threads = &mut *addr_of_mut!(THREADS);
@@ -285,22 +395,23 @@ fn switch(frame: &mut InterruptFrame, preempted: bool) -> bool {
         if let Some(thread) = threads[current].as_mut() {
             thread.frame = *frame;
         }
-        let mut runnable = [false; MAX_THREADS];
-        for (index, slot) in threads.iter().enumerate() {
-            runnable[index] = slot.is_some_and(|thread| thread.runnable);
-        }
-        let Some(next) = wuxia_core::schedule::next_runnable(current, &runnable) else {
+        let now = crate::interrupts::ticks();
+        refresh(threads, now);
+        let ready = ready_flags(threads);
+        let Some(next) = wuxia_core::schedule::next_runnable(current, &ready) else {
             return false;
         };
-        let thread = threads[next].expect("a runnable thread exists");
+        let thread = threads[next].expect("a ready thread exists");
         *frame = thread.frame;
+        // A saved trap frame may carry the cleared interrupt flag of the
+        // syscall gate; user code must always resume with interrupts enabled.
+        frame.rflags |= 0x200;
         write_volatile(addr_of_mut!(CURRENT), next);
         crate::paging::activate(thread.root);
-        if preempted {
-            serial::write_str("WUXIA_PREEMPT_SWITCH\n");
-        } else {
-            serial::write_str("WUXIA_YIELD_SWITCH\n");
+        if let Some(thread) = threads[next].as_mut() {
+            thread.resume_tick = now.saturating_add(1);
         }
+        serial::write_str(label);
         serial::write_hex(next as u64);
         true
     }
@@ -324,17 +435,21 @@ pub fn exit_current(frame: &mut InterruptFrame) -> bool {
             }
             assert_eq!(failures, 0, "process teardown could not return every frame");
         }
-        let mut runnable = [false; MAX_THREADS];
-        for (index, slot) in threads.iter().enumerate() {
-            runnable[index] = slot.is_some_and(|thread| thread.runnable);
+        loop {
+            refresh(threads, crate::interrupts::ticks());
+            let ready = ready_flags(threads);
+            if let Some(next) = wuxia_core::schedule::next_runnable(current, &ready) {
+                let thread = threads[next].expect("a ready thread exists");
+                *frame = thread.frame;
+                write_volatile(addr_of_mut!(CURRENT), next);
+                crate::paging::activate(thread.root);
+                serial::write_str("WUXIA_WAKE_SWITCH\n");
+                serial::write_hex(next as u64);
+                return true;
+            }
+            if !idle_until_wakeup(threads) {
+                return false;
+            }
         }
-        let Some(next) = wuxia_core::schedule::next_runnable(current, &runnable) else {
-            return false;
-        };
-        let thread = threads[next].expect("a runnable thread exists");
-        *frame = thread.frame;
-        write_volatile(addr_of_mut!(CURRENT), next);
-        crate::paging::activate(thread.root);
-        true
     }
 }

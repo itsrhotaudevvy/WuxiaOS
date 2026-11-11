@@ -314,10 +314,11 @@ fn service_syscall(frame: &mut InterruptFrame) {
         }
         Ok(wuxia_core::syscall::PosixRequest::Sleep { millis }) => {
             let start = crate::interrupts::ticks();
-            crate::interrupts::sleep_millis(millis);
-            serial::write_str("WUXIA_SLEEP_OK\n");
-            serial::write_hex(crate::interrupts::ticks() - start);
             frame.rax = 0;
+            if !crate::sched::sleep_current(frame, millis) {
+                serial::write_str("WUXIA_SLEEP_OK\n");
+                serial::write_hex(crate::interrupts::ticks() - start);
+            }
         }
         Ok(wuxia_core::syscall::PosixRequest::Exit { code }) => {
             if !crate::sched::exit_process(code) {

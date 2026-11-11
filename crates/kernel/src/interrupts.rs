@@ -56,28 +56,6 @@ pub fn wait_for_ticks(count: u64) {
 }
 
 /// Record one tick and acknowledge the master PIC.
-/// Wait until `millis` have elapsed on the timer.
-///
-/// The CPU halts between ticks instead of spinning, but the calling thread
-/// keeps the processor: this is not yet a blocking sleep.
-pub fn sleep_millis(millis: u64) {
-    let Some(target) = wuxia_core::schedule::deadline(ticks(), millis, TIMER_HZ) else {
-        return;
-    };
-    while ticks() < target {
-        // SAFETY: enabling interrupts inside the handler lets the PIT arrive,
-        // and halting wakes on that interrupt.
-        unsafe {
-            asm!(
-                "sti",
-                "hlt",
-                "cli",
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-    }
-}
-
 pub fn tick() {
     // SAFETY: bootstrap is single-threaded; the handler runs with interrupts
     // disabled and is the only writer while ring 3 is active.

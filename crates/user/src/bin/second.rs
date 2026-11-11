@@ -49,6 +49,15 @@ core::arch::global_asm!(
     // yield back to the first process
     "mov rax, 24",
     "int 0x80",
+    // sleep(100) after being preempted back; the first process runs meanwhile
+    "mov rax, 35",
+    "mov rdi, 100",
+    "int 0x80",
+    "mov rax, 1",
+    "mov rdi, 1",
+    "lea rsi, [rip + {slept}]",
+    "mov rdx, 6",
+    "int 0x80",
     // exit(0)
     "mov rax, 60",
     "xor rdi, rdi",
@@ -57,7 +66,12 @@ core::arch::global_asm!(
     "ud2",
     message = sym MESSAGE,
     path = sym MOTD_PATH,
+    slept = sym SLEPT,
 );
+
+/// Written after the timer sleep returns.
+#[used]
+static SLEPT: [u8; 6] = *b"SLEPT\n";
 
 /// Name of the second file, opened from this process.
 #[used]
